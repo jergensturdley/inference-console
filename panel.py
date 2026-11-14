@@ -508,7 +508,7 @@ class AvalonManager:
             return {"running": False}
         return {
             "running": True, "state": state,
-            "pid": st.get("pid"), "profile": st.get("profile"),
+            "pid": st.get("pid"), "profile": st.get("profile"), "port": AVALON_PORT,
             "uptime": int(time.time() - st.get("started_at", time.time())),
             "model": detail.get("model"), "max_context": detail.get("max_context"),
             "adopted": st.get("adopted", False),
@@ -784,29 +784,75 @@ _sessions: dict = {}   # token -> expiry (unix time)
 _fails: dict = {}      # ip -> deque(failure unix times)
 
 LOGIN_HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>LFM Panel — Sign in</title>
+<html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>LFM Panel — Sign in</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2363b3ff'/><path d='M17.5 5l-8.5 13h5.2l-1.2 9 8.5-13h-5.2z' fill='%2304121f'/></svg>">
 <style>
-:root{--bg:#111418;--card:#1a1f26;--fg:#dde3ea;--mut:#8b96a5;--acc:#5ab0f0;--err:#e86a6a;--bd:#2a323d}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif;
- display:flex;align-items:center;justify-content:center;min-height:100vh}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:28px;width:320px}
-h1{font-size:16px;margin:0 0 14px}input{width:100%;padding:9px 10px;border-radius:8px;border:1px solid var(--bd);
- background:var(--bg);color:var(--fg);font-size:14px}
-button{width:100%;margin-top:12px;padding:9px;border:0;border-radius:8px;background:var(--acc);color:#08131d;
- font-weight:600;font-size:14px;cursor:pointer}
-#msg{color:var(--err);font-size:12.5px;min-height:18px;margin-top:10px}
+:root{--bg:#0a0d12;--bg-2:#0e1319;--panel:#12171f;--panel-2:#161c25;--raise:#1b222c;--bd:#232d38;--bd-2:#2e3945;
+ --fg:#e7edf5;--fg-2:#bcc7d5;--mut:#8794a6;--faint:#5d6a7c;--acc:#63b3ff;--acc-2:#4dd6c1;--acc-ink:#04121f;
+ --err:#ff6f6f;--ok:#4fd48a;--grad:linear-gradient(135deg,var(--acc),var(--acc-2));
+ --glow:radial-gradient(1100px 520px at 82% -12%,#16222f 0%,rgba(0,0,0,0) 62%)}
+[data-theme=light]{--bg:#f5f7fa;--bg-2:#e9eef4;--panel:#fff;--panel-2:#fafbfd;--raise:#eef2f7;--bd:#dce3eb;--bd-2:#c6d0db;
+ --fg:#101720;--fg-2:#39465a;--mut:#5c6b7d;--faint:#8a96a5;--acc:#1f6feb;--acc-2:#0d9488;--acc-ink:#fff;
+ --err:#c0392b;--ok:#0f7a55;--glow:radial-gradient(1100px 520px at 82% -12%,#dfe8f3 0%,rgba(0,0,0,0) 62%)}
+*,*::before,*::after{box-sizing:border-box}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;background:var(--bg) var(--glow) no-repeat;
+ color:var(--fg);font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
+.card{width:min(360px,94vw);background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--bd);
+ border-radius:16px;padding:24px;box-shadow:0 1px 2px rgba(0,0,0,.4),0 24px 60px -26px rgba(0,0,0,.8)}
+.brand{display:flex;align-items:center;gap:11px;margin-bottom:20px}
+.mark{width:32px;height:32px;border-radius:10px;background:var(--grad);display:grid;place-items:center;color:var(--acc-ink);
+ box-shadow:0 0 0 1px rgba(255,255,255,.1),0 10px 24px -12px var(--acc)}
+.mark svg{width:18px;height:18px}
+.brand b{font-size:16px;letter-spacing:-.2px}
+.brand small{display:block;font-size:10.5px;font-weight:550;color:var(--faint);letter-spacing:.7px;text-transform:uppercase}
+label{display:block;color:var(--mut);font-size:11.5px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin-bottom:6px}
+input{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--bd-2);background:var(--bg-2);color:var(--fg);
+ font:inherit;font-size:14px;transition:border-color .16s,box-shadow .16s}
+input:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent);outline:0}
+button{width:100%;margin-top:14px;padding:10px;border:0;border-radius:10px;background:var(--grad);color:var(--acc-ink);
+ font:inherit;font-weight:650;font-size:14px;cursor:pointer;box-shadow:0 8px 22px -12px var(--acc);transition:filter .16s,opacity .16s}
+button:hover{filter:brightness(1.07)}button:active{transform:translateY(1px)}button[disabled]{opacity:.55;cursor:progress}
+#msg{color:var(--err);font-size:12.5px;min-height:18px;margin-top:11px}
+.hint{color:var(--faint);font-size:12px;margin:14px 0 0;text-align:center}
+.theme{position:fixed;top:14px;right:14px;width:32px;height:32px;display:grid;place-items:center;border-radius:9px;
+ border:1px solid var(--bd);background:var(--panel);color:var(--mut);cursor:pointer;margin:0;padding:0}
+.theme:hover{color:var(--fg);background:var(--raise)}
+.theme svg{width:15px;height:15px}
+@media (prefers-reduced-motion:reduce){*{transition-duration:.01ms !important}}
 </style></head><body>
-<div class="card"><h1>LFM Panel</h1>
-<form>
-<input id="pw" type="password" placeholder="sudo password" autocomplete="current-password" autofocus>
-<button type="submit">Sign in</button><div id="msg"></div></form></div>
+<button class="theme" id="theme" aria-label="Toggle theme"></button>
+<div class="card">
+ <div class="brand"><span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+  <span><b>LFM Panel</b><small>local model console</small></span></div>
+ <form>
+  <label for="pw">Sudo password</label>
+  <input id="pw" type="password" placeholder="your login password" autocomplete="current-password" autofocus>
+  <button type="submit" id="go">Sign in</button>
+  <div id="msg" role="alert"></div>
+ </form>
+ <p class="hint">Validated against sudo · 5 attempts before a 5-minute lockout</p>
+</div>
 <script>
-async function go(ev){ev.preventDefault();const m=document.getElementById('msg');m.textContent='';
+const SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
+const MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 14a8 8 0 01-9.5-9.5A8 8 0 1020 14z"/></svg>';
+function applyTheme(t){document.documentElement.dataset.theme=t;$('#theme').innerHTML=t==='dark'?SUN:MOON}
+function $(s){return document.querySelector(s)}
+applyTheme(localStorage.getItem('lfm.theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'));
+$('#theme').onclick=()=>{const t=document.documentElement.dataset.theme==='dark'?'light':'dark';
+ applyTheme(t);localStorage.setItem('lfm.theme',t)};
+async function go(ev){ev.preventDefault();
+ const m=$('#msg'),b=$('#go'),pw=$('#pw');m.textContent='';
+ b.disabled=true;b.textContent='Signing in…';
  try{const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({password:document.getElementById('pw').value})});
-  if(r.ok){location.replace('/');}else{m.textContent=(r.status===429)?'Too many attempts — wait 5 minutes.':'Wrong password.';}
- }catch(e){m.textContent='Failed: '+e;}}
+  body:JSON.stringify({password:pw.value})});
+  if(r.ok){location.replace('/');return}
+  m.textContent=(r.status===429)?'Too many attempts — wait 5 minutes.':'Wrong password.';
+  pw.select();
+ }catch(e){m.textContent='Failed: '+e}
+ b.disabled=false;b.textContent='Sign in'}
 document.querySelector('form').addEventListener('submit',go);
 </script></body></html>"""
 
@@ -881,10 +927,11 @@ def api_chats_list():
             c = json.loads(f.read_text())
             out.append({"id": c["id"], "title": c.get("title", "(untitled)"),
                         "created": c.get("created", 0), "model": c.get("model", ""),
+                        "updated": c.get("updated", c.get("created", 0)),
                         "msgs": len(c.get("messages", []))})
         except Exception:
             continue
-    return sorted(out, key=lambda c: -c["created"])
+    return sorted(out, key=lambda c: -c["updated"])
 
 @app.get("/api/chats/{cid}")
 def api_chat_get(cid: str):
@@ -919,6 +966,7 @@ def api_chat_append(b: AppendBody):
     if b.reasoning:
         msg["reasoning"] = b.reasoning
     chat["messages"].append(msg)
+    chat["updated"] = time.time()
     if b.model:
         chat["model"] = b.model
     if not chat["title"]:
@@ -1133,14 +1181,15 @@ def _apply_avalon_access():
         SMGR.stop()
         SMGR.start(st["profile"])
     return {"lan": bool(CFG.get("avalon_lan")), "api_key": CFG.get("avalon_api_key", ""),
-            "ip": _lan_ip(), "status": SMGR.status()}
+            "ip": _lan_ip(), "port": AVALON_PORT, "status": SMGR.status()}
 
 class AvalonAccessBody(BaseModel):
     lan: bool
 
 @app.get("/api/avalon/access")
 def api_avalon_access_get():
-    return {"lan": bool(CFG.get("avalon_lan")), "api_key": CFG.get("avalon_api_key", ""), "ip": _lan_ip()}
+    return {"lan": bool(CFG.get("avalon_lan")), "api_key": CFG.get("avalon_api_key", ""),
+            "ip": _lan_ip(), "port": AVALON_PORT}
 
 @app.post("/api/avalon/access")
 def api_avalon_access_set(b: AvalonAccessBody):
@@ -1193,6 +1242,18 @@ def _current_llm():
         return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
     if m.get("running"):  # discovery adopted the systemd avalon on 8086
         return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+    return None
+
+def _chat_target():
+    """(port, api_key) for whichever server can answer chat completions right now, else None."""
+    m = MGR.status()
+    if m.get("running") and m.get("ready") and m["port"] != AVALON_PORT:
+        return m["port"], ""
+    a = SMGR.status()
+    if a.get("running") and a.get("state") == "ready":
+        return AVALON_PORT, CFG.get("avalon_api_key", "")
+    if m.get("running") and m.get("ready"):  # discovery adopted the systemd avalon on 8086
+        return AVALON_PORT, CFG.get("avalon_api_key", "")
     return None
 
 def _yaml_merge(path, apply):
@@ -1393,16 +1454,18 @@ def api_stop():
 
 @app.post("/api/chat")
 async def api_chat(req: Request):
-    st = MGR.status()
-    if not (st["running"] and st.get("ready")):
-        raise HTTPException(409, "no running server")
+    tgt = _chat_target()
+    if not tgt:
+        raise HTTPException(409, "no model ready — load one in the Models tab or start Avalon")
+    port, key = tgt
     body = await req.json()
     body.setdefault("stream", True)
-    url = f"http://127.0.0.1:{st['port']}/v1/chat/completions"
+    url = f"http://127.0.0.1:{port}/v1/chat/completions"
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
     client = httpx.AsyncClient(timeout=None)
     async def gen():
         try:
-            async with client.stream("POST", url, json=body) as r:
+            async with client.stream("POST", url, json=body, headers=headers) as r:
                 async for chunk in r.aiter_bytes():
                     yield chunk
         finally:
@@ -1415,269 +1478,1096 @@ def index():
     return HTMLResponse(content=HTML, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 HTML = r"""<!doctype html>
-<html><head><meta charset="utf-8"><title>LFM Panel</title><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<title>LFM Panel</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark light">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2363b3ff'/><path d='M17.5 5l-8.5 13h5.2l-1.2 9 8.5-13h-5.2z' fill='%2304121f'/></svg>">
 <style>
-:root{--bg:#111418;--card:#1a1f26;--fg:#dde3ea;--mut:#8b96a5;--acc:#5ab0f0;--ok:#5ad191;--warn:#e8b45a;--err:#e86a6a;--bd:#2a323d}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 system-ui,sans-serif}
-header{display:flex;align-items:center;gap:20px;padding:10px 18px;border-bottom:1px solid var(--bd);position:sticky;top:0;background:var(--bg);z-index:5}
-header h1{font-size:15px;margin:0;color:var(--acc)}
-nav button{background:none;border:none;color:var(--mut);font:inherit;padding:6px 10px;cursor:pointer;border-radius:8px}
-nav button.on{color:var(--fg);background:var(--card)}
-main{padding:18px;max-width:1100px;margin:0 auto}
-.card{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:14px 16px;margin-bottom:12px}
-.row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
-.spread{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
-.chip{background:#232b35;border-radius:99px;padding:1px 9px;font-size:12px;color:var(--mut)}
-.chip.moe{color:var(--warn)}.chip.vl{color:var(--acc)}.chip.ok{color:var(--ok)}
-button.act{background:var(--acc);border:none;color:#08243c;padding:6px 14px;border-radius:8px;font-weight:600;cursor:pointer}
-button.stop{background:var(--err);color:#3a0d0d}
-select,input{background:#0e1216;border:1px solid var(--bd);color:var(--fg);border-radius:8px;padding:6px 8px;font:inherit}
-.meter{height:9px;background:#0e1216;border-radius:99px;overflow:hidden;margin:4px 0 10px}
-.meter i{display:block;height:100%;background:var(--acc);border-radius:99px}
-.big{font-size:22px;font-weight:700}
-pre#log{max-height:420px;overflow:auto;background:#0b0e11;padding:10px;border-radius:10px;font-size:12px;color:var(--mut)}
-.mrow{display:flex;gap:8px;margin:6px 0 14px}
-#chat{height:52vh;overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:4px}
-.msg{max-width:82%;padding:8px 12px;border-radius:12px;white-space:pre-wrap;word-wrap:break-word}
-.msg.u{align-self:flex-end;background:#274357}
-.msg.a{align-self:flex-start;background:var(--card);border:1px solid var(--bd)}
-.msg .think{color:var(--mut);font-size:12.5px;border-left:2px solid var(--bd);padding-left:8px;margin-bottom:6px;white-space:pre-wrap}
-.hidden{display:none}
-label.k{color:var(--mut);font-size:12px}
-</style></head><body>
-<header><h1>⚡ LFM Panel</h1>
-<nav>
-<button data-t="models" class="on">Models</button><button data-t="server">Server</button>
-<button data-t="avalon">Avalon</button>
-<button data-t="vitals">Vitals</button><button data-t="chat">Chat</button><button data-t="hf">HF pull</button>
-</nav><span id="hdrstatus" class="chip"></span></header>
-<main>
-<section id="t-models"><div class="card"><div class="spread"><b>Model library</b><span class="chip" id="libinfo"></span></div><div id="modellist"></div></div></section>
-<section id="t-hf" class="hidden">
- <div class="card"><b>Search Hugging Face</b>
-  <div class="mrow"><input id="hfq" style="flex:1" placeholder="search gguf repos… (Enter)" onkeydown="if(event.key=='Enter')hfSearch()">
-  <button class="act" onclick="hfSearch()">Search</button></div>
-  <div id="hfresults"></div></div>
- <div class="card" id="hffilesbox" style="display:none"><b id="hfrepo"></b><div id="hffiles" style="margin:8px 0"></div>
-  <button class="act" onclick="hfPull()">Pull selected</button></div>
- <div class="card"><b>Downloads</b><div id="downloads"></div></div>
+:root{
+  --bg:#0a0d12;--bg-2:#0e1319;--panel:#12171f;--panel-2:#161c25;--raise:#1b222c;
+  --bd:#232d38;--bd-2:#2e3945;
+  --fg:#e7edf5;--fg-2:#bcc7d5;--mut:#8794a6;--faint:#5d6a7c;
+  --acc:#63b3ff;--acc-2:#4dd6c1;--acc-ink:#04121f;
+  --ok:#4fd48a;--warn:#f0b552;--err:#ff6f6f;
+  --glow:radial-gradient(1100px 520px at 82% -12%,#16222f 0%,rgba(0,0,0,0) 62%);
+  --grad:linear-gradient(135deg,var(--acc),var(--acc-2));
+  --sh:0 1px 2px rgba(0,0,0,.45),0 10px 26px -14px rgba(0,0,0,.7);
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --r:14px;
+}
+[data-theme=light]{
+  --bg:#f5f7fa;--bg-2:#e9eef4;--panel:#ffffff;--panel-2:#fafbfd;--raise:#eef2f7;
+  --bd:#dce3eb;--bd-2:#c6d0db;
+  --fg:#101720;--fg-2:#39465a;--mut:#5c6b7d;--faint:#8a96a5;
+  --acc:#1f6feb;--acc-2:#0d9488;--acc-ink:#ffffff;
+  --ok:#0f7a55;--warn:#8f6410;--err:#c0392b;
+  --glow:radial-gradient(1100px 520px at 82% -12%,#dfe8f3 0%,rgba(0,0,0,0) 62%);
+  --sh:0 1px 2px rgba(16,24,40,.07),0 10px 26px -16px rgba(16,24,40,.22);
+}
+*,*::before,*::after{box-sizing:border-box}
+html{-webkit-text-size-adjust:100%}
+body{margin:0;min-height:100vh;background:var(--bg) var(--glow) no-repeat;color:var(--fg);
+  font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;
+  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+h1,h2,h3{margin:0;letter-spacing:-.1px}
+a{color:var(--acc)}
+code,pre,.mono{font-family:var(--mono)}
+.skip{position:absolute;left:-1px;top:-40px;background:var(--acc);color:var(--acc-ink);padding:8px 12px;border-radius:8px;z-index:99}
+.skip:focus{top:8px;left:8px}
+:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:var(--bd-2);border-radius:99px;border:2px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- header ---------- */
+header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:14px;padding:9px 16px;
+  background:rgba(10,13,18,.86);background:color-mix(in srgb,var(--bg) 84%,transparent);
+  backdrop-filter:blur(12px) saturate(150%);-webkit-backdrop-filter:blur(12px) saturate(150%);
+  border-bottom:1px solid var(--bd)}
+[data-theme=light] header{background:rgba(255,255,255,.86)}
+.brand{display:flex;align-items:center;gap:10px;flex-shrink:0}
+.mark{width:28px;height:28px;border-radius:9px;background:var(--grad);display:grid;place-items:center;
+  color:var(--acc-ink);box-shadow:0 0 0 1px rgba(255,255,255,.10),0 8px 20px -10px var(--acc)}
+.mark svg{width:16px;height:16px}
+.brand .nm{font-size:15px;font-weight:650;line-height:1.15}
+.brand .nm small{display:block;font-size:10.5px;font-weight:550;color:var(--faint);letter-spacing:.7px;text-transform:uppercase}
+.nav{display:flex;gap:2px;padding:3px;background:var(--panel);border:1px solid var(--bd);border-radius:12px;
+  overflow-x:auto;scrollbar-width:none;min-width:0}
+.nav::-webkit-scrollbar{display:none}
+.nav button{display:flex;align-items:center;gap:7px;padding:7px 11px;border:0;border-radius:9px;background:transparent;
+  color:var(--mut);font:inherit;font-size:13px;font-weight:550;cursor:pointer;white-space:nowrap;transition:background .16s,color .16s}
+.nav button svg{width:15px;height:15px;opacity:.8}
+.nav button:hover{color:var(--fg);background:var(--raise)}
+.nav button.on{color:var(--fg);background:var(--raise);box-shadow:inset 0 0 0 1px var(--bd-2),0 2px 10px -6px rgba(0,0,0,.6)}
+.nav button.on svg{color:var(--acc);opacity:1}
+.hgap{flex:1;min-width:8px}
+.pill{display:inline-flex;align-items:center;gap:7px;padding:5px 11px;border-radius:999px;border:1px solid var(--bd-2);
+  background:var(--panel);color:var(--fg-2);font-size:12.5px;font-weight:550;white-space:nowrap;max-width:44vw;overflow:hidden}
+.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.pill .dot{width:7px;height:7px;border-radius:99px;background:currentColor;flex-shrink:0}
+.pill.ok .dot{animation:pulse 2.4s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1;box-shadow:0 0 0 0 currentColor}50%{opacity:.65;box-shadow:0 0 0 3px transparent}}
+.icon{display:grid;place-items:center;width:32px;height:32px;border-radius:9px;border:1px solid var(--bd);
+  background:var(--panel);color:var(--mut);cursor:pointer;flex-shrink:0;transition:.16s}
+.icon:hover{color:var(--fg);border-color:var(--bd-2);background:var(--raise)}
+.icon svg{width:15px;height:15px}
+
+/* ---------- layout ---------- */
+main{padding:18px 16px 44px;max-width:1240px;margin:0 auto}
+section{animation:fade .22s ease-out}
+@keyframes fade{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+.hide{display:none}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(238px,1fr));gap:14px}
+.grid.wide{grid-template-columns:1fr}
+.card{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--bd);border-radius:var(--r);
+  padding:14px 16px;margin-bottom:14px;box-shadow:var(--sh)}
+.card.flat{background:var(--panel)}
+.hd{display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap;margin:-2px 0 12px}
+.hd h2{font-size:14px;font-weight:650}
+.hd .meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.stack{display:flex;flex-direction:column;gap:14px}
+.two{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
+.two>.side{width:250px;flex:0 0 250px}
+.two>.main{flex:1;min-width:280px}
+.hint{color:var(--faint);font-size:12px}
+.sep{height:1px;background:var(--bd);margin:12px 0}
+
+/* ---------- controls ---------- */
+.btn{display:inline-flex;align-items:center;gap:6px;padding:7px 13px;border-radius:9px;border:1px solid var(--bd-2);
+  background:var(--raise);color:var(--fg-2);font:inherit;font-size:13px;font-weight:600;cursor:pointer;
+  transition:transform .12s,background .16s,border-color .16s,opacity .16s}
+.btn:hover{background:var(--panel-2);border-color:var(--mut);color:var(--fg)}
+.btn:active{transform:translateY(1px)}
+.btn.primary{background:var(--grad);border:0;color:var(--acc-ink);box-shadow:0 6px 18px -10px var(--acc)}
+.btn.primary:hover{filter:brightness(1.07)}
+.btn.danger{background:color-mix(in srgb,var(--err) 14%,transparent);border-color:color-mix(in srgb,var(--err) 40%,transparent);color:var(--err)}
+.btn.danger:hover{background:color-mix(in srgb,var(--err) 24%,transparent);color:var(--err)}
+.btn.sm{padding:4px 9px;font-size:12px;border-radius:8px}
+.btn.xs{padding:3px 7px;font-size:11.5px}
+.btn[disabled]{opacity:.45;cursor:not-allowed;transform:none}
+select,input[type=text],input[type=password],input[type=search],textarea{background:var(--bg-2);border:1px solid var(--bd-2);
+  color:var(--fg);border-radius:9px;padding:7px 10px;font:inherit;font-size:13px;transition:border-color .16s,box-shadow .16s}
+select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 18%,transparent);outline:0}
+input[type=checkbox],input[type=radio]{accent-color:var(--acc);width:15px;height:15px}
+label.k{display:block;color:var(--mut);font-size:11.5px;font-weight:600;letter-spacing:.4px;text-transform:uppercase;margin-bottom:4px}
+.toolbar{display:flex;align-items:center;gap:9px;flex-wrap:wrap;margin-bottom:12px}
+.search{position:relative;flex:1;min-width:190px}
+.search svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:var(--faint)}
+.search input{width:100%;padding-left:30px}
+.segs{display:flex;gap:2px;padding:3px;background:var(--bg-2);border:1px solid var(--bd);border-radius:10px}
+.segs button{border:0;background:transparent;color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;
+  padding:5px 10px;border-radius:7px;cursor:pointer;transition:.16s}
+.segs button:hover{color:var(--fg)}
+.segs button.on{background:var(--raise);color:var(--fg);box-shadow:inset 0 0 0 1px var(--bd-2)}
+.switch{display:inline-flex;align-items:center;gap:8px;cursor:pointer;user-select:none}
+.switch input{position:absolute;opacity:0;pointer-events:none}
+.switch .track{width:38px;height:22px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd-2);position:relative;transition:.18s;flex-shrink:0}
+.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;border-radius:99px;background:var(--mut);transition:.18s}
+.switch input:checked+.track{background:color-mix(in srgb,var(--acc) 28%,transparent);border-color:var(--acc)}
+.switch input:checked+.track::after{transform:translateX(16px);background:var(--acc)}
+.switch input:focus-visible+.track{outline:2px solid var(--acc);outline-offset:2px}
+
+/* ---------- tags / stats / meters ---------- */
+.tag{display:inline-flex;align-items:center;gap:5px;padding:2px 8px;border-radius:999px;border:1px solid var(--bd-2);
+  background:rgba(255,255,255,.04);color:var(--fg-2);font-size:11.5px;font-weight:600;letter-spacing:.2px;white-space:nowrap}
+[data-theme=light] .tag{background:rgba(16,24,40,.04)}
+.tag.acc{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 34%,transparent);background:color-mix(in srgb,var(--acc) 10%,transparent)}
+.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 34%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
+.tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 34%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
+.tag.err{color:var(--err);border-color:color-mix(in srgb,var(--err) 34%,transparent);background:color-mix(in srgb,var(--err) 10%,transparent)}
+.tag.mut{color:var(--mut)}
+.kvs{display:flex;gap:7px;flex-wrap:wrap;align-items:center}
+.stat{font-size:27px;font-weight:700;letter-spacing:-.6px;font-variant-numeric:tabular-nums;line-height:1.1}
+.stat small{font-size:12.5px;font-weight:550;color:var(--mut);letter-spacing:0}
+.meter{height:7px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd);overflow:hidden;margin:8px 0 2px}
+.meter i{display:block;height:100%;border-radius:99px;background:var(--grad);transition:width .55s cubic-bezier(.4,0,.2,1)}
+.meter.warn i{background:linear-gradient(90deg,var(--warn),#ff9a5a)}
+.meter.err i{background:linear-gradient(90deg,var(--err),#ff4d6d)}
+.spark{width:100%;height:26px;display:block;margin-top:6px;opacity:.85}
+.mfoot{display:flex;justify-content:space-between;gap:8px;color:var(--faint);font-size:11.5px;font-variant-numeric:tabular-nums}
+
+/* ---------- model list ---------- */
+.mlist{display:flex;flex-direction:column;gap:8px}
+.mrow{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center;padding:10px 12px;
+  border:1px solid var(--bd);border-radius:12px;background:var(--panel);transition:border-color .16s,background .16s}
+.mrow:hover{border-color:var(--bd-2);background:var(--panel-2)}
+.mrow.run{border-color:color-mix(in srgb,var(--acc) 45%,transparent);
+  box-shadow:0 0 0 1px color-mix(in srgb,var(--acc) 22%,transparent),0 0 26px -14px var(--acc)}
+.mrow .nm{font-weight:620;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.mrow .pth{color:var(--faint);font-size:11.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:2px}
+.mrow .tags{display:flex;gap:6px;flex-wrap:wrap;margin-top:7px}
+.mrow .acts{display:flex;gap:7px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.empty{text-align:center;color:var(--faint);padding:26px 10px;border:1px dashed var(--bd-2);border-radius:12px}
+.empty b{display:block;color:var(--fg-2);font-size:14px;margin-bottom:4px}
+
+/* ---------- logs ---------- */
+.logbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.log{font-family:var(--mono);font-size:12px;line-height:1.6;color:var(--fg-2);background:var(--bg-2);
+  border:1px solid var(--bd);border-radius:12px;padding:10px 12px;max-height:420px;overflow:auto;
+  white-space:pre-wrap;word-break:break-word;margin:0}
+.log.wrapoff{white-space:pre}
+.log .e{color:var(--err)}
+.log .w{color:var(--warn)}
+.log .g{color:var(--faint)}
+
+/* ---------- chat ---------- */
+.thread{display:flex;flex-direction:column;gap:12px;padding:2px;min-height:38vh;max-height:58vh;overflow-y:auto}
+.msg{max-width:min(88%,780px);padding:10px 13px;border-radius:14px;border:1px solid var(--bd);
+  background:var(--panel-2);line-height:1.62;overflow-wrap:break-word;position:relative}
+.msg.u{align-self:flex-end;background:linear-gradient(180deg,color-mix(in srgb,var(--acc) 20%,var(--panel)),var(--panel));
+  border-color:color-mix(in srgb,var(--acc) 34%,transparent)}
+.msg.a{align-self:flex-start}
+.msg.err{border-color:color-mix(in srgb,var(--err) 45%,transparent);color:var(--err)}
+.msg .who{font-size:10.5px;font-weight:700;letter-spacing:.7px;text-transform:uppercase;color:var(--faint);margin-bottom:5px}
+.msg pre{background:var(--bg-2);border:1px solid var(--bd);border-radius:10px;padding:10px 12px;overflow:auto;
+  font-size:12.5px;line-height:1.55;margin:8px 0}
+.msg code{font-size:12.5px;background:color-mix(in srgb,var(--bg-2) 70%,transparent);padding:1px 5px;border-radius:5px;border:1px solid var(--bd)}
+.msg pre code{background:none;border:0;padding:0}
+.msg .md-h{font-weight:700;margin:8px 0 3px}
+.msg ul,.msg ol{margin:6px 0;padding-left:20px}
+.msg details{margin-bottom:7px;border-left:2px solid var(--bd-2);padding-left:9px;color:var(--mut);font-size:12.5px}
+.msg summary{cursor:pointer;font-weight:650;color:var(--faint);font-size:11.5px;letter-spacing:.4px;text-transform:uppercase}
+.msg details[open] summary{margin-bottom:5px}
+.msg .think{white-space:pre-wrap}
+.msg .bar{display:flex;gap:6px;justify-content:flex-end;margin-top:7px;opacity:0;transition:opacity .16s}
+.msg:hover .bar,.msg:focus-within .bar{opacity:1}
+.typing i{display:inline-block;width:5px;height:5px;border-radius:99px;background:var(--mut);margin-right:4px;animation:bob 1.1s infinite}
+.typing i:nth-child(2){animation-delay:.15s}.typing i:nth-child(3){animation-delay:.3s}
+@keyframes bob{0%,60%,100%{opacity:.3;transform:translateY(0)}30%{opacity:1;transform:translateY(-3px)}}
+.composer{display:flex;gap:9px;align-items:flex-end;border:1px solid var(--bd-2);border-radius:12px;padding:7px 7px 7px 11px;
+  background:var(--bg-2);margin-top:10px;transition:border-color .16s,box-shadow .16s}
+.composer:focus-within{border-color:var(--acc);box-shadow:0 0 0 3px color-mix(in srgb,var(--acc) 16%,transparent)}
+.composer textarea{flex:1;border:0;background:transparent;color:var(--fg);resize:none;min-height:26px;max-height:220px;
+  padding:5px 0;font-size:14px;line-height:1.5}
+.composer textarea:focus{outline:0;box-shadow:none}
+.clist{display:flex;flex-direction:column;gap:4px;max-height:52vh;overflow-y:auto}
+.citem{display:flex;align-items:center;gap:8px;padding:8px 9px;border-radius:10px;border:1px solid transparent;
+  cursor:pointer;transition:.14s}
+.citem:hover{background:var(--raise);border-color:var(--bd)}
+.citem.on{background:var(--raise);border-color:var(--bd-2)}
+.citem .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.citem .s{font-size:11px;color:var(--faint);white-space:nowrap}
+
+/* ---------- hf / downloads ---------- */
+.frow{display:flex;align-items:center;gap:10px;padding:7px 9px;border-radius:9px;cursor:pointer;border:1px solid transparent}
+.frow:hover{background:var(--raise);border-color:var(--bd)}
+.frow .p{flex:1;min-width:0;font-family:var(--mono);font-size:12.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dl{padding:9px 0;border-bottom:1px solid var(--bd)}
+.dl:last-child{border-bottom:0}
+
+/* ---------- toast / dialog ---------- */
+.toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:80;max-width:min(440px,92vw)}
+.toast{display:flex;gap:9px;align-items:flex-start;padding:10px 12px;border-radius:12px;border:1px solid var(--bd-2);
+  background:var(--panel-2);box-shadow:0 18px 40px -18px rgba(0,0,0,.8);cursor:pointer;font-size:13px;
+  animation:tin .2s cubic-bezier(.2,.8,.2,1)}
+.toast.out{animation:tout .18s forwards}
+.toast .ti{width:8px;height:8px;border-radius:99px;background:var(--mut);margin-top:6px;flex-shrink:0}
+.toast.ok .ti{background:var(--ok)}.toast.err{border-color:color-mix(in srgb,var(--err) 40%,transparent)}
+.toast.err .ti{background:var(--err)}.toast.warn .ti{background:var(--warn)}
+@keyframes tin{from{opacity:0;transform:translateY(10px) scale(.98)}to{opacity:1;transform:none}}
+@keyframes tout{to{opacity:0;transform:translateY(6px)}}
+.dlg{position:fixed;inset:0;z-index:90;display:grid;place-items:center;padding:16px;
+  background:rgba(4,7,11,.66);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);opacity:0;transition:opacity .16s}
+.dlg.in{opacity:1}
+.dlg.out{opacity:0}
+.dlg .box{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--bd-2);border-radius:16px;
+  box-shadow:0 40px 90px -28px rgba(0,0,0,.9);padding:16px;max-height:88vh;display:flex;flex-direction:column;
+  transform:translateY(6px) scale(.99);transition:transform .18s}
+.dlg.in .box{transform:none}
+.dlg-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.dlg-hd b{font-size:15px}
+.dlg-bd{overflow:auto;min-height:0}
+.dlg-ft{display:flex;gap:8px;justify-content:flex-end;margin-top:14px;flex-wrap:wrap}
+.dlg-p{margin:0;color:var(--fg-2);line-height:1.6}
+.dlg-p code{font-size:12px;word-break:break-all}
+
+/* ---------- footer ---------- */
+footer{max-width:1240px;margin:0 auto;padding:0 16px 26px;color:var(--faint);font-size:11.5px;
+  display:flex;gap:14px;flex-wrap:wrap;align-items:center}
+kbd{font-family:var(--mono);font-size:11px;border:1px solid var(--bd-2);border-bottom-width:2px;border-radius:5px;
+  padding:1px 5px;background:var(--bg-2);color:var(--fg-2)}
+
+@media (max-width:880px){
+  header{flex-wrap:wrap;gap:9px}
+  .brand .nm small{display:none}
+  .nav{order:3;width:100%}
+  .two>.side{width:100%;flex:1 1 100%}
+  .mrow{grid-template-columns:1fr}
+  .mrow .acts{justify-content:flex-start}
+  .thread{max-height:none}
+}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+}
+</style></head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header>
+  <div class="brand">
+    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+    <span class="nm">LFM Panel<small>local model console</small></span>
+  </div>
+  <nav class="nav" id="nav" aria-label="Sections">
+    <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
+    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>Server</button>
+    <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Avalon</button>
+    <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>Vitals</button>
+    <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg>Chat</button>
+    <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>HF pull</button>
+  </nav>
+  <span class="hgap"></span>
+  <span class="pill" id="hdrstatus" title="Active inference server"><span class="dot"></span><span id="hdrtext">checking…</span></span>
+  <button class="icon" id="theme" title="Toggle light / dark theme" aria-label="Toggle theme"></button>
+  <button class="icon" id="logout" title="Sign out" aria-label="Sign out"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M15 12H4m0 0l3.5-3.5M4 12l3.5 3.5"/><path d="M9 4h7a2 2 0 012 2v12a2 2 0 01-2 2H9"/></svg></button>
+</header>
+
+<main id="main">
+<section id="t-models">
+  <div class="card">
+    <div class="hd"><h2>Model library</h2>
+      <div class="meta"><span class="tag mut" id="libinfo">scanning…</span>
+        <button class="btn sm" id="rescan" title="Re-scan model directories">Rescan</button></div></div>
+    <div class="toolbar">
+      <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="msearch" type="search" placeholder="Filter by name, quant, arch…  press /" aria-label="Filter models"></div>
+      <div class="segs" id="mfilter" role="group" aria-label="Filter">
+        <button data-f="all" class="on">All</button><button data-f="moe">MoE</button>
+        <button data-f="vl">VL</button><button data-f="run">Loaded</button></div>
+      <select id="msort" aria-label="Sort models">
+        <option value="name">Name A–Z</option><option value="size">Largest first</option>
+        <option value="small">Smallest first</option><option value="arch">Architecture</option></select>
+    </div>
+    <div id="modellist" class="mlist"></div>
+    <p class="hint" style="margin:12px 0 0">Loading a model stops the one currently running. Presets: <b>auto</b> picks from model metadata.</p>
+  </div>
 </section>
-<section id="t-server" class="hidden">
- <div class="card"><div class="spread"><b>llama-server</b><span id="srvchip" class="chip"></span></div>
-  <div id="srvdetail" class="row"></div>
-  <div class="row" style="margin-top:10px"><button class="act stop" onclick="stopSrv()">Stop</button>
-  <span class="chip">child binds 127.0.0.1 — LAN only via this panel</span></div></div>
- <div class="card"><b>Log</b><pre id="log"></pre></div>
+
+<section id="t-server" class="hide">
+  <div class="card">
+    <div class="hd"><h2>llama-server</h2><span class="tag" id="srvchip">checking…</span></div>
+    <div id="srvdetail" class="kvs"></div>
+    <div class="row" style="display:flex;gap:9px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn danger" id="srvstop">Stop server</button>
+      <button class="btn" id="agentsbtn">Register in coding agents…</button>
+      <span class="hint">child binds 127.0.0.1 — reachable on the LAN only through this panel</span></div>
+  </div>
+  <div class="card">
+    <div class="hd"><h2>Server log</h2><span class="tag mut" id="logn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="logfilter" type="search" placeholder="Filter log lines…" aria-label="Filter log"></div>
+      <label class="switch"><input type="checkbox" id="logauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <label class="switch"><input type="checkbox" id="logwrap" checked><span class="track"></span><span class="hint">Wrap</span></label>
+      <button class="btn sm" id="logcopy">Copy</button><button class="btn sm" id="logsave">Save</button></div>
+    <pre class="log" id="log"></pre>
+  </div>
 </section>
-<section id="t-avalon" class="hidden">
- <div class="card"><div class="spread"><b>Avalon — Qwen3.8-Flash-Next (125B MoE)</b><span id="avalonchip" class="chip"></span></div>
-  <div id="avalondetail" class="row" style="margin:6px 0"></div>
-  <div class="row" style="margin-top:8px"><button class="act" onclick="avalonStart()">Start selected profile</button>
-  <button class="act stop" onclick="avalonStop()">Stop</button>
-  <span class="chip">OpenAI-compatible · streams reasoning_content</span></div>
-  <div id="avalonprofiles" style="margin-top:10px"></div></div>
- <div class="card"><div class="spread"><b>Network access</b>
-  <label class="row" style="gap:6px;margin:0"><input type="checkbox" id="avalonlan" onchange="avalonSetLan(this.checked)">
-  <span>Expose to LAN (:8080)</span></label></div>
-  <div id="avalonaccess" class="row" style="margin-top:6px"></div></div>
- <div class="card"><b>Avalon log</b><pre id="avalonlog" style="max-height:260px"></pre></div>
+
+<section id="t-avalon" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Avalon — Qwen3.8-Flash-Next (125B MoE)</h2><span class="tag" id="avalonchip">checking…</span></div>
+    <div id="avalondetail" class="kvs" style="margin-bottom:10px"></div>
+    <div id="avalonprofiles"></div>
+    <div style="display:flex;gap:9px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="avalonstart">Start selected profile</button>
+      <button class="btn danger" id="avalonstop">Stop</button>
+      <span class="hint">OpenAI-compatible · streams <code>reasoning_content</code></span></div>
+  </div>
+  <div class="card">
+    <div class="hd"><h2>Network access</h2>
+      <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN</span></label></div>
+    <div id="avalonaccess" class="kvs"></div>
+  </div>
+  <div class="card"><div class="hd"><h2>Avalon log</h2></div><pre class="log" id="avalonlog" style="max-height:280px"></pre></div>
 </section>
-<section id="t-vitals" class="hidden"><div id="vitals"></div></section>
-<section id="t-chat" class="hidden"><div style="display:flex;gap:12px;align-items:flex-start">
- <div class="card" style="width:240px;flex-shrink:0"><div class="spread"><b>Chats</b><button class="act" onclick="newChat()">+ New</button></div><div id="chatlist"></div></div>
- <div class="card" style="flex:1;min-width:0"><div id="chat"></div>
- <div class="mrow"><input id="prompt" style="flex:1" placeholder="message… (Enter to send)" onkeydown="if(event.key=='Enter')send()">
- <button class="act" onclick="send()">Send</button></div></div></div></section>
+
+<section id="t-vitals" class="hide">
+  <div class="hd" style="margin-bottom:10px"><h2>System vitals</h2>
+    <div class="meta"><span class="tag mut" id="vupdatetime">—</span><button class="btn sm" id="vrefresh">Refresh</button></div></div>
+  <div id="vitals" class="grid"></div>
+</section>
+
+<section id="t-chat" class="hide">
+  <div class="two">
+    <div class="card side">
+      <div class="hd"><h2>Chats</h2><button class="btn sm primary" id="newchat">+ New</button></div>
+      <div id="chatlist" class="clist"></div>
+    </div>
+    <div class="card main">
+      <div class="hd"><h2>Conversation</h2><div class="meta"><span class="tag" id="chatmodel">no model</span>
+        <button class="btn xs" id="sysbtn" title="Edit the system prompt">System prompt</button></div></div>
+      <div id="sysbox" class="hide" style="margin-bottom:10px">
+        <textarea id="sysprompt" rows="3" style="width:100%"></textarea>
+        <p class="hint" style="margin:5px 0 0">Saved in this browser. Applies to every new message.</p></div>
+      <div id="chat" class="thread"></div>
+      <div class="composer">
+        <textarea id="prompt" rows="1" placeholder="Message… Enter to send, Shift+Enter for a new line" aria-label="Message"></textarea>
+        <button class="btn" id="stopbtn" style="display:none">Stop</button>
+        <button class="btn primary" id="sendbtn">Send</button></div>
+      <p class="hint" style="margin:8px 2px 0" id="chatnote"></p>
+    </div>
+  </div>
+</section>
+
+<section id="t-hf" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Search Hugging Face</h2><span class="tag mut" id="hfinfo"></span></div>
+    <div style="display:flex;gap:9px;flex-wrap:wrap">
+      <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="hfq" type="search" placeholder="search gguf repos… press Enter" aria-label="Search Hugging Face"></div>
+      <button class="btn primary" id="hfsearch">Search</button></div>
+    <div id="hfresults" style="margin-top:10px"></div>
+  </div>
+  <div class="card hide" id="hffilesbox">
+    <div class="hd"><h2 id="hfrepo"></h2><div class="meta"><span class="tag mut" id="hftotal"></span>
+      <button class="btn sm" id="hfnone">Clear</button></div></div>
+    <div id="hffiles"></div>
+    <button class="btn primary" id="hfpull" style="margin-top:10px">Pull selected</button>
+  </div>
+  <div class="card"><div class="hd"><h2>Downloads</h2><span class="tag mut" id="dlinfo"></span></div>
+    <div id="downloads"><span class="hint">none</span></div></div>
+</section>
 </main>
+
+<footer>
+  <span><kbd>1</kbd>–<kbd>6</kbd> switch tabs</span><span><kbd>/</kbd> filter</span>
+  <span><kbd>Esc</kbd> close</span><span><kbd>Enter</kbd> send · <kbd>Shift+Enter</kbd> newline</span>
+  <span id="footnote"></span>
+</footer>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
 <script>
-const $=s=>document.querySelector(s);
-let MODELS=[],ACTIVE=null;
-document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
- document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));b.classList.add('on');
- document.querySelectorAll('main section').forEach(s=>s.classList.add('hidden'));
- $('#t-'+b.dataset.t).classList.remove('hidden');});
-function h(n){return n.toFixed?n.toFixed(1):n}
-async function j(url,opt){const r=await fetch(url,opt);if(!r.ok)throw(await r.text());return r.json()}
-async function loadModels(){MODELS=(await j('/api/models')).models;
- $('#libinfo').textContent=MODELS.length+' models';
- $('#modellist').innerHTML=MODELS.map(m=>`<div class="row" style="padding:8px 0;border-bottom:1px solid var(--bd)">
-  <b style="min-width:280px">${m.name}</b>
-  <span class="chip">${m.arch}</span><span class="chip">${m.quant}</span>
-  ${m.params?`<span class="chip">${m.params}</span>`:''}<span class="chip">${m.size_h}</span>
-  ${m.moe?'<span class="chip moe">MoE</span>':''}${m.vl?'<span class="chip vl">VL</span>':''}
-  <span style="flex:1"></span>
-  <select id="p_${btoa(m.path)}"><option value="auto">auto preset</option><option value="dense-gpu">dense-gpu</option><option value="moe-split">moe-split</option><option value="vision">vision</option><option value="igpu-full">iGPU full (780M)</option><option value="igpu-vision">iGPU vision (780M)</option></select>
-  <button class="act" onclick="start('${m.path}')">Start</button>
-  <button class="act stop" onclick="delModel('${m.path}','${m.name}','${m.size_h}')">✕</button></div>`).join('');}
-async function delModel(path,name,size){
- if(!confirm('Delete '+name+' ('+size+')?\\n'+path+'\\n\\nThis cannot be undone.'))return;
- const r=await fetch('/api/models/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path})});
- if(r.ok){const d=await r.json();alert('Deleted: '+d.deleted+' ('+d.freed_h+' freed)');loadModels();}
- else alert('Delete failed: '+await r.text());}
-async function hfSearch(){const q=$('#hfq').value.trim();if(!q)return;
- const res=await j('/api/hf/search?q='+encodeURIComponent(q));
- $('#hfresults').innerHTML=res.map(m=>`<div class="row" style="padding:6px 0;border-bottom:1px solid var(--bd);cursor:pointer" onclick="hfFiles('${m.id}')">
-  <b style="flex:1">${m.id}</b><span class="chip">↓ ${m.downloads}</span><span class="chip">★ ${m.likes}</span></div>`).join('')||'<span class="chip">no results</span>';}
-async function hfFiles(repo){const files=await j('/api/hf/files?repo='+encodeURIComponent(repo));
- $('#hfrepo').textContent=repo;
- $('#hffiles').innerHTML=files.map(f=>`<label class="row" style="padding:4px 0"><input type="checkbox" value="${f.path}" data-size="${f.size}">
-  <span style="flex:1;word-break:break-all">${f.path}</span><span class="chip">${f.size_h}</span></label>`).join('')||'<span class="chip">no gguf files</span>';
- $('#hffilesbox').style.display='block';}
-async function hfPull(){const sel=[...document.querySelectorAll('#hffiles input:checked')].map(i=>i.value);
- if(!sel.length)return alert('select files first');
- const repo=$('#hfrepo').textContent;
- const r=await fetch('/api/hf/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({repo,files:sel})});
- if(!r.ok)return alert(await r.text());
- setInterval(pollDownloads,1500);pollDownloads();}
-async function pollDownloads(){const ds=await j('/api/downloads');if(!ds.length){$('#downloads').innerHTML='<span class="chip">none</span>';return}
- $('#downloads').innerHTML=ds.map(d=>{const pct=d.total?Math.round(100*d.done/d.total):0;
-  return `<div style="padding:6px 0;border-bottom:1px solid var(--bd)"><div class="spread"><span>${d.file}</span>
-  <span class="chip ${d.status==='done'?'ok':''}">${d.status}${d.status==='downloading'?` ${pct}% · ${h(d.done/1e9)}G`:''}</span></div>
-  ${d.status==='downloading'?`<div class="meter"><i style="width:${pct}%"></i></div>`:''}
-  ${d.status==='downloading'?`<button class="act stop" onclick="fetch('/api/downloads/cancel',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:'${d.id}'})})">Cancel</button>`:''}</div>`;}).join('');}
-async function start(path){
- const sel=document.getElementById('p_'+btoa(path));
- try{await j('/api/server/start',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({model:path,preset:sel?sel.value:'auto'})});pollStatus(true);}
- catch(e){alert('Start failed: '+e);}}
-async function stopSrv(){await j('/api/server/stop',{method:'POST'});pollStatus(true)}
-function pollStatus(force){return j('/api/server/status').then(st=>{
- ACTIVE=st.running?st:null;
- $('#hdrstatus').textContent=st.running?(st.ready?'● '+st.alias:'◌ '+st.alias+' (loading)'):'○ no server';
- $('#hdrstatus').className='chip '+(st.running?(st.ready?'ok':''):'');
- $('#srvchip').textContent=st.running?(st.ready?'running · ready':'running · loading'):'stopped';
- $('#srvchip').className='chip '+(st.running&&st.ready?'ok':'');
- $('#srvdetail').innerHTML=st.running?`
-  <span class="chip">alias ${st.alias}</span><span class="chip">pid ${st.pid}</span>
-  <span class="chip">preset ${st.preset}</span><span class="chip">port ${st.port}</span>
-  <span class="chip">uptime ${Math.floor(st.uptime/60)}m${st.uptime%60}s</span>
-  <button class="act" onclick="agentsModal()">Agents…</button>`:'<span class="chip">pick a model and press Start</span>';
- if(force&&!st.running)loadModels();}).catch(()=>{})}
-function closeAgModal(){document.getElementById('agmodal')?.remove();}
-async function agentsModal(){
- closeAgModal();
- let d;try{d=await j('/api/agents');}catch(e){alert('Failed: '+e);return;}
- const reg=(d.registry&&d.registry.agents)||{};
- const rows=d.agents.map(a=>{
-  const r=reg[a.id];
-  return `<label style="display:flex;gap:8px;align-items:center;padding:4px 0">
-   <input type="checkbox" class="agchk" value="${a.id}">
-   <span>${a.label}</span>
-   ${r?`<span class="chip ok">${r.alias}@${r.port}</span>`:''}
-   ${a.hint?`<span style="opacity:.55;font-size:12px">${a.hint}</span>`:''}</label>`;}).join('');
- const el=document.createElement('div');el.id='agmodal';
- el.style.cssText='position:fixed;inset:0;background:#000a;display:flex;align-items:center;justify-content:center;z-index:99';
- el.innerHTML=`<div style="background:#14161a;color:var(--fg,#ddd);border:1px solid var(--bd,#333);padding:16px;border-radius:8px;min-width:min(420px,92vw)">
-  <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px">
-   <b>Register into coding agents</b><button class="act" onclick="closeAgModal()">✕</button></div>
-  <div style="margin-bottom:6px;opacity:.7;font-size:12px">writes each agent's config to point at ${d.running?`${d.running[0]} @ :${d.running[1]}`:'—'}</div>
-  ${rows}
-  <div style="margin-top:12px"><button class="act" onclick="syncAgents()">Apply</button></div></div>`;
- document.body.appendChild(el);}
-async function syncAgents(){
- const picks=[...document.querySelectorAll('.agchk:checked')].map(x=>x.value);
- if(!picks.length){alert('pick at least one agent');return;}
- let r;try{r=await j('/api/agents/sync',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({agents:picks})});}
- catch(e){alert('Sync failed: '+e);return;}
- alert(Object.entries(r.results).map(([k,v])=>k+': '+(v.ok?'✓ '+v.detail:'✗ '+v.detail)).join('\n'));
- closeAgModal();pollStatus(true);}
-function drawVitals(v){let out='';
- if(v.gpu){const g=v.gpu,pct=Math.round(100*g.used_mb/g.total_mb),idle=g.util===0;
-  const extra=[g.power_w!=null?g.power_w+' W':null,idle?null:(g.fan_rpm?g.fan_rpm+' RPM fan':null),idle?null:(g.sclk_mhz?g.sclk_mhz+' MHz':null),g.mclk_mhz?g.mclk_mhz+' MHz mem':null].filter(Boolean).join(' · ');
-  out+=`<div class="card"><div class="spread"><b>GPU</b><span class="chip">${idle?'idle':g.temp+'°C junction'}${g.temp_mem!=null?' · '+g.temp_mem+'°C mem':''} · ${g.util}% util${g.stale?' · cached':''}</span></div>
-  <div class="big">${g.used_mb} <small>/ ${g.total_mb} MB VRAM</small></div>
-  <div class="meter"><i style="width:${pct}%"></i></div>${extra?`<div class="chip" style="margin-top:6px">${extra}</div>`:''}</div>`;}
- const m=v.mem,mp=Math.round(100*m.used_gb/m.total_gb);
- out+=`<div class="card"><b>RAM</b><div class="big">${m.used_gb} <small>/ ${m.total_gb} GB</small></div><div class="meter"><i style="width:${mp}%"></i></div></div>`;
- if(v.cpu)out+=`<div class="card"><div class="spread"><b>CPU</b><span class="chip">${v.cpu.cores} threads</span></div><div class="big">${v.cpu.percent}%</div><div class="meter"><i style="width:${v.cpu.percent}%"></i></div></div>`;
- for(const[k,d]of Object.entries(v.disk||{})){const p=Math.round(100*d.used_gb/d.total_gb);
-  out+=`<div class="card"><b>Disk ${k}</b><div class="big">${d.used_gb} <small>/ ${d.total_gb} GB</small></div><div class="meter"><i style="width:${p}%"></i></div></div>`;}
- $('#vitals').innerHTML=out;}
-let HIST=[],CID=null,SYSPROMPT='You are a helpful local assistant. Be concise.';
-const escq=s=>esc(s).replace(/"/g,'&quot;');
-function esc(s){const d=document.createElement('div');d.textContent=s;return d.innerHTML}
-function addMsg(m){const d=document.createElement('div');d.className='msg '+(m.role==='user'?'u':'a');
- d.innerHTML=(m.reasoning?'<span class="think">'+esc(m.reasoning)+'</span>':'')+'<span class="ans">'+esc(m.content||'')+'</span>';
- $('#chat').appendChild(d);$('#chat').scrollTop=1e9;return d}
-async function loadChatList(){try{const cs=await j('/api/chats');
- $('#chatlist').innerHTML='<div class="row" style="padding:2px 0 8px"><button class="act" style="width:100%" onclick="newChat()">+ New chat</button></div>'
-  +(cs.map(c=>`<div class="row" style="padding:5px 0;border-bottom:1px solid var(--bd);cursor:pointer" onclick="openChat('${c.id}')">
-   <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escq(c.title)}">${esc(c.title)}</span>
-   <span class="chip">${c.msgs}</span>
-   <button class="act stop" onclick="event.stopPropagation();delChat('${c.id}')">✕</button></div>`).join('')||'<span class="chip">no chats yet</span>');}catch(e){}}
-async function openChat(id){const c=await j('/api/chats/'+id);CID=id;HIST=c.messages.filter(m=>m.role!=='system');
- $('#chat').innerHTML='';HIST.forEach(addMsg);}
-function newChat(){CID=null;HIST=[];$('#chat').innerHTML='';}
-async function delChat(id){if(!confirm('Delete this chat?'))return;
- await fetch('/api/chats/'+id,{method:'DELETE'});if(CID===id)newChat();loadChatList();}
-async function send(){const t=$('#prompt');const q=t.value.trim();if(!q)return;t.value='';
- const um={role:'user',content:q};HIST.push(um);addMsg(um);
- const model=ACTIVE?ACTIVE.alias:'';
- j('/api/chats/append',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({id:CID,model:model,role:'user',content:q})}).then(r=>{CID=r.id;loadChatList()});
- const box=addMsg({role:'assistant',content:''});
- const think=box.querySelector('.think'),ans=box.querySelector('.ans');
- let buff='',bufa='';
- try{const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
-  body:JSON.stringify({messages:[{role:'system',content:SYSPROMPT},...HIST.map(m=>({role:m.role,content:m.content}))]})});
-  if(!r.ok){const d=await r.text();ans.textContent=d.includes('no running server')?'No model running — start one in the Models tab first.':'error: '+d;return}
-  const rd=r.body.getReader(),dec=new TextDecoder();let sbuf='';
-  for(;;){const{done,value}=await rd.read();if(done)break;sbuf+=dec.decode(value,{stream:true});
-   const lines=sbuf.split('\n');sbuf=lines.pop();
-   for(const ln of lines){if(!ln.startsWith('data: '))continue;const d=ln.slice(6);
-    if(d==='[DONE]')continue;
-    try{const j2=JSON.parse(d),dl=j2.choices?.[0]?.delta||{};
-     if(dl.reasoning_content){buff+=dl.reasoning_content;think.textContent=buff}
-     if(dl.content){bufa+=dl.content;ans.textContent=bufa}
-     $('#chat').scrollTop=1e9;}catch(e){}}}
-  HIST.push({role:'assistant',content:bufa||buff,reasoning:buff});
-  j('/api/chats/append',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({id:CID,model:model,role:'assistant',content:bufa||buff,reasoning:buff})}).then(()=>loadChatList());
- }catch(e){ans.textContent='error: '+e}}
-async function refreshLog(){try{const{log}=(await j('/api/server/log'));const p=$('#log');
-if(p.textContent!==log){p.textContent=log;p.scrollTop=1e9;}}catch(e){}}
-let AVALON_SEL=null,AVALON_LIST=[];
-function fmtUp(s){s|=0;const m=(s/60)|0;return m>=60?((m/60)|0)+'h'+(m%60)+'m':m+'m'+(s%60)+'s'}
-async function loadAvalon(){try{AVALON_LIST=await j('/api/avalon/profiles');const st=await j('/api/avalon/status');
- if(AVALON_SEL===null)AVALON_SEL=(st.running&&st.profile)||'balanced';
- $('#avalonprofiles').innerHTML=AVALON_LIST.map(p=>`
-  <label class="row" style="padding:9px 10px;border-bottom:1px solid var(--bd);cursor:pointer;border-radius:8px;${p.key===AVALON_SEL?'background:#1c2630':''}">
-   <input type="radio" name="sprof" value="${p.key}" ${p.key===AVALON_SEL?'checked':''} ${p.available?'':'disabled'} onchange="AVALON_SEL='${p.key}';loadAvalon()">
-   <span style="flex:1"><b>${p.label}</b>${st.running&&st.profile===p.key?' <span class="chip ok">running</span>':''}<br>
-   <span class="chip">${p.desc}</span> <span class="chip ok">${p.speed}</span>${p.available?'':' <span class="chip" style="color:var(--err)">config missing</span>'}</span>
-  </label>`).join('');
- const c=$('#avalonchip');
- c.textContent=st.running?(st.state==='ready'?'● avalon · '+(st.profile||''):'◌ avalon loading…'):'○ avalon stopped';
- c.className='chip '+(st.running&&st.state==='ready'?'ok':'');
- $('#avalondetail').innerHTML=st.running?`<span class="chip">pid ${st.pid||'?'}${st.adopted?' · adopted':''}</span><span class="chip">up ${fmtUp(st.uptime||0)}</span><span class="chip">ctx ${st.max_context||'…'}</span><span class="chip">${st.model||''}</span>`:'';
- const{log}=await j('/api/avalon/log');const p2=$('#avalonlog');
- if(p2.textContent!==log){p2.textContent=log;p2.scrollTop=1e9;}}catch(e){}}
-async function avalonStart(){try{
-  await j('/api/avalon/start',{method:'POST',headers:{'Content-Type':'application/json'},
-   body:JSON.stringify({profile:AVALON_SEL})});}
- catch(e){const t=String(e);
-  if(t.includes('Stop the LFM server')&&confirm('This profile needs the VRAM the LFM server is using.\\nStop the LFM server and start Avalon?')){
-   await j('/api/server/stop',{method:'POST'});return avalonStart();}
-  alert('Start failed: '+t);}
- loadAvalon().catch(()=>{})}
-async function avalonStop(){await j('/api/avalon/stop',{method:'POST'});loadAvalon().catch(()=>{})}
-async function loadAvalonAccess(){try{const a=await j('/api/avalon/access');
- $('#avalonlan').checked=a.lan;
- $('#avalonaccess').innerHTML=a.lan
-  ?`<span class="chip ok">LAN · http://${a.ip}:8080/v1</span>
-    <span class="chip">key: <code>${esc(a.api_key)}</code></span>
-    <button class="act" style="padding:2px 8px" onclick="avalonRegen()">New key</button>
-    <span class="chip">send as: Authorization: Bearer &lt;key&gt;</span>`
-  :`<span class="chip">local only · http://127.0.0.1:8080/v1</span>`;}catch(e){}}
-async function avalonSetLan(on){try{await j('/api/avalon/access',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lan:on})});}catch(e){alert('Failed: '+e)}loadAvalonAccess();loadAvalon().catch(()=>{})}
-async function avalonRegen(){if(!confirm('Generate a new API key? Every LAN client must update its key.'))return;
- await j('/api/avalon/access/regenerate',{method:'POST'});loadAvalonAccess();}
-loadModels();pollStatus();loadChatList();loadAvalon();loadAvalonAccess();
-setInterval(()=>{pollStatus();loadAvalon();},2500);
-setInterval(()=>{if(!document.getElementById('t-vitals').classList.contains('hidden'))j('/api/vitals').then(drawVitals)},2000);
-setInterval(()=>{if(!document.getElementById('t-server').classList.contains('hidden'))refreshLog()},1500);
-document.getElementById('t-vitals').classList.contains('hidden')||j('/api/vitals').then(drawVitals);
-</script></body></html>"""
+/* ============================== helpers ============================== */
+const $=(s,r=document)=>r.querySelector(s);
+const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
+const n0=v=>Number(v||0).toLocaleString();
+const gib=b=>(Number(b||0)/1073741824).toFixed(2)+' GB';
+const ago=t=>{const s=Date.now()/1000-(t||0);if(s<60)return'just now';if(s<3600)return((s/60)|0)+'m ago';
+  if(s<86400)return((s/3600)|0)+'h ago';return((s/86400)|0)+'d ago'};
+const fmtUp=s=>{s=s|0;const h=(s/3600)|0,m=((s%3600)/60)|0;return h?h+'h '+m+'m':m?m+'m '+(s%60)+'s':s+'s'};
+
+async function api(url,opt){
+  const r=await fetch(url,opt);
+  if(!r.ok){let d=await r.text();try{const j=JSON.parse(d);d=(j&&j.detail)||d}catch(e){}
+    throw new Error(String(d).slice(0,400))}
+  return r.json();
+}
+const post=(u,b)=>api(u,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b||{})});
+
+async function copy(text,label){
+  try{await navigator.clipboard.writeText(text)}
+  catch(e){
+    const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+    document.body.appendChild(ta);ta.select();
+    let ok=false;try{ok=document.execCommand('copy')}catch(_){}
+    ta.remove();if(!ok)return toast('Clipboard blocked by the browser — select and copy manually','err');
+  }
+  toast((label||'Copied')+' · '+String(text).slice(0,60),'ok',2400);
+}
+
+/* ============================== toasts ============================== */
+function toast(msg,kind,ms){
+  kind=kind||'info';
+  const t=document.createElement('div');t.className='toast '+kind;
+  t.innerHTML='<span class="ti"></span><div>'+esc(msg)+'</div>';
+  $('#toasts').appendChild(t);
+  const kill=()=>{t.classList.add('out');setTimeout(()=>t.remove(),200)};
+  t.addEventListener('click',kill);
+  setTimeout(kill,ms||(kind==='err'?9000:4200));
+}
+
+/* ============================== dialogs ============================== */
+let openDlg=null;
+function dialog(o){
+  if(openDlg)openDlg.close(null);
+  const el=document.createElement('div');el.className='dlg';
+  el.innerHTML='<div class="box" role="dialog" aria-modal="true" style="width:min('+(o.width||'520px')+',94vw)">'
+    +'<div class="dlg-hd"><b>'+esc(o.title||'')+'</b><button class="icon" data-x aria-label="Close">✕</button></div>'
+    +'<div class="dlg-bd">'+(o.html||'')+'</div><div class="dlg-ft"></div></div>';
+  const inst={el:el,box:el.querySelector('.box'),body:el.querySelector('.dlg-bd'),foot:el.querySelector('.dlg-ft'),
+    close(v){document.removeEventListener('keydown',onk);el.classList.add('out');
+      setTimeout(()=>el.remove(),180);if(openDlg===inst)openDlg=null;if(inst.onclose)inst.onclose(v)}};
+  function onk(e){if(e.key==='Escape'){e.preventDefault();inst.close(null)}}
+  el.querySelector('[data-x]').addEventListener('click',()=>inst.close(null));
+  el.addEventListener('mousedown',e=>{if(e.target===el)inst.close(null)});
+  document.addEventListener('keydown',onk);
+  document.body.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('in'));
+  openDlg=inst;
+  return inst;
+}
+function mkBtn(label,kind){const b=document.createElement('button');b.className='btn '+(kind||'');b.textContent=label;return b}
+function confirmDlg(title,msg,okLabel,danger){
+  return new Promise(res=>{
+    const d=dialog({title:title,html:'<p class="dlg-p">'+msg+'</p>',width:'500px'});
+    const no=mkBtn('Cancel'),yes=mkBtn(okLabel||'Confirm',danger?'danger':'primary');
+    d.foot.append(no,yes);
+    no.addEventListener('click',()=>{d.close();res(false)});
+    yes.addEventListener('click',()=>{d.close();res(true)});
+    d.onclose=v=>res(v===true);
+    yes.focus();
+  });
+}
+
+/* ============================== theme ============================== */
+const SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
+const MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 14a8 8 0 01-9.5-9.5A8 8 0 1020 14z"/></svg>';
+function applyTheme(t){document.documentElement.dataset.theme=t;$('#theme').innerHTML=t==='dark'?SUN:MOON;
+  $('#theme').title=t==='dark'?'Switch to light theme':'Switch to dark theme'}
+applyTheme(localStorage.getItem('lfm.theme')||(matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'));
+$('#theme').addEventListener('click',()=>{
+  const t=document.documentElement.dataset.theme==='dark'?'light':'dark';
+  applyTheme(t);localStorage.setItem('lfm.theme',t)});
+$('#logout').addEventListener('click',async()=>{
+  if(!await confirmDlg('Sign out','End this panel session?','Sign out',true))return;
+  try{await post('/api/logout')}catch(e){}
+  location.href='/login'});
+
+/* ============================== tabs ============================== */
+const TABS=['models','server','avalon','vitals','chat','hf'];
+let tab='models';
+function setTab(t){
+  if(TABS.indexOf(t)<0)t='models';
+  tab=t;localStorage.setItem('lfm.tab',t);
+  $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
+  $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
+  if(t==='vitals')refreshVitals();
+  if(t==='server')refreshLog();
+  if(t==='avalon'){loadAvalon();loadAvalonAccess()}
+}
+$$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
+
+/* ============================== models ============================== */
+let MODELS=[],MMP=[],ACTIVE=null,AV=null,FILTER='all',SORT='name';
+async function loadModels(){
+  const d=await api('/api/models');MODELS=d.models||[];MMP=d.mmproj||[];renderModels();
+}
+function modelRow(m,i){
+  const running=ACTIVE&&ACTIVE.model===m.path;
+  const tags=['<span class="tag">'+esc(m.arch)+'</span>','<span class="tag acc">'+esc(m.quant)+'</span>'];
+  if(m.params)tags.push('<span class="tag">'+esc(m.params)+'</span>');
+  if(m.ctx_len)tags.push('<span class="tag mut">'+n0(m.ctx_len)+' ctx</span>');
+  tags.push('<span class="tag mut">'+esc(m.size_h)+'</span>');
+  if(m.moe)tags.push('<span class="tag warn">MoE</span>');
+  if(m.vl)tags.push('<span class="tag acc">VL</span>');
+  if(running)tags.push('<span class="tag ok">loaded</span>');
+  return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'">'
+    +'<div style="min-width:0"><div class="nm" title="'+esc(m.path)+'">'+esc(m.name)+'</div>'
+    +'<div class="pth">'+esc(m.path.replace(/^\/[^/]*\//,'/…/'))+'</div>'
+    +'<div class="tags">'+tags.join('')+'</div></div>'
+    +'<div class="acts"><select data-preset aria-label="Preset for '+esc(m.name)+'">'
+    +['auto|auto preset','dense-gpu|dense · full offload','moe-split|MoE · split experts','vision|vision + mmproj',
+      'igpu-full|iGPU full (780M)','igpu-vision|iGPU vision (780M)']
+      .map(o=>{const p=o.split('|');return '<option value="'+p[0]+'">'+p[1]+'</option>'}).join('')
+    +'</select><button class="btn primary sm" data-act="start">'+(running?'Reload':'Load')+'</button>'
+    +'<button class="btn sm" data-act="copy" title="Copy path">Path</button>'
+    +'<button class="btn sm danger" data-act="del" title="Delete model">Delete</button></div></div>';
+}
+function renderModels(){
+  const q=$('#msearch').value.trim().toLowerCase();
+  let list=MODELS.filter(m=>{
+    if(FILTER==='moe'&&!m.moe)return false;
+    if(FILTER==='vl'&&!m.vl)return false;
+    if(FILTER==='run'&&!(ACTIVE&&ACTIVE.model===m.path))return false;
+    if(q&&!(m.name+' '+m.arch+' '+m.quant+' '+(m.params||'')).toLowerCase().includes(q))return false;
+    return true;
+  });
+  const by={name:(a,b)=>a.name.localeCompare(b.name),size:(a,b)=>b.size-a.size,
+    small:(a,b)=>a.size-b.size,arch:(a,b)=>a.arch.localeCompare(b.arch)||a.name.localeCompare(b.name)}[SORT];
+  list=list.slice().sort(by);
+  const bytes=MODELS.reduce((s,m)=>s+m.size,0);
+  $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
+  if(!list.length){
+    $('#modellist').innerHTML='<div class="empty"><b>'+(MODELS.length?'No model matches this filter':'No GGUF models found')+'</b>'
+      +(MODELS.length?'Clear the filter or press Rescan.':'Add files under a configured model dir, or use the HF pull tab.')+'</div>';
+    return;
+  }
+  $('#modellist').innerHTML=list.map(m=>modelRow(m,MODELS.indexOf(m))).join('');
+}
+$('#msearch').addEventListener('input',renderModels);
+$('#msort').addEventListener('change',e=>{SORT=e.target.value;renderModels()});
+$$('#mfilter button').forEach(b=>b.addEventListener('click',()=>{
+  $$('#mfilter button').forEach(x=>x.classList.toggle('on',x===b));FILTER=b.dataset.f;renderModels()}));
+$('#rescan').addEventListener('click',async()=>{
+  const b=$('#rescan');b.disabled=true;
+  try{await loadModels();toast('Library rescanned — '+MODELS.length+' models','ok',2200)}
+  catch(e){toast('Scan failed: '+e.message,'err')}
+  b.disabled=false});
+$('#modellist').addEventListener('click',async e=>{
+  const b=e.target.closest('[data-act]');if(!b)return;
+  const row=b.closest('.mrow');const path=row.dataset.path;
+  if(b.dataset.act==='copy')return copy(path,'Path');
+  if(b.dataset.act==='del'){
+    if(!await confirmDlg('Delete model','<b>'+esc(row.dataset.name)+'</b> ('+esc(row.dataset.size)+')<br><code>'
+      +esc(path)+'</code><br><br>This cannot be undone.','Delete',true))return;
+    b.disabled=true;
+    try{const d=await post('/api/models/delete',{path:path});
+      toast('Deleted · '+d.freed_h+' freed','ok');await loadModels()}
+    catch(err){toast('Delete failed: '+err.message,'err');b.disabled=false}
+    return;
+  }
+  const sel=row.querySelector('[data-preset]');
+  b.disabled=true;const old=b.textContent;b.textContent='Starting…';
+  try{await post('/api/server/start',{model:path,preset:sel?sel.value:'auto'});
+    toast('Loading '+row.dataset.name+'…','ok');await pollStatus(true)}
+  catch(err){toast('Start failed: '+err.message,'err',12000)}
+  b.disabled=false;b.textContent=old;
+});
+
+/* ============================== server status ============================== */
+let lastRunModel=null;
+function chatTarget(){
+  const ap=(AV&&AV.port)||8086;
+  if(ACTIVE&&ACTIVE.ready&&ACTIVE.port!==ap)return{alias:ACTIVE.alias,port:ACTIVE.port,src:'panel'};
+  if(AV&&AV.running&&AV.state==='ready')return{alias:AV.model||'qwen3.8-flash-next',port:ap,src:'avalon'};
+  if(ACTIVE&&ACTIVE.ready&&ACTIVE.port===ap)return{alias:'qwen3.8-flash-next',port:ap,src:'avalon'};
+  return null;
+}
+function drawHeader(){
+  const p=$('#hdrstatus'),t=$('#hdrtext');
+  const ct=chatTarget();
+  if(ct){p.className='pill ok';t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':'')}
+  else if(ACTIVE){p.className='pill warn';t.textContent=ACTIVE.alias+' · loading'}
+  else if(AV&&AV.running){p.className='pill warn';t.textContent='avalon · loading'}
+  else{p.className='pill';t.textContent='no server running'}
+}
+function pollStatus(force){
+  return api('/api/server/status').then(st=>{
+    ACTIVE=st.running?st:null;
+    const chip=$('#srvchip');
+    chip.textContent=st.running?(st.ready?'running · ready':'running · loading'):'stopped';
+    chip.className='tag '+(st.running?(st.ready?'ok':'warn'):'mut');
+    if(st.running){
+      $('#srvdetail').innerHTML=[
+        ['alias',st.alias],['pid',st.pid],['port',':'+st.port],['preset',st.preset],
+        ['uptime',fmtUp(st.uptime)],st.adopted?['source','adopted']:null]
+        .filter(Boolean).map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+        +'<button class="btn sm" data-copy="http://127.0.0.1:'+st.port+'/v1">Copy base URL</button>';
+      $('#srvstop').disabled=false;$('#agentsbtn').disabled=false;
+    }else{
+      $('#srvdetail').innerHTML='<span class="hint">No llama-server running. Pick a model in the Models tab and press Load.</span>';
+      $('#srvstop').disabled=true;$('#agentsbtn').disabled=true;
+    }
+    const now=ACTIVE?ACTIVE.model:null;
+    if(force||now!==lastRunModel){lastRunModel=now;renderModels()}
+    drawHeader();drawChatTarget();
+  }).catch(()=>{});
+}
+$('#srvdetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Base URL')});
+$('#srvstop').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop server','Stop the loaded model? Running requests will be cut.','Stop',true))return;
+  $('#srvstop').disabled=true;
+  try{await post('/api/server/stop');toast('Server stopped','ok')}catch(e){toast('Stop failed: '+e.message,'err')}
+  pollStatus(true);$('#srvstop').disabled=false;
+});
+
+/* ============================== log viewer ============================== */
+let LOGTEXT='';
+function paintLog(){
+  const f=$('#logfilter').value.trim().toLowerCase();
+  const lines=LOGTEXT.split('\n');
+  const shown=lines.filter(l=>!f||l.toLowerCase().includes(f));
+  const html=shown.map(l=>{
+    const e=esc(l);
+    if(/error|failed|exception|abort|refused/i.test(l))return '<span class="e">'+e+'</span>';
+    if(/warn|deprecat/i.test(l))return '<span class="w">'+e+'</span>';
+    if(/^\s*$/.test(l))return '<span class="g">·</span>';
+    return e;
+  }).join('\n');
+  const p=$('#log');
+  if(p.innerHTML!==html){p.innerHTML=html;if($('#logauto').checked)p.scrollTop=1e9}
+  $('#logn').textContent=shown.length+' / '+lines.length+' lines';
+}
+async function refreshLog(){
+  try{const d=await api('/api/server/log');
+    if(d.log!==LOGTEXT){LOGTEXT=d.log;paintLog()}}catch(e){}
+}
+$('#logfilter').addEventListener('input',paintLog);
+$('#logauto').addEventListener('change',()=>{if($('#logauto').checked){const p=$('#log');p.scrollTop=1e9}});
+$('#logwrap').addEventListener('change',e=>$('#log').classList.toggle('wrapoff',!e.target.checked));
+$('#logcopy').addEventListener('click',()=>copy(LOGTEXT,'Log'));
+$('#logsave').addEventListener('click',()=>{
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([LOGTEXT],{type:'text/plain'}));
+  a.download='lfm-server-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.log';
+  a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)});
+
+/* ============================== vitals ============================== */
+const VH={gpu:[],cpu:[],mem:[]};let VIT=null,VT=0;
+function pushHist(){
+  if(!VIT)return;
+  const add=(k,v)=>{if(v==null)return;const a=VH[k];a.push(v);if(a.length>70)a.shift()};
+  add('gpu',VIT.gpu?Math.round(100*(VIT.gpu.used_mb||0)/(VIT.gpu.total_mb||1)):null);
+  add('cpu',VIT.cpu?VIT.cpu.percent:null);
+  add('mem',VIT.mem?Math.round(100*VIT.mem.used_gb/VIT.mem.total_gb):null);
+}
+function spark(arr){
+  if(!arr||arr.length<3)return '<div style="height:26px"></div>';
+  const w=100,ht=26,mx=Math.max.apply(null,arr.concat([1]));
+  const pts=arr.map((v,i)=>((i/(arr.length-1))*w).toFixed(1)+','+(ht-1.5-(v/mx)*(ht-4)).toFixed(1)).join(' ');
+  return '<svg class="spark" viewBox="0 0 '+w+' '+ht+'" preserveAspectRatio="none" aria-hidden="true">'
+    +'<polyline points="'+pts+'" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round" stroke-linecap="round"/></svg>';
+}
+const lvlCls=p=>p>=90?'err':p>=75?'warn':'';
+function card(o){
+  return '<div class="card" style="margin:0;color:var(--'+(o.tone||'acc')+');'+(o.raw||'')+'">'
+    +'<div class="hd" style="margin-bottom:8px"><h2 style="color:var(--fg-2);font-size:13px">'+o.title+'</h2>'
+    +'<span class="tag" style="color:inherit">'+o.badge+'</span></div>'
+    +'<div class="stat" style="color:var(--fg)">'+o.big+'</div>'
+    +'<div class="meter '+lvlCls(o.pct||0)+'"><i style="width:'+Math.min(100,o.pct||0)+'%"></i></div>'+spark(o.hist)+'</div>';
+}
+function drawVitals(){
+  if(!VIT){$('#vitals').innerHTML='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';return}
+  const v=VIT;let out='';
+  if(v.gpu){
+    const g=v.gpu,pct=Math.round(100*(g.used_mb||0)/(g.total_mb||1)),idle=g.util===0;
+    const bits=[g.power_w!=null?g.power_w+' W':null,idle?null:(g.fan_rpm?g.fan_rpm+' RPM':null),
+      idle?null:(g.sclk_mhz?g.sclk_mhz+' MHz':null),g.mclk_mhz?g.mclk_mhz+' MHz mem':null].filter(Boolean);
+    out+=card({title:'GPU'+(g.stale?' · cached':''),tone:idle?'mut':'acc',pct:pct,
+      badge:(idle?'idle':g.temp+'°C jct'+(g.temp_mem!=null?' · '+g.temp_mem+'°C mem':''))+(g.stale?' · stale':'')+' · '+(g.util||0)+'% util',
+      big:n0(g.used_mb)+' <small>/ '+n0(g.total_mb)+' MB VRAM</small>',hist:VH.gpu});
+    if(bits.length)out+='<div class="card" style="margin:0"><div class="hd" style="margin-bottom:8px"><h2 style="color:var(--fg-2);font-size:13px">GPU clocks</h2></div>'
+      +'<div class="kvs">'+bits.map(b=>'<span class="tag">'+esc(b)+'</span>').join('')+'</div>'
+      +'<p class="hint" style="margin:8px 0 0">Sensors go to sleep with the card; readings are held until it wakes.</p></div>';
+  }
+  if(v.mem){const p=Math.round(100*v.mem.used_gb/v.mem.total_gb);
+    out+=card({title:'RAM',tone:'acc',pct:p,badge:p+'%',big:v.mem.used_gb+' <small>/ '+v.mem.total_gb+' GB</small>',hist:VH.mem})}
+  if(v.cpu){out+=card({title:'CPU',tone:'acc',pct:v.cpu.percent,badge:(v.cpu.cores||'?')+' threads',
+      big:v.cpu.percent+'%',hist:VH.cpu})}
+  Object.keys(v.disk||{}).forEach(k=>{const d=v.disk[k],p=Math.round(100*d.used_gb/d.total_gb);
+    out+=card({title:'Disk '+k,tone:'acc',pct:p,badge:p+'%',big:d.used_gb+' <small>/ '+d.total_gb+' GB</small>'})});
+  if(!out)out='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';
+  $('#vitals').innerHTML=out;
+  $('#vupdatetime').textContent='updated '+Math.max(0,Math.round((Date.now()-VT)/1000))+'s ago';
+}
+async function refreshVitals(){
+  try{VIT=await api('/api/vitals');VT=Date.now();pushHist();drawVitals()}catch(e){drawVitals()}
+}
+$('#vrefresh').addEventListener('click',refreshVitals);
+
+/* ============================== chat ============================== */
+let HIST=[],CID=null,BUSY=false,AC=null;
+const DEF_SYS='You are a helpful local assistant. Be concise.';
+$('#sysprompt').value=localStorage.getItem('lfm.sys')||DEF_SYS;
+$('#sysbtn').addEventListener('click',()=>{
+  const box=$('#sysbox');box.classList.toggle('hide');
+  if(box.classList.contains('hide')){localStorage.setItem('lfm.sys',$('#sysprompt').value||DEF_SYS);toast('System prompt saved','ok',1800)}
+  else $('#sysprompt').focus();
+});
+$('#sysprompt').addEventListener('change',()=>localStorage.setItem('lfm.sys',$('#sysprompt').value||DEF_SYS));
+function drawChatTarget(){
+  const ct=chatTarget(),t=$('#chatmodel');
+  if(ct){t.className='tag ok';t.textContent=ct.alias+' · :'+ct.port}
+  else{t.className='tag warn';t.textContent='no model loaded'}
+  $('#sendbtn').disabled=BUSY||!ct;
+  $('#chatnote').textContent=ct?'':'Start a model in the Models or Avalon tab to chat.';
+}
+function md(src){
+  const blocks=[];
+  let s=String(src||'').replace(/```(\w*)\n?([\s\S]*?)```/g,(m,lang,code)=>{
+    blocks.push('<pre><code>'+esc(String(code).replace(/\n+$/,''))+'</code></pre>');
+    return '\u0000'+(blocks.length-1)+'\u0000'});
+  s=esc(s);
+  s=s.replace(/`([^`\n]+)`/g,'<code>$1</code>');
+  s=s.replace(/\*\*([^*\n]+)\*\*/g,'<strong>$1</strong>');
+  s=s.replace(/(^|[\s(])\*([^*\n]+)\*/g,'$1<em>$2</em>');
+  s=s.replace(/\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
+  s=s.replace(/^#{1,4}\s+(.+)$/gm,'<div class="md-h">$1</div>');
+  s=s.replace(/^(?:[-*]\s+.+(?:\n|$))+/gm,b=>'<ul>'+b.trim().split('\n')
+    .map(l=>'<li>'+l.replace(/^[-*]\s+/,'')+'</li>').join('')+'</ul>');
+  s=s.replace(/^(?:\d+[.)]\s+.+(?:\n|$))+/gm,b=>'<ol>'+b.trim().split('\n')
+    .map(l=>'<li>'+l.replace(/^\d+[.)]\s+/,'')+'</li>').join('')+'</ol>');
+  s=s.replace(/\n{2,}/g,'<br><br>').replace(/\n/g,'<br>');
+  return s.replace(/\u0000(\d+)\u0000/g,(m,i)=>blocks[+i]);
+}
+function addMsg(m){
+  const d=document.createElement('div');
+  d.className='msg '+(m.role==='user'?'u':'a');
+  const body=md(m.content||'');
+  d.innerHTML='<div class="who">'+esc(m.role==='user'?'You':'Assistant')+'</div>'
+    +(m.reasoning?'<details><summary>reasoning</summary><div class="think">'+esc(m.reasoning)+'</div></details>':'')
+    +'<div class="ans">'+(body||'<span class="typing"><i></i><i></i><i></i></span>')+'</div>'
+    +(m.role==='assistant'&&m.content?'<div class="bar"><button class="btn xs" data-copy="'+esc(m.content)+'">Copy</button></div>':'');
+  $('#chat').appendChild(d);
+  $('#chat').scrollTop=1e9;
+  return d;
+}
+$('#chat').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Reply')});
+async function loadChatList(){
+  try{const cs=await api('/api/chats');
+    $('#chatlist').innerHTML=cs.length?cs.map(c=>'<div class="citem'+(c.id===CID?' on':'')+'" data-id="'+c.id+'">'
+      +'<span class="t" title="'+esc(c.title)+'">'+esc(c.title||'(untitled)')+'</span>'
+      +'<span class="s">'+(c.msgs||0)+' · '+esc(ago(c.updated||c.created))+'</span>'
+      +'<button class="btn xs danger" data-del="'+c.id+'" aria-label="Delete chat">✕</button></div>').join('')
+      :'<span class="hint">No chats yet — start one below.</span>';
+  }catch(e){}
+}
+$('#chatlist').addEventListener('click',async e=>{
+  const del=e.target.closest('[data-del]');
+  if(del){e.stopPropagation();
+    if(!await confirmDlg('Delete chat','This chat will be removed from disk.','Delete',true))return;
+    try{await api('/api/chats/'+del.dataset.del,{method:'DELETE'});
+      if(CID===del.dataset.del)newChat();loadChatList()}catch(err){toast('Delete failed: '+err.message,'err')}
+    return}
+  const it=e.target.closest('[data-id]');if(it)openChat(it.dataset.id);
+});
+async function openChat(id,quiet){
+  try{const c=await api('/api/chats/'+id);CID=id;localStorage.setItem('lfm.cid',id);
+    HIST=(c.messages||[]).filter(m=>m.role!=='system');
+    $('#chat').innerHTML='';HIST.forEach(addMsg);loadChatList();return true}
+  catch(e){if(!quiet)toast('Could not open chat: '+e.message,'err');return false}
+}
+function emptyThread(){
+  $('#chat').innerHTML='<div class="empty"><b>New conversation</b>'
+    +'Pick a chat on the left, or type below to start one.</div>';
+}
+function newChat(){CID=null;HIST=[];localStorage.removeItem('lfm.cid');emptyThread();loadChatList();$('#prompt').focus()}
+$('#newchat').addEventListener('click',newChat);
+
+const ta=$('#prompt');
+function autosize(){ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px'}
+ta.addEventListener('input',autosize);
+ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
+$('#sendbtn').addEventListener('click',send);
+$('#stopbtn').addEventListener('click',()=>{if(AC)AC.abort()});
+
+async function send(){
+  const q=ta.value.trim();
+  if(!q||BUSY)return;
+  const ct=chatTarget();
+  if(!ct)return toast('Start a model first (Models or Avalon tab)','warn');
+  ta.value='';autosize();
+  const th=$('#chat');if(th.querySelector('.empty'))th.innerHTML='';
+  const um={role:'user',content:q};HIST.push(um);addMsg(um);
+  post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q})
+    .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+  const box=addMsg({role:'assistant',content:''});
+  const ans=box.querySelector('.ans'),who=box.querySelector('.who');
+  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
+  AC=new AbortController();
+  let buff='',bufa='',t0=0,toks=0,stopped=false;
+  try{
+    const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AC.signal,
+      body:JSON.stringify({messages:[{role:'system',content:$('#sysprompt').value||DEF_SYS}]
+        .concat(HIST.map(m=>({role:m.role,content:m.content})))})});
+    if(!r.ok){const d=await r.text();ans.innerHTML=esc(d.indexOf('no model')>=0?'No model running — load one first.':'error: '+d)}
+    else{
+      const rd=r.body.getReader(),dec=new TextDecoder();let sbuf='';
+      for(;;){
+        const it=await rd.read();if(it.done)break;
+        sbuf+=dec.decode(it.value,{stream:true});
+        const lines=sbuf.split('\n');sbuf=lines.pop();
+        for(const ln of lines){
+          if(ln.indexOf('data: ')!==0)continue;
+          const d=ln.slice(6);if(d==='[DONE]')continue;
+          try{
+            const j=JSON.parse(d);
+            if(t0===0)t0=performance.now();
+            const dl=(j.choices&&j.choices[0]&&j.choices[0].delta)||{};
+            if(dl.reasoning_content){buff+=dl.reasoning_content;
+              let de=box.querySelector('details');
+              if(!de){de=document.createElement('details');de.innerHTML='<summary>reasoning</summary><div class="think"></div>';
+                box.insertBefore(de,ans)}
+              de.querySelector('.think').textContent=buff}
+            if(dl.content){bufa+=dl.content;ans.textContent=bufa}
+            if(j.usage&&j.usage.completion_tokens)toks=j.usage.completion_tokens;
+          }catch(e){}
+        }
+        $('#chat').scrollTop=1e9;
+      }
+    }
+  }catch(e){
+    if(e.name==='AbortError'){stopped=true;ans.textContent=bufa||buff||'(stopped)'}
+    else ans.textContent='error: '+e.message;
+  }
+  const finalText=bufa||buff||'';
+  const secs=Math.max(.001,(performance.now()-(t0||performance.now()))/1000);
+  const tps=toks?toks/secs:Math.round((finalText.length/4)/secs);
+  who.innerHTML='Assistant <span class="tag mut" style="margin-left:6px">'+(stopped?'stopped · ':'')
+    +tps+' tok/s · '+esc(ct.alias)+'</span>';
+  box.insertAdjacentHTML('beforeend',finalText?'<div class="bar"><button class="btn xs" data-copy="'+esc(finalText)+'">Copy</button></div>':'');
+  if(finalText){
+    HIST.push({role:'assistant',content:finalText,reasoning:buff});
+    post('/api/chats/append',{id:CID,model:ct.alias,role:'assistant',content:finalText,reasoning:buff})
+      .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+  }
+  BUSY=false;AC=null;$('#stopbtn').style.display='none';drawChatTarget();ta.focus();
+}
+
+/* ============================== agents registry ============================== */
+$('#agentsbtn').addEventListener('click',async()=>{
+  let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
+  const reg=(d.registry&&d.registry.agents)||{};
+  const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
+  const rows=d.agents.map(a=>{
+    const r=reg[a.id];
+    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'">'
+      +'<span style="flex:1;min-width:0"><b>'+esc(a.label)+'</b>'
+      +(r?' <span class="tag ok">'+esc(r.alias)+'@'+r.port+' · '+esc(ago(r.synced_at))+'</span>':'')
+      +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
+  }).join('');
+  const dlg=dialog({title:'Register into coding agents',width:'600px',
+    html:'<p class="dlg-p" style="margin-bottom:10px">Writes each agent&rsquo;s config to point at <b>'+cur+'</b>.</p>'
+      +'<div style="max-height:52vh;overflow:auto">'+rows+'</div><div id="agres" style="margin-top:10px"></div>'});
+  const apply=mkBtn('Apply','primary'),close=mkBtn('Close');
+  dlg.foot.append(close,apply);
+  close.addEventListener('click',()=>dlg.close());
+  apply.addEventListener('click',async()=>{
+    const picks=$$('.agchk',dlg.el).filter(x=>x.checked).map(x=>x.value);
+    if(!picks.length)return toast('Pick at least one agent','warn');
+    apply.disabled=true;apply.textContent='Applying…';
+    let r;try{r=await post('/api/agents/sync',{agents:picks})}
+    catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
+    $('#agres',dlg.el).innerHTML='<div class="hd" style="margin:0 0 6px"><h2 style="font-size:12px;color:var(--fg-2)">Results</h2></div>'
+      +Object.keys(r.results).map(k=>{const v=r.results[k];
+        return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
+          +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
+    apply.disabled=false;apply.textContent='Apply again';
+    toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
+    pollStatus();
+  });
+});
+
+/* ============================== avalon ============================== */
+let ASEL=null,ALIST=[];
+async function loadAvalon(){
+  try{
+    ALIST=await api('/api/avalon/profiles');AV=await api('/api/avalon/status');
+    if(!ASEL||!ALIST.some(p=>p.key===ASEL))ASEL=(AV&&AV.running&&AV.profile)||'';
+    if(!ASEL&&ALIST.length)ASEL=(ALIST.find(p=>p.available)||ALIST[0]).key;
+    $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+      +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
+      +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
+      +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
+      +(p.available?'':' <span class="tag err">config missing</span>')
+      +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok">'+esc(p.speed)+'</span></span></label>').join('');
+    $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon()}));
+    const c=$('#avalonchip');
+    c.textContent=AV.running?(AV.state==='ready'?'avalon · ready':'avalon · loading'):'avalon · stopped';
+    c.className='tag '+(AV.running?(AV.state==='ready'?'ok':'warn'):'mut');
+    $('#avalondetail').innerHTML=AV.running
+      ?[['pid',AV.pid||'?'],AV.adopted?['source','adopted']:null,['up',fmtUp(AV.uptime||0)],
+        ['ctx',AV.max_context?n0(AV.max_context):'…'],['port',':'+(AV.port||8086)]]
+        .filter(Boolean).map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+        +(AV.model?'<span class="tag mut">'+esc(AV.model)+'</span>':'')
+      :'<span class="hint">Avalon is stopped. Choose a profile below — it needs the LFM server&rsquo;s VRAM.</span>';
+    $('#avalonstart').disabled=!ASEL||!ALIST.some(p=>p.key===ASEL&&p.available);
+    $('#avalonstop').disabled=!AV.running;
+    const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log);
+    drawHeader();drawChatTarget();
+  }catch(e){}
+}
+function paintInto(el,text){
+  if(el.dataset.raw===text)return;el.dataset.raw=text;
+  el.innerHTML=text.split('\n').map(l=>{
+    const e=esc(l);
+    if(/error|failed|exception|abort/i.test(l))return '<span class="e">'+e+'</span>';
+    if(/warn/i.test(l))return '<span class="w">'+e+'</span>';
+    return e}).join('\n');
+  el.scrollTop=1e9;
+}
+$('#avalonstart').addEventListener('click',async()=>{
+  $('#avalonstart').disabled=true;
+  try{await post('/api/avalon/start',{profile:ASEL});toast('Avalon starting — a 125B load takes a while','ok')}
+  catch(e){
+    const t=e.message;
+    if(t.indexOf('Stop the LFM server')>=0){
+      if(await confirmDlg('VRAM conflict','This profile needs the VRAM the LFM server is holding.'
+        +'<br><br>Stop the LFM server and start Avalon?','Stop LFM & start Avalon',true)){
+        try{await post('/api/server/stop');pollStatus(true);$('#avalonstart').click()}
+        catch(e2){toast('Could not stop the LFM server: '+e2.message,'err')}}
+    }else toast('Start failed: '+t,'err',12000);
+  }
+  loadAvalon();
+});
+$('#avalonstop').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop Avalon','Stop the Avalon server? Running requests will be cut.','Stop',true))return;
+  $('#avalonstop').disabled=true;
+  try{const r=await post('/api/avalon/stop');toast(r.stopped?'Avalon stopped':'Stop requested — port still busy, check the log',r.stopped?'ok':'warn')}
+  catch(e){toast('Stop failed: '+e.message,'err')}
+  loadAvalon();
+});
+async function loadAvalonAccess(){
+  try{
+    const a=await api('/api/avalon/access');
+    $('#avalonlan').checked=!!a.lan;
+    const port=a.port||8086;
+    $('#avalonaccess').innerHTML=a.lan
+      ?'<span class="tag ok">LAN · http://'+esc(a.ip)+':'+port+'/v1</span>'
+        +'<button class="btn sm" data-copy="'+esc(a.api_key)+'">Copy key</button>'
+        +'<span class="tag mut mono" title="API key">'+esc(a.api_key.slice(0,6))+'…'+esc(a.api_key.slice(-4))+'</span>'
+        +'<button class="btn sm" id="regen">New key</button>'
+        +'<span class="hint">send as <code>Authorization: Bearer &lt;key&gt;</code></span>'
+      :'<span class="tag mut">local only · http://127.0.0.1:'+port+'/v1</span>'
+        +'<span class="hint">toggle above to expose it on the LAN with an API key</span>';
+    const rg=$('#regen');
+    if(rg)rg.addEventListener('click',async()=>{
+      if(!await confirmDlg('Rotate API key','Every LAN client must be updated with the new key.','Rotate',true))return;
+      try{await post('/api/avalon/access/regenerate');loadAvalonAccess();toast('New key issued','ok')}
+      catch(e){toast('Failed: '+e.message,'err')}});
+  }catch(e){}
+}
+$('#avalonlan').addEventListener('change',async e=>{
+  const on=e.target.checked;e.target.disabled=true;
+  try{await post('/api/avalon/access',{lan:on});
+    toast(on?'Exposed on the LAN with an API key':'Back to local-only','ok')}
+  catch(err){toast('Failed: '+err.message,'err');e.target.checked=!on}
+  e.target.disabled=false;loadAvalonAccess();loadAvalon();
+});
+
+/* ============================== HF pull ============================== */
+let HFREPO='',DLPREV={},DLTIMER=null;
+async function hfSearch(){
+  const q=$('#hfq').value.trim();if(!q)return;
+  $('#hfinfo').textContent='searching…';
+  let res;try{res=await api('/api/hf/search?q='+encodeURIComponent(q))}
+  catch(e){$('#hfinfo').textContent='';return toast('Search failed: '+e.message,'err')}
+  $('#hfinfo').textContent=res.length+' repos';
+  $('#hfresults').innerHTML=res.length?res.map(m=>'<div class="frow" data-repo="'+esc(m.id)+'">'
+    +'<span style="flex:1;min-width:0"><b>'+esc(m.id)+'</b><br><span class="hint">downloads '
+    +n0(m.downloads)+' · likes '+n0(m.likes)+'</span></span><span class="tag">open →</span></div>').join('')
+    :'<div class="empty"><b>No repos found</b>Try a broader term.</div>';
+}
+$('#hfsearch').addEventListener('click',hfSearch);
+$('#hfq').addEventListener('keydown',e=>{if(e.key==='Enter')hfSearch()});
+$('#hfresults').addEventListener('click',e=>{const r=e.target.closest('[data-repo]');if(r)hfFiles(r.dataset.repo)});
+async function hfFiles(repo){
+  HFREPO=repo;
+  let files;try{files=await api('/api/hf/files?repo='+encodeURIComponent(repo))}
+  catch(e){return toast('Repo lookup failed: '+e.message,'err')}
+  $('#hfrepo').textContent=repo;
+  $('#hffiles').innerHTML=files.length?files.map(f=>'<label class="frow"><input type="checkbox" value="'+esc(f.path)+'" data-size="'
+    +(f.size||0)+'"><span class="p" title="'+esc(f.path)+'">'+esc(f.path)+'</span>'
+    +'<span class="tag mut">'+esc(f.size_h)+'</span></label>').join('')
+    :'<div class="empty"><b>No GGUF files</b>This repo has no .gguf in its root tree.</div>';
+  $('#hffilesbox').classList.remove('hide');
+  totsize();
+}
+function totsize(){
+  const s=$$('#hffiles input:checked').reduce((a,i)=>a+(+i.dataset.size||0),0);
+  const n=$$('#hffiles input:checked').length;
+  $('#hftotal').textContent=n?n+' files · '+gib(s):'nothing selected';
+}
+$('#hffiles').addEventListener('change',totsize);
+$('#hfnone').addEventListener('click',()=>{$$('#hffiles input').forEach(i=>i.checked=false);totsize()});
+$('#hfpull').addEventListener('click',async()=>{
+  const sel=$$('#hffiles input:checked').map(i=>i.value);
+  if(!sel.length)return toast('Select at least one file','warn');
+  try{await post('/api/hf/pull',{repo:HFREPO,files:sel});
+    toast('Queued '+sel.length+' file'+(sel.length>1?'s':''),'ok');ensureDl(true);pollDownloads()}
+  catch(e){toast('Pull failed: '+e.message,'err',10000)}
+});
+function ensureDl(on){
+  if(on&&!DLTIMER)DLTIMER=setInterval(pollDownloads,1200);
+  if(!on&&DLTIMER){clearInterval(DLTIMER);DLTIMER=null}
+}
+async function pollDownloads(){
+  let ds;try{ds=await api('/api/downloads')}catch(e){return}
+  if(!ds.length){$('#downloads').innerHTML='<span class="hint">none</span>';$('#dlinfo').textContent='';ensureDl(false);return}
+  const live=ds.some(d=>d.status==='downloading'||d.status==='queued');
+  $('#dlinfo').textContent=ds.length+' job'+(ds.length>1?'s':'')+(live?' · active':'');
+  $('#downloads').innerHTML=ds.map(d=>{
+    const pct=d.total?Math.round(100*d.done/d.total):0;
+    const now=Date.now(),p=DLPREV[d.id]||{d:d.done,t:now};
+    const dt=(now-p.t)/1000,spd=dt>0.4?(d.done-p.d)/dt:null;
+    if(d.status==='downloading'&&dt>0.4)DLPREV[d.id]={d:d.done,t:now};
+    const eta=(spd>0&&d.total&&d.done<d.total)?fmtUp((d.total-d.done)/spd):null;
+    const kind=d.status==='done'?'ok':d.status==='error'?'err':d.status==='cancelled'?'warn':'acc';
+    return '<div class="dl"><div style="display:flex;gap:9px;align-items:center;flex-wrap:wrap">'
+      +'<span style="flex:1;min-width:0;font-family:var(--mono);font-size:12.5px" title="'+esc(d.dest)+'">'+esc(d.file)+'</span>'
+      +'<span class="tag '+kind+'">'+esc(d.status)+'</span>'
+      +(d.status==='downloading'?'<span class="tag mut">'+pct+'% · '+gib(d.done)+' / '+gib(d.total)+'</span>'
+        +(spd!=null?'<span class="tag mut">'+(spd/1048576).toFixed(1)+' MB/s</span>':'')
+        +(eta?'<span class="tag mut">ETA '+eta+'</span>':''):'')
+      +(d.status==='downloading'?'<button class="btn xs danger" data-cancel="'+esc(d.id)+'">Cancel</button>':'')
+      +'</div>'+(d.status==='downloading'?'<div class="meter"><i style="width:'+pct+'%"></i></div>':'')
+      +(d.error?'<p class="hint" style="color:var(--err);margin:5px 0 0">'+esc(d.error)+'</p>':'')+'</div>';
+  }).join('');
+  ensureDl(live);
+}
+$('#downloads').addEventListener('click',e=>{
+  const b=e.target.closest('[data-cancel]');if(!b)return;
+  post('/api/downloads/cancel',{id:b.dataset.cancel}).then(()=>{b.disabled=true;pollDownloads()})
+    .catch(err=>toast('Cancel failed: '+err.message,'err'));
+});
+
+/* ============================== polling & keys ============================== */
+function tick(){
+  if(document.hidden)return;
+  pollStatus();
+  if(tab==='avalon')loadAvalon();
+}
+setInterval(tick,2500);
+setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
+setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
+setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
+async function refreshAvalonLog(){try{const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log)}catch(e){}}
+document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollStatus();refreshVitals()}});
+document.addEventListener('keydown',e=>{
+  if(e.metaKey||e.ctrlKey||e.altKey)return;
+  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.isContentEditable);
+  if(e.key==='Escape')return;
+  if(e.key==='/'&&!typing){e.preventDefault();
+    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else{setTab('models');$('#msearch').focus()}
+    return}
+  if(!typing&&TABS[Number(e.key)-1])setTab(TABS[Number(e.key)-1]);
+});
+
+/* ============================== boot ============================== */
+setTab(localStorage.getItem('lfm.tab')||'models');
+loadModels().then(()=>pollStatus(true)).catch(e=>toast('Panel load failed: '+e.message,'err'));
+loadChatList();
+(async()=>{const s=localStorage.getItem('lfm.cid');
+  if(!s||!(await openChat(s,true))){localStorage.removeItem('lfm.cid');emptyThread()}})();
+refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();drawChatTarget();
+$('#footnote').textContent='polling pauses when the tab is hidden';
+</script>
+</body></html>"""
 
 if __name__ == "__main__":
     import uvicorn
