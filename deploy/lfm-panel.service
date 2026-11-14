@@ -1,0 +1,14 @@
+[Unit]
+Description=LFM Panel - local model library, llama-server manager, vitals
+After=network.target
+
+[Service]
+Environment=LFM_PANEL_PORT=8817
+KillMode=process
+ExecStart=%h/.local/share/lfm-panel/venv/bin/python %h/.local/share/lfm-panel/panel.py
+WorkingDirectory=%h/.local/share/lfm-panel
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
