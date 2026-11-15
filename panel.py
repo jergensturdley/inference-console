@@ -4,7 +4,7 @@
 Single-file FastAPI app. Dependencies: fastapi, uvicorn, httpx.
 Config: ~/.config/lfm-panel/config.json (created with defaults on first run).
 """
-import asyncio, json, os, platform, re, secrets, shutil, signal, socket, struct, subprocess, threading, time, uuid
+import json, os, re, secrets, shutil, signal, socket, struct, subprocess, threading, time, uuid
 from collections import deque
 from pathlib import Path
 
@@ -27,6 +27,7 @@ DEFAULT_CONFIG = {
     "server_binary": BIN,
     "ctx": 8192,
     "port_base": 8830,
+    "bind_host": "0.0.0.0",      # the admin API can launch arbitrary binaries — use 127.0.0.1 for local-only
     "avalon_lan": False,
     "avalon_api_key": "",
     "idle_unload_min": 0,        # 0 = never auto-unload the panel's llama-server
@@ -157,7 +158,13 @@ def gguf_metadata(path: Path, limit_mb: int = 64):
             val = read_val(t)
             arch = out.get("general.architecture")
             if key in WANT_GENERIC or (arch and key.startswith(arch + ".")):
-                if not isinstance(val, list):
+                # head_count_kv / key_length / value_length are ARRAY-typed in GGUF. Every
+                # converter emits a single element, so collapse numeric arrays to element 0 —
+                # dropping them made GQA models look like MHA and inflated the KV estimate.
+                if isinstance(val, list):
+                    if val and not isinstance(val[0], str):
+                        out[key] = val[0]
+                else:
                     out[key] = val
             if f.tell() > limit_mb << 20:
                 break
@@ -249,20 +256,26 @@ def scan_models():
             k_len = md.get(f"{arch}.attention.key_length", (embd // n_head) if n_head else 128) or 128
             v_len = md.get(f"{arch}.attention.value_length", k_len) or k_len
             blocks = md.get(f"{arch}.block_count", 0) or 0
+            mmproj = find_mmproj(str(f))
             m = {
                 "path": str(f), "name": stem, "arch": arch,
                 "quant": quant, "size": st.st_size, "size_h": human_size(st.st_size),
-                "moe": moe, "vl": "vl" in stem.lower() or "omni" in stem.lower(),
+                "moe": moe, "vl": bool(VL_NAME_RE.search(stem)),
                 "params": name_label, "ctx_len": md.get(f"{arch}.context_length", 0),
                 "blocks": blocks, "embd": embd, "n_head": n_head, "n_kv": n_kv,
                 "k_len": k_len, "v_len": v_len,
                 "experts": expert_count, "experts_used": expert_used,
                 "imatrix": bool(md.get("general.quantization_imatrix", False)),
-                "mmproj": find_mmproj(str(f)),
+                "mmproj": mmproj,
             }
             _model_cache[key] = m
             models.append(m)
     models.sort(key=lambda m: m["name"].lower())
+    # Cache keys carry mtime+size, so every re-download or re-quant adds an entry that a
+    # scan never drops on its own. Forget entries for files that are gone.
+    live_paths = {m["path"] for m in models}
+    for stale in [k for k in _model_cache if k[0] not in live_paths]:
+        _model_cache.pop(stale, None)
     return {"models": models, "mmproj": accessories}
 
 # ---------------------------------------------------------------- VRAM fit & launch profiles
@@ -275,9 +288,22 @@ KV_TYPE_BYTES = {
     "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625, "iq4_nl": 0.5625,
 }
 
+# Vision-language name markers. Substring matching is kept for the glued families
+# (InternVL, Qwen3-VL without a separator) that word-boundary matching would miss, but
+# `omni`/`vl` must not run straight into more letters, which is what made a bare
+# `"vl" in stem` / `"omni" in stem` test flag OmniDocBench-style names.
+# A paired mmproj sidecar is deliberately NOT used as a vl signal: find_mmproj() matches
+# on token overlap, and in a flat library where files share a name prefix that overlap is
+# non-zero for unrelated models, so it would tag every model VL (and flip the `auto`
+# preset to vision). The name is the reliable signal here.
+VL_NAME_RE = re.compile(
+    r"(?i)(?:vlm|internvl|llava|pixtral|molmo|minicpm-v|vision|visual"
+    r"|omni(?![a-z])|vl(?![a-z]))")
+
 def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
                   ctk: str = "f16", ctv: str = "f16", parallel: int = 1,
-                  preset: str = "auto", ncmoe: int = 0) -> dict:
+                  preset: str = "auto", ncmoe: int = 0,
+                  vit: dict | None = None, srv_running: bool | None = None) -> dict:
     """Estimate VRAM & RAM footprint in MB for loading `model_meta` with given launch settings."""
     size_mb = (model_meta.get("size", 0) or 0) / 1048576.0
     blocks = int(model_meta.get("blocks") or 32)
@@ -326,7 +352,8 @@ def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
     total_ram_mb = round(weights_ram_mb + kv_ram_mb + 250.0)
 
     # Compare against available device memory
-    vit = vitals()
+    if vit is None:
+        vit = vitals()
     igpu = preset.startswith("igpu")
     if igpu:
         _, free_mib = igpu_device()
@@ -335,7 +362,8 @@ def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
     elif "gpu" in vit and vit["gpu"].get("total_mb"):
         g = vit["gpu"]
         # If our own managed server is currently holding VRAM, count its VRAM as reclaimable on reload
-        srv_running = MGR.status().get("running") or SMGR.status().get("running")
+        if srv_running is None:
+            srv_running = MGR.status().get("running") or SMGR.status().get("running")
         used_other = 0 if srv_running else min(g.get("used_mb", 0), 1024)
         budget_mb = max(0, g["total_mb"] - used_other)
         device_label = g.get("name", "dGPU VRAM")
@@ -366,7 +394,9 @@ def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
         "usable_mb": round(usable_mb),
         "device": device_label,
         "budget_source": device_label,
-        "pct": min(999, round(100 * total_vram_mb / max(1, budget_mb))),
+        # Same denominator as `status`/`badge` above: the reserve is what the verdict is
+        # measured against, so a "Tight fit" badge can't sit next to a smaller percentage.
+        "pct": min(999, round(100 * total_vram_mb / max(1, usable_mb))),
         "status": status,
         "badge": badge,
         "label": badge,
@@ -383,6 +413,10 @@ def recommend_model_config(model_meta: dict, target: str = "balanced") -> dict:
     native_ctx = int(model_meta.get("ctx_len") or 32768)
     cores = os.cpu_count() or 8
     phys_threads = max(4, min(16, cores // 2 if cores >= 12 else cores))
+    # Snapshot hardware state once: the overflow search below calls estimate_vram dozens
+    # of times, and each call would otherwise fork nvidia-smi and probe both /health.
+    vit = vitals()
+    srv_running = bool(MGR.status().get("running") or SMGR.status().get("running"))
 
     # Determine optimal preset & KV quantization by target goal:
     # target in ("speed", "balanced", "max_ctx", "low_vram")
@@ -406,14 +440,14 @@ def recommend_model_config(model_meta: dict, target: str = "balanced") -> dict:
     preset = "vision" if vl else ("moe-split" if moe else "dense-gpu")
     ngl = 99
     ncmoe = 0
-    fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset="dense-gpu" if not vl else "vision")
+    fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset="dense-gpu" if not vl else "vision", vit=vit, srv_running=srv_running)
 
     notes = []
     if not moe and fit["status"] == "fit":
         preset = "vision" if vl else "dense-gpu"
         notes.append(f"Full GPU offload (-ngl 99) fits in {fit['device']} ({fit['total_vram_mb']} / {fit['budget_mb']} MB).")
     elif moe:
-        dense_fit = estimate_vram(model_meta, ctx=ctx, ngl=99, ctk=ctk, ctv=ctv, parallel=parallel, preset="dense-gpu")
+        dense_fit = estimate_vram(model_meta, ctx=ctx, ngl=99, ctk=ctk, ctv=ctv, parallel=parallel, preset="dense-gpu", vit=vit, srv_running=srv_running)
         if dense_fit["status"] == "fit" and target == "speed":
             preset = "dense-gpu"
             notes.append("All MoE experts fit in VRAM — using full GPU offload for maximum token generation speed.")
@@ -425,22 +459,22 @@ def recommend_model_config(model_meta: dict, target: str = "balanced") -> dict:
         # Binary search highest ngl or ctx that fits
         if ctk != "q8_0" or ctv != "q4_0":
             ctk, ctv = "q8_0", "q4_0"
-            fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset)
+            fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)
             notes.append("Enabled Q8_0 / Q4_0 KV cache quantization to halve KV memory footprint.")
         if fit["status"] == "overflow" and ctx > 8192:
-            while ctx > 4096 and estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset)["status"] == "overflow":
+            while ctx > 4096 and estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)["status"] == "overflow":
                 ctx //= 2
             notes.append(f"Scaled context window to {ctx:,} tokens to fit available VRAM.")
-        fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset)
+        fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)
         if fit["status"] == "overflow" and blocks > 0:
             best_ngl = 0
             for cand in range(blocks, -1, -1):
-                if estimate_vram(model_meta, ctx=ctx, ngl=cand, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset)["status"] != "overflow":
+                if estimate_vram(model_meta, ctx=ctx, ngl=cand, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)["status"] != "overflow":
                     best_ngl = cand
                     break
             ngl = best_ngl
             notes.append(f"Partial layer offload: {ngl}/{blocks} layers on GPU, remaining {blocks - ngl} in system RAM.")
-            fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset)
+            fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)
 
     notes.append("Flash Attention enabled (-fa on) for faster prefill and reduced KV overhead.")
     return {
@@ -473,6 +507,21 @@ def igpu_device(refresh=False):
         pass
     _igpu_cache.update(checked=now, tag=tag, free=free)
     return tag, free
+
+# llama.cpp counter names differ between builds, so match the family rather than one
+# suffix, and record what a build actually exposed: an unrecognised counter then shows up
+# in /api/server/telemetry's metric_keys instead of needing a hand scrape of /metrics.
+_METRIC_TOK_TOTAL_RE = re.compile(r"^(?:llama[:_])?tokens_(predicted|prompted)_total$")
+_METRIC_KEYS: dict = {}    # port -> counter names that build emitted (first scrape wins)
+
+_SECRET_ARG_RE = re.compile(r"(--api-key[ =])(\S+)")
+
+def _redact_cmd(text: str) -> str:
+    """Mask launch secrets before a command string reaches the UI, the log buffer, or the
+    state file. The real argv still carries the key: on Linux /proc/<pid>/cmdline is
+    world-readable, so this only stops the panel from re-publishing it. Nothing parses
+    these strings, so masking is safe at every exposure point."""
+    return _SECRET_ARG_RE.sub(r"\1***", text)
 
 class ServerManager:
     def __init__(self):
@@ -594,7 +643,7 @@ class ServerManager:
         return out
 
     def log(self, line):
-        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
 
     @staticmethod
     def _health(port, timeout=1.5):
@@ -619,6 +668,8 @@ class ServerManager:
             "tok_s": round(self.last_tok_s, 1),
             "prompt_s": round(self.last_prompt_s, 1),
             "requests_processing": 0, "requests_deferred": 0,
+            "tokens_predicted_total": 0, "tokens_prompted_total": 0,
+            "metric_keys": list(_METRIC_KEYS.get(port, [])),
             "slots": [],
         }
         try:
@@ -657,6 +708,7 @@ class ServerManager:
         try:
             r = httpx.get(f"http://127.0.0.1:{port}/metrics", headers=headers, timeout=1.2)
             if r.status_code == 200:
+                seen = set()
                 for ln in r.text.splitlines():
                     if ln.startswith("#") or not ln.strip():
                         continue
@@ -668,20 +720,31 @@ class ServerManager:
                         fv = float(v)
                     except ValueError:
                         continue
-                    if "tokens_predicted_seconds_total" in k or k.endswith("predicted_tokens_seconds"):
+                    if k.startswith("llama") or "token" in k:
+                        seen.add(k)
+                    tok_total = _METRIC_TOK_TOTAL_RE.match(k)
+                    if "predicted_seconds_total" in k or k.endswith("predicted_tokens_seconds"):
                         if fv > 0:
                             out["tok_s"] = round(fv, 1)
                             self.last_tok_s = fv
-                    elif "prompt_tokens_seconds" in k:
+                    elif "prompted_seconds_total" in k or "prompt_tokens_seconds" in k:
                         if fv > 0:
                             out["prompt_s"] = round(fv, 1)
                             self.last_prompt_s = fv
+                    elif tok_total:
+                        if tok_total.group(1) == "predicted":
+                            out["tokens_predicted_total"] = int(fv)
+                        else:
+                            out["tokens_prompted_total"] = int(fv)
                     elif "kv_cache_usage_ratio" in k:
                         out["kv_pct"] = max(out["kv_pct"], round(fv * 100.0, 1))
                     elif "requests_processing" in k:
                         out["requests_processing"] = int(fv)
                     elif "requests_deferred" in k:
                         out["requests_deferred"] = int(fv)
+                if seen:
+                    _METRIC_KEYS[port] = sorted(seen)[:80]
+                out["metric_keys"] = _METRIC_KEYS.get(port, [])
         except Exception:
             pass
         if out["active_slots"] > 0 or out["requests_processing"] > 0:
@@ -710,6 +773,8 @@ class ServerManager:
                     "uptime": int(time.time() - i.get("started_at", time.time())),
                     "idle_sec": idle_sec,
                     "idle_unload_in": max(0, idle_min * 60 - idle_sec) if idle_min > 0 else None,
+                    "idle_unload_min": idle_min,
+                    "idle_remaining_s": max(0, idle_min * 60 - idle_sec) if idle_min > 0 else None,
                     "ready": self._health(i["port"], timeout=1.0), "adopted": i.get("adopted", False),
                 }
             self.log("server pid %s exited" % pid)
@@ -740,6 +805,8 @@ class ServerManager:
             "uptime": int(time.time() - i.get("started_at", time.time())),
             "idle_sec": idle_sec,
             "idle_unload_in": max(0, idle_min * 60 - idle_sec) if idle_min > 0 else None,
+            "idle_unload_min": idle_min,
+            "idle_remaining_s": max(0, idle_min * 60 - idle_sec) if idle_min > 0 else None,
             "ready": self._health(i["port"], timeout=1.0), "adopted": i.get("adopted", False),
         }
 
@@ -778,7 +845,8 @@ class ServerManager:
         pd = preset_defaults[preset]
         eff_ctx = int(ctx or CFG.get("ctx", 8192) or 8192)
         eff_ngl = pd["ngl"] if ngl is None else int(ngl)
-        eff_t = pd["t"] if threads is None else int(threads)
+        # The UI's -t field is labelled "0 = auto", so 0 means "use the preset default".
+        eff_t = int(threads) if threads else pd["t"]
 
         binary = CFG.get("server_binary", BIN)
         caps = bin_caps(binary)
@@ -871,7 +939,7 @@ class ServerManager:
         self.last_tok_s = 0.0
         self.last_prompt_s = 0.0
         self.info = {"pid": self.proc.pid, "port": port, "alias": mp.stem, "model": model,
-                     "preset": resolved_preset, "ctx": eff_ctx, "cmd": cmd_str,
+                     "preset": resolved_preset, "ctx": eff_ctx, "cmd": _redact_cmd(cmd_str),
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
@@ -884,7 +952,7 @@ class ServerManager:
     def _pump_logs(self):
         proc = self.proc
         for line in proc.stdout:
-            s = line.rstrip()
+            s = _redact_cmd(line.rstrip())
             self.logbuf.append(s)
             # Parse tok/s from llama-server log lines when /metrics isn't scraped yet
             m = re.search(r"eval time\s*=.*?\(\s*([0-9.]+)\s*tokens per second\)", s)
@@ -906,12 +974,21 @@ class ServerManager:
         if pid and _pid_alive(pid):
             try: os.kill(pid, signal.SIGTERM)
             except ProcessLookupError: pass
+            except PermissionError:
+                # Adopted server owned by another user: stop tracking it rather than
+                # failing the request, so the panel never believes it owns the process.
+                self.log(f"pid {pid} is owned by another user — cannot signal it")
+                self.proc, self.info = None, {}
+                STATE_PATH.unlink(missing_ok=True)
+                raise HTTPException(403, f"pid {pid} is owned by another user; stop it outside the panel")
             for _ in range(50):
                 if not _pid_alive(pid): break
                 time.sleep(0.1)
             else:
                 try: os.kill(pid, signal.SIGKILL)
                 except ProcessLookupError: pass
+                except PermissionError:
+                    self.log(f"pid {pid} survived SIGTERM and cannot be SIGKILLed (foreign owner)")
         self.log(f"stopped {i.get('alias')} (pid {pid})")
         self.proc, self.info = None, {}
         STATE_PATH.unlink(missing_ok=True)
@@ -978,7 +1055,7 @@ class AvalonManager:
             pass
 
     def log(self, line):
-        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
 
     def _health(self, timeout=1.5):
         """Returns 'down' | 'loading' | 'ready' plus detail dict."""
@@ -1075,7 +1152,7 @@ class AvalonManager:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", start_new_session=True)
         threading.Thread(target=self._pump_logs, daemon=True).start()
-        self.info = {"profile": profile, "pid": self.proc.pid, "cmd": cmd_str,
+        self.info = {"profile": profile, "pid": self.proc.pid, "cmd": _redact_cmd(cmd_str),
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
@@ -1083,7 +1160,7 @@ class AvalonManager:
     def _pump_logs(self):
         proc = self.proc
         for line in proc.stdout:
-            self.logbuf.append(line.rstrip())
+            self.logbuf.append(_redact_cmd(line.rstrip()))
 
     def stop(self):
         st = self.info
@@ -1094,7 +1171,7 @@ class AvalonManager:
                 os.killpg(os.getpgid(pid), signal.SIGTERM)
             except (ProcessLookupError, PermissionError):
                 try: os.kill(pid, signal.SIGTERM)
-                except ProcessLookupError: pass
+                except (ProcessLookupError, PermissionError): pass
             for _ in range(100):
                 if not (_pid_alive(pid) and not self._port_free()):
                     killed = True
@@ -1105,7 +1182,7 @@ class AvalonManager:
                     os.killpg(os.getpgid(pid), signal.SIGKILL)
                 except (ProcessLookupError, PermissionError):
                     try: os.kill(pid, signal.SIGKILL)
-                    except ProcessLookupError: pass
+                    except (ProcessLookupError, PermissionError): pass
             killed = True
         self.log(f"stopped avalon (pid {pid})" if killed else "avalon not running")
         self.proc, self.info = None, {}
@@ -1246,7 +1323,21 @@ def _gpu_prime():
     threading.Thread(target=work, daemon=True).start()
 _gpu_prime()
 
-def vitals():
+_VITALS_TTL = 1.0
+_vitals_cache = {"ts": 0.0, "data": None}
+
+def vitals(refresh: bool = False) -> dict:
+    """Memoized vitals(): every miss forks nvidia-smi, and estimate_vram() runs per model,
+    so without this a single /api/models page load forks one subprocess per model."""
+    now = time.time()
+    if not refresh and _vitals_cache["data"] is not None and now - _vitals_cache["ts"] < _VITALS_TTL:
+        return _vitals_cache["data"]
+    v = _vitals_now()
+    _vitals_cache["ts"] = now
+    _vitals_cache["data"] = v
+    return v
+
+def _vitals_now():
     global _prev_cpu, _gpu_last
     v = {}
     try:
@@ -1439,6 +1530,10 @@ document.querySelector('form').addEventListener('submit',go);
 </script></body></html>"""
 
 def _sudo_ok(pw: str) -> bool:
+    if not pw:
+        # Under NOPASSWD sudo, `sudo -S -k -v` never reads stdin and exits 0 for any input,
+        # so an empty password must never open the panel.
+        return False
     try:
         r = subprocess.run(["sudo", "-S", "-k", "-v"], input=pw + "\n",
                            capture_output=True, text=True, timeout=10)
@@ -1604,7 +1699,14 @@ def _hf_headers():
 
 @app.get("/api/hf/search")
 def api_hf_search(q: str):
-    res = httpx.get("https://huggingface.co/api/models", params={"search": q, "limit": 20, "sort": "downloads", "direction": -1}, headers=_hf_headers(), timeout=15).json()
+    try:
+        r = httpx.get("https://huggingface.co/api/models", params={"search": q, "limit": 20, "sort": "downloads", "direction": -1}, headers=_hf_headers(), timeout=15)
+        r.raise_for_status()
+        res = r.json()
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"HF search failed: {e}")
+    if not isinstance(res, list):
+        raise HTTPException(502, "HF search returned an unexpected shape")
     return [{"id": m["modelId"], "downloads": m.get("downloads", 0), "likes": m.get("likes", 0)}
             for m in res if m.get("modelId")]
 
@@ -1626,9 +1728,24 @@ def api_hf_files(repo: str):
     return out
 
 DOWNLOADS = {}
+# FastAPI runs sync endpoints on a threadpool, so pull/cancel/resume/list can all touch
+# DOWNLOADS concurrently: a bare `sorted(DOWNLOADS.values())` can raise "dictionary
+# changed size during iteration" while a pull registers a job.
+_dl_lock = threading.Lock()
+
+
+def _dl_live(d: dict) -> bool:
+    """True while the job's worker thread is still running. Status strings alone are
+    not enough: a thread can die with status left at "downloading"."""
+    t = d.get("_thread")
+    return bool(t and t.is_alive())
+
 
 def _download_worker(did: str):
-    d = DOWNLOADS[did]
+    with _dl_lock:
+        d = DOWNLOADS.get(did)
+    if d is None:          # cancelled and dropped before we got scheduled
+        return
     d["status"] = "downloading"
     dest = Path(d["dest"])
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1642,6 +1759,8 @@ def _download_worker(did: str):
         with httpx.stream("GET", d["url"], headers=headers, follow_redirects=True,
                           timeout=httpx.Timeout(30, read=120)) as r:
             if r.status_code == 416:  # range already complete
+                if d["cancel"]:
+                    raise RuntimeError("paused")
                 tmp.rename(dest)
                 d["status"] = "done"
                 return
@@ -1660,13 +1779,30 @@ def _download_worker(did: str):
                         raise RuntimeError("paused")
                     fh.write(chunk)
                     d["done"] = fh.tell()
+        if d["cancel"]:
+            # All chunks arrived before the cancel landed; don't publish a file the
+            # user just cancelled.
+            raise RuntimeError("paused")
         tmp.rename(dest)
         d["status"] = "done"
         _model_cache.clear()
         MGR.log(f"pulled {dest.name}")
     except Exception as e:
-        d["status"] = "paused" if d["cancel"] else "error"
-        if not d["cancel"]:
+        cancelled = bool(d["cancel"])
+        if cancelled:
+            d["status"] = "paused"
+            # A cancel that arrives while this thread holds the .part open is deferred
+            # to here: unlinking from the request thread would leave the worker writing
+            # to an unlinked inode and then failing its rename.
+            if d.get("delete_part"):
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                with _dl_lock:
+                    DOWNLOADS.pop(did, None)
+        else:
+            d["status"] = "error"
             d["error"] = str(e)[:300]
 
 class PullBody(BaseModel):
@@ -1697,11 +1833,21 @@ def api_hf_pull(b: PullBody):
         did = f"{b.repo}:{fname}"
         part = dest.with_suffix(dest.suffix + ".part")
         done_b = part.stat().st_size if part.exists() else 0
-        DOWNLOADS[did] = {"id": did, "repo": b.repo, "file": fname, "path": f,
-                          "url": f"https://huggingface.co/{b.repo}/resolve/main/{f}",
-                          "dest": str(dest), "done": done_b, "total": int(b.sizes.get(f, 0) or 0),
-                          "status": "queued", "cancel": False, "error": ""}
-        threading.Thread(target=_download_worker, args=(did,), daemon=True).start()
+        with _dl_lock:
+            existing = DOWNLOADS.get(did)
+            if existing and _dl_live(existing):
+                # did is derived from repo+file, so one did is always one dest: attach to
+                # the running job rather than racing a second writer onto the same .part.
+                started.append(did)
+                continue
+            job = {"id": did, "repo": b.repo, "file": fname, "path": f,
+                   "url": f"https://huggingface.co/{b.repo}/resolve/main/{f}",
+                   "dest": str(dest), "done": done_b, "total": int(b.sizes.get(f, 0) or 0),
+                   "status": "queued", "cancel": False, "delete_part": False, "error": ""}
+            t = threading.Thread(target=_download_worker, args=(did,), daemon=True)
+            job["_thread"] = t
+            DOWNLOADS[did] = job
+        t.start()
         started.append(did)
     if not started:
         raise HTTPException(400, "no .gguf files in selection")
@@ -1709,7 +1855,11 @@ def api_hf_pull(b: PullBody):
 
 @app.get("/api/downloads")
 def api_downloads():
-    return sorted(DOWNLOADS.values(), key=lambda d: d["id"])
+    with _dl_lock:
+        jobs = list(DOWNLOADS.values())
+    # _thread is bookkeeping, not API surface (a Thread is not JSON-serialisable).
+    return sorted(({k: v for k, v in d.items() if k != "_thread"} for d in jobs),
+                  key=lambda d: d["id"])
 
 class CancelBody(BaseModel):
     id: str
@@ -1717,30 +1867,44 @@ class CancelBody(BaseModel):
 
 @app.post("/api/downloads/cancel")
 def api_cancel(b: CancelBody):
-    d = DOWNLOADS.get(b.id)
-    if not d:
-        raise HTTPException(404)
-    d["cancel"] = True
-    if b.delete_part:
-        try:
-            Path(d["dest"] + ".part").unlink(missing_ok=True)
-        except Exception:
-            pass
-        DOWNLOADS.pop(b.id, None)
-    return {"ok": True}
+    with _dl_lock:
+        d = DOWNLOADS.get(b.id)
+        if not d:
+            raise HTTPException(404)
+        d["cancel"] = True
+        d["delete_part"] = bool(b.delete_part)
+        live = _dl_live(d)
+        if b.delete_part and not live:
+            # No worker holds the file open, so unlink and forget it here. A live worker
+            # does that itself once its handle closes.
+            try:
+                Path(d["dest"] + ".part").unlink(missing_ok=True)
+            except OSError:
+                pass
+            DOWNLOADS.pop(b.id, None)
+    return {"ok": True, "deferred_to_worker": live}
 
 @app.post("/api/downloads/resume")
 def api_resume(b: CancelBody):
-    d = DOWNLOADS.get(b.id)
-    if not d:
-        raise HTTPException(404)
-    if d.get("status") in ("downloading", "queued"):
-        return {"ok": True}
-    d["cancel"] = False
-    d["error"] = ""
-    d["status"] = "queued"
-    threading.Thread(target=_download_worker, args=(b.id,), daemon=True).start()
-    return {"ok": True}
+    t = None
+    with _dl_lock:
+        d = DOWNLOADS.get(b.id)
+        if not d:
+            raise HTTPException(404)
+        # Clear cancel first: a live worker re-reads it per chunk, so resuming a running
+        # download is just that. The old code returned early on status=="downloading"
+        # without clearing it, leaving the job stuck showing "downloading".
+        d["cancel"] = False
+        d["delete_part"] = False
+        d["error"] = ""
+        live = _dl_live(d)
+        if not live:
+            d["status"] = "queued"
+            t = threading.Thread(target=_download_worker, args=(b.id,), daemon=True)
+            d["_thread"] = t
+    if t is not None:
+        t.start()
+    return {"ok": True, "resumed_live": live}
 
 # ---------------------------------------------------------------- delete
 class DeleteBody(BaseModel):
@@ -1784,6 +1948,10 @@ def api_models():
     benches = _read_json(BENCHMARKS_PATH, [])
     pins = set(mmeta.get("pins", []))
     recents = mmeta.get("recents", {})
+    # One hardware snapshot for the whole list: estimate_vram() would otherwise fork
+    # nvidia-smi and probe both servers once per model.
+    host_vit = vitals()
+    srv_running = bool(MGR.status().get("running") or SMGR.status().get("running"))
     # Compute latest benchmark per model path
     best_bench = {}
     for b in benches:
@@ -1808,6 +1976,7 @@ def api_models():
             parallel=int(saved.get("parallel") or 1),
             preset=saved.get("preset") or "auto",
             ncmoe=int(saved.get("ncmoe") or 0),
+            vit=host_vit, srv_running=srv_running,
         )
     data["caps"] = bin_caps(CFG.get("server_binary", BIN))
     data["default_ctx"] = int(CFG.get("ctx", 8192) or 8192)
@@ -2033,7 +2202,7 @@ def api_benchmark_run(b: BenchRunBody):
 
     MGR.last_tok_s = tok_s
     MGR.last_prompt_s = prompt_s
-    vit = vitals()
+    vit = vitals(refresh=True)   # post-run VRAM must not come from a cached sample
     vram_mb = (vit.get("gpu") or {}).get("used_mb", 0)
 
     entry = {
@@ -2075,8 +2244,11 @@ def api_avalon_profiles():
             "speed": p["speed"], "exclusive": p["exclusive"],
             "draft": p.get("draft", False),
             "defaults": defs,
-            "cmd": cmd_str,
-            "cmd_preview": cmd_str,
+            # What the user explicitly saved (empty = inherit profile defaults) — the tune
+            # form restores this, not `defaults`, so unset fields stay unset.
+            "saved": saved_all.get(key) if isinstance(saved_all.get(key), dict) else {},
+            "cmd": _redact_cmd(cmd_str),
+            "cmd_preview": _redact_cmd(cmd_str),
             "available": Path(AVALON_BIN).exists() and AVALON_MODEL.exists(),
         })
     return out
@@ -2108,20 +2280,28 @@ class AvalonTuneBody(BaseModel):
     draft_n: int | None = None
     ubd: int | None = None
     parallel: int | None = None
+    preview: bool = False
 
 @app.post("/api/avalon/tune")
 def api_avalon_tune(b: AvalonTuneBody):
     if b.profile not in AVALON_PROFILES:
         raise HTTPException(400, "unknown profile")
     tune_dict = dict(b.tune or {})
+    # The select-backed fields use 0 to mean "profile default"; draft_n/ubd are free number
+    # inputs where an empty box is unset and a typed 0 means "drafting off" — so 0 is a value.
     for k in ("ctx", "batch", "ubatch", "ctk", "ctv", "draft_n", "ubd", "parallel"):
         val = getattr(b, k, None)
-        if val is not None and val != "" and val != 0:
-            tune_dict[k] = val
-    CFG.setdefault("avalon_tune", {})[b.profile] = tune_dict
-    _save_config_secure()
+        if val is None or val == "":
+            continue
+        if k in ("ctx", "parallel") and val == 0:
+            continue
+        tune_dict[k] = val
     cmd_str = " ".join(SMGR.build_args(b.profile, tune_dict))
-    return {"ok": True, "cmd": cmd_str, "cmd_preview": cmd_str, "tune": tune_dict}
+    if not b.preview:
+        CFG.setdefault("avalon_tune", {})[b.profile] = tune_dict
+        _save_config_secure()
+    return {"ok": True, "cmd": _redact_cmd(cmd_str), "cmd_preview": _redact_cmd(cmd_str),
+            "tune": tune_dict, "preview": b.preview}
 
 @app.post("/api/avalon/stop")
 def api_avalon_stop():
@@ -2145,8 +2325,11 @@ def _lan_ip():
             if len(parts) < 4:
                 continue
             ip = parts[3].split("/")[0]
-            if ip.startswith("192.168.") or ip.startswith(("10.", "172.")):
-                best = best or (ip if ip.startswith("192.168.") else best) or ip
+            if ip.startswith("192.168."):
+                best = ip
+                break
+            if best is None and ip.startswith(("10.", "172.")):
+                best = ip
         return best or "127.0.0.1"
     except Exception:
         return "127.0.0.1"
@@ -2286,10 +2469,11 @@ def _w_codex(alias, base, ctx):
     block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"LFM Panel\"\n"
              f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n"
              f"\n[profiles.{PANEL_PROVIDER_ID}]\nmodel_provider = \"{PANEL_PROVIDER_ID}\"\nmodel = \"{alias}\"\n")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(old + block)
     import tomllib
-    tomllib.loads(path.read_text())  # validate
+    merged = old + block
+    tomllib.loads(merged)  # validate before touching the user's config
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(merged)
     return str(path) + " — codex: codex --profile lfm-panel"
 
 def _w_aider(alias, base, ctx):
@@ -2360,10 +2544,11 @@ def _w_kimi(alias, base, ctx, key):
     block = (f"\n[providers.{PANEL_PROVIDER_ID}]\nname = \"LFM Panel\"\ntype = \"openai\"\n"
              f"baseUrl = \"{base}/v1\"\napiKey = \"{key or 'panel'}\"\n"
              f"\n[models.\"{alias}\"]\nprovider = \"{PANEL_PROVIDER_ID}\"\nname = \"{alias} via LFM Panel\"\n")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(old + block)
     import tomllib
-    tomllib.loads(path.read_text())  # validate
+    merged = old + block
+    tomllib.loads(merged)  # validate before touching the user's config
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(merged)
     return str(path) + " — kimi: model lfm-panel/" + alias
 
 AGENTS = {
@@ -2526,6 +2711,8 @@ async def api_chat(req: Request):
     MGR.touch()
     port, key = tgt
     body = await req.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "expected a JSON object body")
     body.setdefault("stream", True)
     url = f"http://127.0.0.1:{port}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {key}"} if key else {}
@@ -3518,14 +3705,14 @@ async function loadModels(){
 }
 function fitMeterHtml(fit){
   if(!fit)return '<div class="fitbox"><span class="hint">no estimate</span></div>';
-  const tot=Math.max(1,fit.budget_mb||1);
+  const tot=Math.max(1,fit.usable_mb||fit.budget_mb||1);
   const wPct=Math.min(100,Math.round(100*(fit.weights_vram_mb||0)/tot));
   const kvPct=Math.min(100-wPct,Math.round(100*(fit.kv_vram_mb||0)/tot));
   const cPct=Math.min(100-wPct-kvPct,Math.round(100*(fit.compute_mb||0)/tot));
   const tone=fit.status==='fit'?'ok':fit.status==='tight'?'warn':'err';
   const lbl=fit.status==='fit'?'Fits':fit.status==='tight'?'Tight':'Exceeds';
   return '<div class="fitbox" title="Weights: '+n0(fit.weights_vram_mb)+' MB · KV: '+n0(fit.kv_vram_mb)+' MB · Compute: '+n0(fit.compute_mb)+' MB / Budget: '+n0(fit.budget_mb)+' MB ('+esc(fit.budget_source)+')">'
-    +'<div class="fit-top"><span>'+(fit.vram_used_mb/1024).toFixed(1)+' / '+(fit.budget_mb/1024).toFixed(1)+' GB</span>'
+    +'<div class="fit-top"><span>'+(fit.vram_used_mb/1024).toFixed(1)+' / '+((fit.usable_mb||fit.budget_mb)/1024).toFixed(1)+' GB</span>'
     +'<span class="tag '+tone+'" style="padding:0 6px;font-size:10px">'+lbl+' '+fit.pct+'%</span></div>'
     +'<div class="meter '+(tone==='ok'?'':tone)+'" style="margin:3px 0"><i style="width:'+wPct+'%"></i><i class="kv" style="width:'+kvPct+'%"></i><i class="cmp" style="width:'+cPct+'%"></i></div>'
     +'<div class="fit-sub">W '+(fit.weights_vram_mb/1024).toFixed(1)+'G · KV '+n0(fit.kv_vram_mb)+'M'+(fit.ram_offload_mb>0?' · RAM '+(fit.ram_offload_mb/1024).toFixed(1)+'G':'')+'</div></div>';
@@ -3584,7 +3771,7 @@ function renderModels(){
   $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
   if(MODELS[0]&&MODELS[0].fit){
     const f=MODELS[0].fit;
-    $('#vramchip').textContent=f.budget_source+': '+(f.budget_mb/1024).toFixed(1)+' GB usable';
+    $('#vramchip').textContent=f.budget_source+': '+((f.usable_mb||f.budget_mb)/1024).toFixed(1)+' GB usable';
   }
   if(!list.length){
     $('#modellist').innerHTML='<div class="empty"><b>'+(MODELS.length?'No model matches this filter':'No GGUF models found')+'</b>'
@@ -3687,8 +3874,8 @@ async function updateLaunchPreview(){
     const tone=fit.status==='fit'?'ok':fit.status==='tight'?'warn':'err';
     const b=$('#ld-fit-badge');
     b.className='tag '+tone;
-    b.textContent=fit.label+' · '+n0(fit.vram_used_mb)+' / '+n0(fit.budget_mb)+' MB ('+fit.pct+'%)';
-    const tot=Math.max(1,fit.budget_mb||1);
+    b.textContent=fit.label+' · '+n0(fit.vram_used_mb)+' / '+n0(fit.usable_mb||fit.budget_mb)+' MB ('+fit.pct+'%)';
+    const tot=Math.max(1,fit.usable_mb||fit.budget_mb||1);
     const wPct=Math.min(100,Math.round(100*(fit.weights_vram_mb||0)/tot));
     const kvPct=Math.min(100-wPct,Math.round(100*(fit.kv_vram_mb||0)/tot));
     const cPct=Math.min(100-wPct-kvPct,Math.round(100*(fit.compute_mb||0)/tot));
@@ -4068,7 +4255,7 @@ $('#chat').addEventListener('click',async e=>{
     const msg=HIST[idx];if(!msg)return;
     $('#prompt').value=msg.content;autosize();$('#prompt').focus();
     HIST=HIST.slice(0,idx);
-    if(CID){try{await post('/api/chats/'+CID+'/truncate',{count:idx})}catch(err){}}
+    if(CID){try{await post('/api/chats/'+CID+'/truncate',{keep:idx})}catch(err){}}
     redrawThread();
     return;
   }
@@ -4081,7 +4268,7 @@ $('#chat').addEventListener('click',async e=>{
     if(userIdx<0)return;
     const promptText=HIST[userIdx].content;
     HIST=HIST.slice(0,userIdx);
-    if(CID){try{await post('/api/chats/'+CID+'/truncate',{count:userIdx})}catch(err){}}
+    if(CID){try{await post('/api/chats/'+CID+'/truncate',{keep:userIdx})}catch(err){}}
     redrawThread();
     $('#prompt').value=promptText;
     send();
@@ -4285,9 +4472,10 @@ async function loadAvalon(){
       :'<span class="hint">Avalon is stopped. Choose a profile below or open Config Optimizer &amp; Tuning.</span>';
     $('#avalonstart').disabled=!ASEL||!ALIST.some(p=>p.key===ASEL&&p.available);
     $('#avalonstop').disabled=!AV.running;
-    if(AV&&AV.tune&&!$('#avalontunebox').dataset.loaded){
+    const tp=ALIST.find(p=>p.key===ASEL);
+    if(tp&&tp.saved&&!$('#avalontunebox').dataset.loaded){
       $('#avalontunebox').dataset.loaded='1';
-      setAvalonTuneForm(AV.tune);
+      setAvalonTuneForm(tp.saved);
     }
     const selProf=ALIST.find(p=>p.key===ASEL);
     if(selProf&&selProf.cmd_preview&&!$('#avcmdpreview').textContent)$('#avcmdpreview').textContent=selProf.cmd_preview;
@@ -4296,31 +4484,36 @@ async function loadAvalon(){
   }catch(e){}
 }
 function getAvalonTuneForm(){
+  // Empty number box = unset (null); the two selects use 0 = "profile default".
+  const num=v=>{const s=String(v).trim();if(s==='')return null;const n=Number(s);return isNaN(n)?null:n};
   return {
     profile:ASEL||'flagship',
     ctx:Number($('#av-ctx').value)||0,
-    batch:Number($('#av-batch').value)||0,
-    ubatch:Number($('#av-ubatch').value)||0,
+    batch:num($('#av-batch').value),
+    ubatch:num($('#av-ubatch').value),
     ctk:$('#av-ctk').value,
     ctv:$('#av-ctv').value,
-    draft_n:Number($('#av-draft').value)||0,
-    ubd:Number($('#av-ubd').value)||0,
+    draft_n:num($('#av-draft').value),
+    ubd:num($('#av-ubd').value),
     parallel:Number($('#av-np').value)||0
   };
 }
 function setAvalonTuneForm(t){
+  // Number boxes: null/undefined = unset (blank), but a saved 0 must render as "0"
+  // (draft_n 0 means drafting off — blank would silently mean "profile default").
+  const v=x=>(x==null||x==='')?'':String(x);
   $('#av-ctx').value=String(t.ctx||0);
-  $('#av-batch').value=t.batch||'';
-  $('#av-ubatch').value=t.ubatch||'';
+  $('#av-batch').value=v(t.batch);
+  $('#av-ubatch').value=v(t.ubatch);
   $('#av-ctk').value=t.ctk||'';
   $('#av-ctv').value=t.ctv||'';
-  $('#av-draft').value=t.draft_n||'';
-  $('#av-ubd').value=t.ubd||'';
+  $('#av-draft').value=v(t.draft_n);
+  $('#av-ubd').value=v(t.ubd);
   $('#av-np').value=String(t.parallel||0);
 }
 async function previewAvalonTune(){
   try{
-    const r=await post('/api/avalon/tune',getAvalonTuneForm());
+    const r=await post('/api/avalon/tune',Object.assign(getAvalonTuneForm(),{preview:true}));
     $('#avcmdpreview').textContent=r.cmd_preview||'';
   }catch(e){}
 }
@@ -4634,4 +4827,4 @@ $('#footnote').textContent='live telemetry active · polling pauses when tab is 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host=CFG.get("bind_host", "0.0.0.0"), port=PORT, log_level="info")
