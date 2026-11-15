@@ -12,6 +12,8 @@ import os
 import struct
 import sys
 import tempfile
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -525,6 +527,330 @@ def test_vitals_memoized_across_calls():
 
 def test_sudo_rejects_empty_password():
     assert panel._sudo_ok("") is False
+
+
+# ------------------------------------------------- fit percentage / badge agreement
+def test_fit_pct_and_badge_share_a_denominator():
+    """pct used to divide by budget_mb while the badge divided by usable_mb, so a
+    "Tight fit" badge could sit next to a smaller percentage than it implies."""
+    ov = (panel.vitals, panel.MGR, panel.SMGR, panel.CFG["vram_reserve_mb"])
+
+    def fake_vitals(refresh=False):
+        return {"gpu": {"used_mb": 0, "total_mb": 24576, "name": "T"},
+                "mem": {"total_gb": 32.0, "used_gb": 1.0}}
+
+    class St:
+        def status(self):
+            return {"running": True}
+
+    panel.vitals, panel.MGR, panel.SMGR = fake_vitals, St(), St()
+    panel.CFG["vram_reserve_mb"] = 512
+    try:
+        saw_denominators_differ = False
+        for size_mb in (500, 2000, 6000, 10000, 15000, 20000, 25000, 32000, 48000):
+            meta = {"size": size_mb * 1048576, "blocks": 8, "n_kv": 4, "k_len": 128,
+                    "v_len": 128, "moe": False, "vl": False, "mmproj": None}
+            f = panel.estimate_vram(meta, ctx=1024, ngl=99, ctk="f16", ctv="f16",
+                                    parallel=1, preset="dense-gpu")
+            assert f["budget_mb"] > f["usable_mb"], "reserve must separate the two"
+            assert f["pct"] == min(999, round(100 * f["total_vram_mb"] / f["usable_mb"])), \
+                f"pct must be measured against usable_mb at {size_mb} MB"
+            # The badge thresholds are 0.85 and 1.0 of usable, so pct must land on the
+            # same side of those lines as the badge it is displayed next to.
+            if f["status"] == "fit":
+                assert f["pct"] <= 85, f"fit badge with pct {f['pct']}"
+            elif f["status"] == "tight":
+                assert 85 < f["pct"] <= 100, f"tight badge with pct {f['pct']}"
+            else:
+                assert f["pct"] > 100, f"overflow badge with pct {f['pct']}"
+            if round(100 * f["total_vram_mb"] / f["budget_mb"]) != f["pct"]:
+                saw_denominators_differ = True
+        assert saw_denominators_differ, "test is vacuous unless the old denominator differs"
+    finally:
+        panel.vitals, panel.MGR, panel.SMGR, panel.CFG["vram_reserve_mb"] = ov
+
+
+# ------------------------------------------------- vision-language detection
+def test_vl_name_detection():
+    yes = ["qwen2.5-vl-7b-instruct", "internvl3-8b", "Qwen3VL-8B", "llava-v1.6-mistral",
+           "pixtral-12b-2409", "qwen2.5-omni-7b", "minicpm-v-2_6", "moe-vl-mixtral",
+           "phi3.5-vision-instruct", "molmo-7b-d"]
+    no = ["omnidoc-bench-parser", "meta-llama-3.1-8b-instruct", "deepseek-r1-q4_k_m",
+          "revaluation-notes-13b", "volume-knob-8b", "qwen3-30b-a3b", "nova-bench-v2"]
+    for name in yes:
+        assert panel.VL_NAME_RE.search(name), f"{name} should be vision-language"
+    for name in no:
+        assert not panel.VL_NAME_RE.search(name), f"{name} should not be vision-language"
+
+
+def test_loose_mmproj_sidecar_does_not_flag_every_model_as_vl():
+    """find_mmproj() matches on name-token overlap, so a sibling that merely shares a
+    prefix "finds" a sidecar. Using that as a vl signal tagged every model VL and flipped
+    the `auto` preset to vision; the name marker is the signal instead."""
+    base = MODELS_DIR / "plain-dense-weights.gguf"
+    sibling = MODELS_DIR / "plain-dense-other.gguf"   # shares 2 of 5 tokens with the sidecar
+    for p in (base, sibling):
+        if not p.exists():
+            gguf(p, arch="llama")
+    sidecar = MODELS_DIR / "plain-dense-weights-mmproj-f16.gguf"
+    sidecar.write_bytes(b"GGUF" + b"\0" * 1_100_000)
+    try:
+        assert panel.find_mmproj(str(base)) == str(sidecar)
+        assert panel.find_mmproj(str(sibling)) == str(sidecar), \
+            "overlap is loose by design: a prefix-sharing sibling also matches"
+        models = {m["name"]: m for m in panel.scan_models()["models"]}
+        for name in (base.stem, sibling.stem):
+            m = models[name]
+            assert m["vl"] is False, f"{name} must not be tagged VL from a loose sidecar"
+            assert m["mmproj"], "the sidecar is still reported for explicit vision launches"
+    finally:
+        sidecar.unlink(missing_ok=True)
+        panel._model_cache.clear()
+
+
+def test_model_cache_prunes_entries_for_gone_files():
+    panel.scan_models()
+    stale = ("/nonexistent/dir/gone.gguf", 1, 2)
+    panel._model_cache[stale] = {"path": stale[0]}
+    panel.scan_models()
+    assert stale not in panel._model_cache, "cache must drop files that no longer exist"
+
+
+# ------------------------------------------------- metrics counter self-diagnosis
+def test_telemetry_reports_counter_names_the_build_emits():
+    """A build whose counter names the panel doesn't know must be diagnosable from the
+    API rather than by scraping /metrics on the host."""
+    body = (METRICS + "llama:tokens_generated_total 999\n"
+            "llama:some_brand_new_counter 3\n")
+    real_get = httpx.get
+
+    def fake_get(url, **kw):
+        if url.endswith("/slots"):
+            return Resp(200, json.loads(json.dumps(SLOTS)))
+        if url.endswith("/metrics"):
+            return Resp(200, None, body)
+        return Resp(200, {"status": "ok"})
+    httpx.get = fake_get
+    port = 8899           # fresh port: the name cache keeps the first scrape per port
+    panel._METRIC_KEYS.pop(port, None)
+    try:
+        t = panel.MGR.telemetry(port=port)
+        assert "llama:tokens_generated_total" in t["metric_keys"], t["metric_keys"]
+        assert "llama:some_brand_new_counter" in t["metric_keys"]
+        assert "llama:tokens_predicted_total" in t["metric_keys"]
+        assert t["tokens_predicted_total"] == 12345
+        assert panel._METRIC_KEYS[port] == sorted(set(body.split() and [
+            "llama:tokens_predicted_total", "llama:tokens_predicted_seconds_total",
+            "llama:tokens_prompted_total", "llama:tokens_prompted_seconds_total",
+            "llama:kv_cache_usage_ratio", "llama:requests_processing",
+            "llama:requests_deferred", "llama:tokens_generated_total",
+            "llama:some_brand_new_counter"]))
+    finally:
+        httpx.get = real_get
+        panel._METRIC_KEYS.pop(port, None)
+
+
+def test_counter_family_matches_spelling_variants():
+    for name in ("llama:tokens_predicted_total", "llama_tokens_predicted_total",
+                 "tokens_predicted_total", "llama:tokens_prompted_total"):
+        m = panel._METRIC_TOK_TOTAL_RE.match(name)
+        assert m, f"{name} must match the counter family"
+        assert m.group(1) == ("predicted" if "predicted" in name else "prompted")
+    assert not panel._METRIC_TOK_TOTAL_RE.match("llama:tokens_predicted_seconds_total")
+
+
+# ------------------------------------------------- download job state
+def test_downloads_list_is_json_safe_and_lock_guarded():
+    """_thread must not leak into the API, and listing while a pull registers a job must
+    not raise 'dictionary changed size during iteration'."""
+    did = "repo/concurrent.gguf"
+    stop = threading.Event()
+    holder = threading.Thread(target=stop.wait, daemon=True)
+    holder.start()
+    panel.DOWNLOADS[did] = {"id": did, "repo": "repo", "file": "concurrent.gguf",
+                            "path": "concurrent.gguf", "url": "http://x",
+                            "dest": "/tmp/concurrent.gguf", "done": 0, "total": 1,
+                            "status": "downloading", "cancel": False,
+                            "delete_part": False, "error": "", "_thread": holder}
+    errors = []
+
+    def churn():
+        try:
+            for i in range(300):
+                extra = f"repo/churn{i}.gguf"
+                panel.DOWNLOADS[extra] = {"id": extra, "status": "queued", "cancel": False,
+                                          "dest": f"/tmp/c{i}.gguf"}
+                if i % 3 == 0:
+                    panel.DOWNLOADS.pop(extra, None)
+        except Exception as e:                       # pragma: no cover - the point is it can't
+            errors.append(e)
+
+    t = threading.Thread(target=churn)
+    t.start()
+    try:
+        for _ in range(200):
+            listed = panel.api_downloads()
+            json.dumps(listed)
+            assert all("_thread" not in d for d in listed), "Thread must not reach the API"
+    finally:
+        stop.set()
+        t.join(5)
+        for k in [k for k in panel.DOWNLOADS if k.startswith("repo/churn")]:
+            panel.DOWNLOADS.pop(k, None)
+        panel.DOWNLOADS.pop(did, None)
+    assert not errors, f"concurrent mutation escaped the lock: {errors!r}"
+
+
+class _ChunkStream:
+    """httpx.stream stand-in that yields chunks until the job is cancelled."""
+
+    def __init__(self, job, chunk=b"x" * 512, rounds=400):
+        self.job, self.chunk, self.rounds = job, chunk, rounds
+
+    def __call__(self, method, url, **kw):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    @property
+    def status_code(self):
+        return 200
+
+    @property
+    def headers(self):
+        return {"content-length": "200000"}
+
+    def raise_for_status(self):
+        return None
+
+    def iter_bytes(self, n):
+        for _ in range(self.rounds):
+            if self.job["cancel"]:
+                raise RuntimeError("paused")
+            time.sleep(0.004)
+            yield self.chunk
+
+
+def test_cancel_while_worker_is_live_defers_the_delete():
+    d = MODELS_DIR / "dl"
+    d.mkdir(parents=True, exist_ok=True)
+    dest = d / "cancel-me.gguf"
+    part = Path(str(dest) + ".part")
+    part.write_bytes(b"")
+    job = {"id": "r/cancel-me.gguf", "repo": "r", "file": "cancel-me.gguf",
+           "path": "cancel-me.gguf", "url": "http://x", "dest": str(dest),
+           "done": 0, "total": 200000, "status": "queued", "cancel": False,
+           "delete_part": False, "error": ""}
+    real_stream = httpx.stream
+    httpx.stream = _ChunkStream(job)
+    panel.DOWNLOADS[job["id"]] = job
+    try:
+        th = threading.Thread(target=panel._download_worker, args=(job["id"],), daemon=True)
+        job["_thread"] = th
+        th.start()
+        for _ in range(200):
+            if job["status"] == "downloading":
+                break
+            time.sleep(0.01)
+        r = panel.api_cancel(panel.CancelBody(id=job["id"], delete_part=True))
+        assert r["deferred_to_worker"] is True, r
+        assert job["id"] in panel.DOWNLOADS, "a live worker must not be yanked mid-write"
+        assert part.exists(), "the .part the worker holds open must survive for now"
+        th.join(10)
+        assert job["id"] not in panel.DOWNLOADS, "worker must drop the entry on cancel+delete"
+        assert not part.exists(), "worker must unlink the .part it owns"
+        assert job["status"] == "paused", job["status"]
+        assert not dest.exists(), "a cancelled download must never be published"
+    finally:
+        httpx.stream = real_stream
+        panel.DOWNLOADS.pop(job["id"], None)
+        part.unlink(missing_ok=True)
+        dest.unlink(missing_ok=True)
+
+
+def test_resume_clears_cancel_on_a_live_job():
+    """The old code returned early on status=="downloading" without clearing cancel,
+    leaving the job stuck showing "downloading" forever."""
+    did = "r/resume-me.gguf"
+    stop = threading.Event()
+    holder = threading.Thread(target=stop.wait, daemon=True)
+    holder.start()
+    panel.DOWNLOADS[did] = {"id": did, "repo": "r", "file": "resume-me.gguf",
+                            "path": "resume-me.gguf", "url": "http://x",
+                            "dest": "/tmp/resume-me.gguf", "done": 1, "total": 2,
+                            "status": "downloading", "cancel": True,
+                            "delete_part": True, "error": "boom", "_thread": holder}
+    try:
+        r = panel.api_resume(panel.CancelBody(id=did))
+        assert r["resumed_live"] is True, r
+        job = panel.DOWNLOADS[did]
+        assert job["cancel"] is False, "cancel must clear or the worker keeps aborting"
+        assert job["delete_part"] is False and job["error"] == ""
+        assert job["status"] == "downloading", "a live job must not be re-queued"
+    finally:
+        stop.set()
+        holder.join(5)
+        panel.DOWNLOADS.pop(did, None)
+
+
+def test_pull_reuses_a_live_job_for_the_same_destination():
+    did = "r:same.gguf"          # api_hf_pull keys jobs as "{repo}:{filename}"
+    stop = threading.Event()
+    holder = threading.Thread(target=stop.wait, daemon=True)
+    holder.start()
+    panel.DOWNLOADS[did] = {"id": did, "repo": "r", "file": "same.gguf",
+                            "path": "same.gguf", "url": "http://x",
+                            "dest": "/tmp/same.gguf", "done": 0, "total": 1,
+                            "status": "downloading", "cancel": False,
+                            "delete_part": False, "error": "", "_thread": holder}
+    real_dirs = panel.CFG["model_dirs"]
+    panel.CFG["model_dirs"] = [str(MODELS_DIR)]
+    try:
+        r = panel.api_hf_pull(panel.PullBody(repo="r", files=["same.gguf"],
+                                             sizes={"same.gguf": 10}))
+        assert r["started"] == [did]
+        assert panel.DOWNLOADS[did]["_thread"] is holder, \
+            "a second pull must attach to the running job, not race a second writer"
+    finally:
+        panel.CFG["model_dirs"] = real_dirs
+        stop.set()
+        holder.join(5)
+        panel.DOWNLOADS.pop(did, None)
+
+
+# ------------------------------------------------- launch secret redaction
+def test_launch_secrets_are_redacted_in_every_exposed_surface():
+    assert panel._redact_cmd("run --api-key SECRETTOKEN -c 8192") == \
+        "run --api-key *** -c 8192"
+    assert panel._redact_cmd("run --api-key=SECRETTOKEN") == "run --api-key=***"
+    ov_key, ov_lan = panel.CFG.get("avalon_api_key"), panel.CFG.get("avalon_lan")
+    # build_args only appends --api-key when Avalon is LAN-exposed, which is exactly the
+    # case where the key is visible in `ps` and worth keeping out of the panel's surfaces.
+    panel.CFG["avalon_api_key"] = "SECRETTOKEN"
+    panel.CFG["avalon_lan"] = True
+    n_log = len(panel.SMGR.logbuf)
+    try:
+        args = panel.SMGR.build_args("flagship")
+        assert "SECRETTOKEN" in args, "the real argv must still carry the key"
+        cmd = " ".join(args)
+        assert "SECRETTOKEN" in cmd
+        for p in panel.api_avalon_profiles():
+            assert "SECRETTOKEN" not in p["cmd"], p["cmd"]
+            assert "SECRETTOKEN" not in p["cmd_preview"], p["cmd_preview"]
+        t = panel.api_avalon_tune(panel.AvalonTuneBody(profile="flagship", preview=True))
+        assert "SECRETTOKEN" not in t["cmd"] and "SECRETTOKEN" not in t["cmd_preview"]
+        panel.SMGR.log("starting: " + cmd)
+        assert "SECRETTOKEN" not in list(panel.SMGR.logbuf)[-1], "log line leaked the key"
+        stored = panel._redact_cmd(cmd)
+        assert "SECRETTOKEN" not in stored
+    finally:
+        panel.CFG["avalon_api_key"], panel.CFG["avalon_lan"] = ov_key, ov_lan
+        while len(panel.SMGR.logbuf) > n_log:
+            panel.SMGR.logbuf.pop()
 
 
 def test_agent_toml_invalid_leaves_file_untouched():

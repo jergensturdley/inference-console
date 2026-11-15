@@ -256,20 +256,26 @@ def scan_models():
             k_len = md.get(f"{arch}.attention.key_length", (embd // n_head) if n_head else 128) or 128
             v_len = md.get(f"{arch}.attention.value_length", k_len) or k_len
             blocks = md.get(f"{arch}.block_count", 0) or 0
+            mmproj = find_mmproj(str(f))
             m = {
                 "path": str(f), "name": stem, "arch": arch,
                 "quant": quant, "size": st.st_size, "size_h": human_size(st.st_size),
-                "moe": moe, "vl": "vl" in stem.lower() or "omni" in stem.lower(),
+                "moe": moe, "vl": bool(VL_NAME_RE.search(stem)),
                 "params": name_label, "ctx_len": md.get(f"{arch}.context_length", 0),
                 "blocks": blocks, "embd": embd, "n_head": n_head, "n_kv": n_kv,
                 "k_len": k_len, "v_len": v_len,
                 "experts": expert_count, "experts_used": expert_used,
                 "imatrix": bool(md.get("general.quantization_imatrix", False)),
-                "mmproj": find_mmproj(str(f)),
+                "mmproj": mmproj,
             }
             _model_cache[key] = m
             models.append(m)
     models.sort(key=lambda m: m["name"].lower())
+    # Cache keys carry mtime+size, so every re-download or re-quant adds an entry that a
+    # scan never drops on its own. Forget entries for files that are gone.
+    live_paths = {m["path"] for m in models}
+    for stale in [k for k in _model_cache if k[0] not in live_paths]:
+        _model_cache.pop(stale, None)
     return {"models": models, "mmproj": accessories}
 
 # ---------------------------------------------------------------- VRAM fit & launch profiles
@@ -281,6 +287,18 @@ KV_TYPE_BYTES = {
     "f32": 4.0, "f16": 2.0, "bf16": 2.0, "q8_0": 1.0625,
     "q5_1": 0.75, "q5_0": 0.6875, "q4_1": 0.625, "q4_0": 0.5625, "iq4_nl": 0.5625,
 }
+
+# Vision-language name markers. Substring matching is kept for the glued families
+# (InternVL, Qwen3-VL without a separator) that word-boundary matching would miss, but
+# `omni`/`vl` must not run straight into more letters, which is what made a bare
+# `"vl" in stem` / `"omni" in stem` test flag OmniDocBench-style names.
+# A paired mmproj sidecar is deliberately NOT used as a vl signal: find_mmproj() matches
+# on token overlap, and in a flat library where files share a name prefix that overlap is
+# non-zero for unrelated models, so it would tag every model VL (and flip the `auto`
+# preset to vision). The name is the reliable signal here.
+VL_NAME_RE = re.compile(
+    r"(?i)(?:vlm|internvl|llava|pixtral|molmo|minicpm-v|vision|visual"
+    r"|omni(?![a-z])|vl(?![a-z]))")
 
 def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
                   ctk: str = "f16", ctv: str = "f16", parallel: int = 1,
@@ -376,7 +394,9 @@ def estimate_vram(model_meta: dict, ctx: int = 8192, ngl: int = 99,
         "usable_mb": round(usable_mb),
         "device": device_label,
         "budget_source": device_label,
-        "pct": min(999, round(100 * total_vram_mb / max(1, budget_mb))),
+        # Same denominator as `status`/`badge` above: the reserve is what the verdict is
+        # measured against, so a "Tight fit" badge can't sit next to a smaller percentage.
+        "pct": min(999, round(100 * total_vram_mb / max(1, usable_mb))),
         "status": status,
         "badge": badge,
         "label": badge,
@@ -487,6 +507,21 @@ def igpu_device(refresh=False):
         pass
     _igpu_cache.update(checked=now, tag=tag, free=free)
     return tag, free
+
+# llama.cpp counter names differ between builds, so match the family rather than one
+# suffix, and record what a build actually exposed: an unrecognised counter then shows up
+# in /api/server/telemetry's metric_keys instead of needing a hand scrape of /metrics.
+_METRIC_TOK_TOTAL_RE = re.compile(r"^(?:llama[:_])?tokens_(predicted|prompted)_total$")
+_METRIC_KEYS: dict = {}    # port -> counter names that build emitted (first scrape wins)
+
+_SECRET_ARG_RE = re.compile(r"(--api-key[ =])(\S+)")
+
+def _redact_cmd(text: str) -> str:
+    """Mask launch secrets before a command string reaches the UI, the log buffer, or the
+    state file. The real argv still carries the key: on Linux /proc/<pid>/cmdline is
+    world-readable, so this only stops the panel from re-publishing it. Nothing parses
+    these strings, so masking is safe at every exposure point."""
+    return _SECRET_ARG_RE.sub(r"\1***", text)
 
 class ServerManager:
     def __init__(self):
@@ -608,7 +643,7 @@ class ServerManager:
         return out
 
     def log(self, line):
-        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
 
     @staticmethod
     def _health(port, timeout=1.5):
@@ -634,6 +669,7 @@ class ServerManager:
             "prompt_s": round(self.last_prompt_s, 1),
             "requests_processing": 0, "requests_deferred": 0,
             "tokens_predicted_total": 0, "tokens_prompted_total": 0,
+            "metric_keys": list(_METRIC_KEYS.get(port, [])),
             "slots": [],
         }
         try:
@@ -672,6 +708,7 @@ class ServerManager:
         try:
             r = httpx.get(f"http://127.0.0.1:{port}/metrics", headers=headers, timeout=1.2)
             if r.status_code == 200:
+                seen = set()
                 for ln in r.text.splitlines():
                     if ln.startswith("#") or not ln.strip():
                         continue
@@ -683,6 +720,9 @@ class ServerManager:
                         fv = float(v)
                     except ValueError:
                         continue
+                    if k.startswith("llama") or "token" in k:
+                        seen.add(k)
+                    tok_total = _METRIC_TOK_TOTAL_RE.match(k)
                     if "predicted_seconds_total" in k or k.endswith("predicted_tokens_seconds"):
                         if fv > 0:
                             out["tok_s"] = round(fv, 1)
@@ -691,16 +731,20 @@ class ServerManager:
                         if fv > 0:
                             out["prompt_s"] = round(fv, 1)
                             self.last_prompt_s = fv
-                    elif k.endswith("tokens_predicted_total"):
-                        out["tokens_predicted_total"] = int(fv)
-                    elif k.endswith("tokens_prompted_total"):
-                        out["tokens_prompted_total"] = int(fv)
+                    elif tok_total:
+                        if tok_total.group(1) == "predicted":
+                            out["tokens_predicted_total"] = int(fv)
+                        else:
+                            out["tokens_prompted_total"] = int(fv)
                     elif "kv_cache_usage_ratio" in k:
                         out["kv_pct"] = max(out["kv_pct"], round(fv * 100.0, 1))
                     elif "requests_processing" in k:
                         out["requests_processing"] = int(fv)
                     elif "requests_deferred" in k:
                         out["requests_deferred"] = int(fv)
+                if seen:
+                    _METRIC_KEYS[port] = sorted(seen)[:80]
+                out["metric_keys"] = _METRIC_KEYS.get(port, [])
         except Exception:
             pass
         if out["active_slots"] > 0 or out["requests_processing"] > 0:
@@ -895,7 +939,7 @@ class ServerManager:
         self.last_tok_s = 0.0
         self.last_prompt_s = 0.0
         self.info = {"pid": self.proc.pid, "port": port, "alias": mp.stem, "model": model,
-                     "preset": resolved_preset, "ctx": eff_ctx, "cmd": cmd_str,
+                     "preset": resolved_preset, "ctx": eff_ctx, "cmd": _redact_cmd(cmd_str),
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
@@ -908,7 +952,7 @@ class ServerManager:
     def _pump_logs(self):
         proc = self.proc
         for line in proc.stdout:
-            s = line.rstrip()
+            s = _redact_cmd(line.rstrip())
             self.logbuf.append(s)
             # Parse tok/s from llama-server log lines when /metrics isn't scraped yet
             m = re.search(r"eval time\s*=.*?\(\s*([0-9.]+)\s*tokens per second\)", s)
@@ -1011,7 +1055,7 @@ class AvalonManager:
             pass
 
     def log(self, line):
-        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {line}")
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
 
     def _health(self, timeout=1.5):
         """Returns 'down' | 'loading' | 'ready' plus detail dict."""
@@ -1108,7 +1152,7 @@ class AvalonManager:
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, errors="replace", start_new_session=True)
         threading.Thread(target=self._pump_logs, daemon=True).start()
-        self.info = {"profile": profile, "pid": self.proc.pid, "cmd": cmd_str,
+        self.info = {"profile": profile, "pid": self.proc.pid, "cmd": _redact_cmd(cmd_str),
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
@@ -1116,7 +1160,7 @@ class AvalonManager:
     def _pump_logs(self):
         proc = self.proc
         for line in proc.stdout:
-            self.logbuf.append(line.rstrip())
+            self.logbuf.append(_redact_cmd(line.rstrip()))
 
     def stop(self):
         st = self.info
@@ -1684,9 +1728,24 @@ def api_hf_files(repo: str):
     return out
 
 DOWNLOADS = {}
+# FastAPI runs sync endpoints on a threadpool, so pull/cancel/resume/list can all touch
+# DOWNLOADS concurrently: a bare `sorted(DOWNLOADS.values())` can raise "dictionary
+# changed size during iteration" while a pull registers a job.
+_dl_lock = threading.Lock()
+
+
+def _dl_live(d: dict) -> bool:
+    """True while the job's worker thread is still running. Status strings alone are
+    not enough: a thread can die with status left at "downloading"."""
+    t = d.get("_thread")
+    return bool(t and t.is_alive())
+
 
 def _download_worker(did: str):
-    d = DOWNLOADS[did]
+    with _dl_lock:
+        d = DOWNLOADS.get(did)
+    if d is None:          # cancelled and dropped before we got scheduled
+        return
     d["status"] = "downloading"
     dest = Path(d["dest"])
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -1700,6 +1759,8 @@ def _download_worker(did: str):
         with httpx.stream("GET", d["url"], headers=headers, follow_redirects=True,
                           timeout=httpx.Timeout(30, read=120)) as r:
             if r.status_code == 416:  # range already complete
+                if d["cancel"]:
+                    raise RuntimeError("paused")
                 tmp.rename(dest)
                 d["status"] = "done"
                 return
@@ -1718,13 +1779,30 @@ def _download_worker(did: str):
                         raise RuntimeError("paused")
                     fh.write(chunk)
                     d["done"] = fh.tell()
+        if d["cancel"]:
+            # All chunks arrived before the cancel landed; don't publish a file the
+            # user just cancelled.
+            raise RuntimeError("paused")
         tmp.rename(dest)
         d["status"] = "done"
         _model_cache.clear()
         MGR.log(f"pulled {dest.name}")
     except Exception as e:
-        d["status"] = "paused" if d["cancel"] else "error"
-        if not d["cancel"]:
+        cancelled = bool(d["cancel"])
+        if cancelled:
+            d["status"] = "paused"
+            # A cancel that arrives while this thread holds the .part open is deferred
+            # to here: unlinking from the request thread would leave the worker writing
+            # to an unlinked inode and then failing its rename.
+            if d.get("delete_part"):
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                with _dl_lock:
+                    DOWNLOADS.pop(did, None)
+        else:
+            d["status"] = "error"
             d["error"] = str(e)[:300]
 
 class PullBody(BaseModel):
@@ -1755,11 +1833,21 @@ def api_hf_pull(b: PullBody):
         did = f"{b.repo}:{fname}"
         part = dest.with_suffix(dest.suffix + ".part")
         done_b = part.stat().st_size if part.exists() else 0
-        DOWNLOADS[did] = {"id": did, "repo": b.repo, "file": fname, "path": f,
-                          "url": f"https://huggingface.co/{b.repo}/resolve/main/{f}",
-                          "dest": str(dest), "done": done_b, "total": int(b.sizes.get(f, 0) or 0),
-                          "status": "queued", "cancel": False, "error": ""}
-        threading.Thread(target=_download_worker, args=(did,), daemon=True).start()
+        with _dl_lock:
+            existing = DOWNLOADS.get(did)
+            if existing and _dl_live(existing):
+                # did is derived from repo+file, so one did is always one dest: attach to
+                # the running job rather than racing a second writer onto the same .part.
+                started.append(did)
+                continue
+            job = {"id": did, "repo": b.repo, "file": fname, "path": f,
+                   "url": f"https://huggingface.co/{b.repo}/resolve/main/{f}",
+                   "dest": str(dest), "done": done_b, "total": int(b.sizes.get(f, 0) or 0),
+                   "status": "queued", "cancel": False, "delete_part": False, "error": ""}
+            t = threading.Thread(target=_download_worker, args=(did,), daemon=True)
+            job["_thread"] = t
+            DOWNLOADS[did] = job
+        t.start()
         started.append(did)
     if not started:
         raise HTTPException(400, "no .gguf files in selection")
@@ -1767,7 +1855,11 @@ def api_hf_pull(b: PullBody):
 
 @app.get("/api/downloads")
 def api_downloads():
-    return sorted(DOWNLOADS.values(), key=lambda d: d["id"])
+    with _dl_lock:
+        jobs = list(DOWNLOADS.values())
+    # _thread is bookkeeping, not API surface (a Thread is not JSON-serialisable).
+    return sorted(({k: v for k, v in d.items() if k != "_thread"} for d in jobs),
+                  key=lambda d: d["id"])
 
 class CancelBody(BaseModel):
     id: str
@@ -1775,30 +1867,44 @@ class CancelBody(BaseModel):
 
 @app.post("/api/downloads/cancel")
 def api_cancel(b: CancelBody):
-    d = DOWNLOADS.get(b.id)
-    if not d:
-        raise HTTPException(404)
-    d["cancel"] = True
-    if b.delete_part:
-        try:
-            Path(d["dest"] + ".part").unlink(missing_ok=True)
-        except Exception:
-            pass
-        DOWNLOADS.pop(b.id, None)
-    return {"ok": True}
+    with _dl_lock:
+        d = DOWNLOADS.get(b.id)
+        if not d:
+            raise HTTPException(404)
+        d["cancel"] = True
+        d["delete_part"] = bool(b.delete_part)
+        live = _dl_live(d)
+        if b.delete_part and not live:
+            # No worker holds the file open, so unlink and forget it here. A live worker
+            # does that itself once its handle closes.
+            try:
+                Path(d["dest"] + ".part").unlink(missing_ok=True)
+            except OSError:
+                pass
+            DOWNLOADS.pop(b.id, None)
+    return {"ok": True, "deferred_to_worker": live}
 
 @app.post("/api/downloads/resume")
 def api_resume(b: CancelBody):
-    d = DOWNLOADS.get(b.id)
-    if not d:
-        raise HTTPException(404)
-    if d.get("status") in ("downloading", "queued"):
-        return {"ok": True}
-    d["cancel"] = False
-    d["error"] = ""
-    d["status"] = "queued"
-    threading.Thread(target=_download_worker, args=(b.id,), daemon=True).start()
-    return {"ok": True}
+    t = None
+    with _dl_lock:
+        d = DOWNLOADS.get(b.id)
+        if not d:
+            raise HTTPException(404)
+        # Clear cancel first: a live worker re-reads it per chunk, so resuming a running
+        # download is just that. The old code returned early on status=="downloading"
+        # without clearing it, leaving the job stuck showing "downloading".
+        d["cancel"] = False
+        d["delete_part"] = False
+        d["error"] = ""
+        live = _dl_live(d)
+        if not live:
+            d["status"] = "queued"
+            t = threading.Thread(target=_download_worker, args=(b.id,), daemon=True)
+            d["_thread"] = t
+    if t is not None:
+        t.start()
+    return {"ok": True, "resumed_live": live}
 
 # ---------------------------------------------------------------- delete
 class DeleteBody(BaseModel):
@@ -2141,8 +2247,8 @@ def api_avalon_profiles():
             # What the user explicitly saved (empty = inherit profile defaults) — the tune
             # form restores this, not `defaults`, so unset fields stay unset.
             "saved": saved_all.get(key) if isinstance(saved_all.get(key), dict) else {},
-            "cmd": cmd_str,
-            "cmd_preview": cmd_str,
+            "cmd": _redact_cmd(cmd_str),
+            "cmd_preview": _redact_cmd(cmd_str),
             "available": Path(AVALON_BIN).exists() and AVALON_MODEL.exists(),
         })
     return out
@@ -2194,7 +2300,8 @@ def api_avalon_tune(b: AvalonTuneBody):
     if not b.preview:
         CFG.setdefault("avalon_tune", {})[b.profile] = tune_dict
         _save_config_secure()
-    return {"ok": True, "cmd": cmd_str, "cmd_preview": cmd_str, "tune": tune_dict, "preview": b.preview}
+    return {"ok": True, "cmd": _redact_cmd(cmd_str), "cmd_preview": _redact_cmd(cmd_str),
+            "tune": tune_dict, "preview": b.preview}
 
 @app.post("/api/avalon/stop")
 def api_avalon_stop():
@@ -3598,14 +3705,14 @@ async function loadModels(){
 }
 function fitMeterHtml(fit){
   if(!fit)return '<div class="fitbox"><span class="hint">no estimate</span></div>';
-  const tot=Math.max(1,fit.budget_mb||1);
+  const tot=Math.max(1,fit.usable_mb||fit.budget_mb||1);
   const wPct=Math.min(100,Math.round(100*(fit.weights_vram_mb||0)/tot));
   const kvPct=Math.min(100-wPct,Math.round(100*(fit.kv_vram_mb||0)/tot));
   const cPct=Math.min(100-wPct-kvPct,Math.round(100*(fit.compute_mb||0)/tot));
   const tone=fit.status==='fit'?'ok':fit.status==='tight'?'warn':'err';
   const lbl=fit.status==='fit'?'Fits':fit.status==='tight'?'Tight':'Exceeds';
   return '<div class="fitbox" title="Weights: '+n0(fit.weights_vram_mb)+' MB · KV: '+n0(fit.kv_vram_mb)+' MB · Compute: '+n0(fit.compute_mb)+' MB / Budget: '+n0(fit.budget_mb)+' MB ('+esc(fit.budget_source)+')">'
-    +'<div class="fit-top"><span>'+(fit.vram_used_mb/1024).toFixed(1)+' / '+(fit.budget_mb/1024).toFixed(1)+' GB</span>'
+    +'<div class="fit-top"><span>'+(fit.vram_used_mb/1024).toFixed(1)+' / '+((fit.usable_mb||fit.budget_mb)/1024).toFixed(1)+' GB</span>'
     +'<span class="tag '+tone+'" style="padding:0 6px;font-size:10px">'+lbl+' '+fit.pct+'%</span></div>'
     +'<div class="meter '+(tone==='ok'?'':tone)+'" style="margin:3px 0"><i style="width:'+wPct+'%"></i><i class="kv" style="width:'+kvPct+'%"></i><i class="cmp" style="width:'+cPct+'%"></i></div>'
     +'<div class="fit-sub">W '+(fit.weights_vram_mb/1024).toFixed(1)+'G · KV '+n0(fit.kv_vram_mb)+'M'+(fit.ram_offload_mb>0?' · RAM '+(fit.ram_offload_mb/1024).toFixed(1)+'G':'')+'</div></div>';
@@ -3664,7 +3771,7 @@ function renderModels(){
   $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
   if(MODELS[0]&&MODELS[0].fit){
     const f=MODELS[0].fit;
-    $('#vramchip').textContent=f.budget_source+': '+(f.budget_mb/1024).toFixed(1)+' GB usable';
+    $('#vramchip').textContent=f.budget_source+': '+((f.usable_mb||f.budget_mb)/1024).toFixed(1)+' GB usable';
   }
   if(!list.length){
     $('#modellist').innerHTML='<div class="empty"><b>'+(MODELS.length?'No model matches this filter':'No GGUF models found')+'</b>'
@@ -3767,8 +3874,8 @@ async function updateLaunchPreview(){
     const tone=fit.status==='fit'?'ok':fit.status==='tight'?'warn':'err';
     const b=$('#ld-fit-badge');
     b.className='tag '+tone;
-    b.textContent=fit.label+' · '+n0(fit.vram_used_mb)+' / '+n0(fit.budget_mb)+' MB ('+fit.pct+'%)';
-    const tot=Math.max(1,fit.budget_mb||1);
+    b.textContent=fit.label+' · '+n0(fit.vram_used_mb)+' / '+n0(fit.usable_mb||fit.budget_mb)+' MB ('+fit.pct+'%)';
+    const tot=Math.max(1,fit.usable_mb||fit.budget_mb||1);
     const wPct=Math.min(100,Math.round(100*(fit.weights_vram_mb||0)/tot));
     const kvPct=Math.min(100-wPct,Math.round(100*(fit.kv_vram_mb||0)/tot));
     const cPct=Math.min(100-wPct-kvPct,Math.round(100*(fit.compute_mb||0)/tot));
