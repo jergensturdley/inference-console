@@ -35,7 +35,7 @@ VIT_24G = {"gpu": {"used_mb": 1000, "total_mb": 24576, "util": 5, "temp": 50,
            "cpu": {"percent": 10, "cores": 16}}
 
 
-def gguf(path: Path, arch="qwen3moe", kv=None):
+def gguf(path: Path, arch="qwen3moe", kv=None, file_type=10):
     """Write a minimal GGUF v3 header. `kv` entries are (key, type, payload)."""
     def s(v):
         b = v.encode()
@@ -49,7 +49,7 @@ def gguf(path: Path, arch="qwen3moe", kv=None):
 
     pairs = [
         s("general.architecture") + struct.pack("<I", 8) + s(arch),
-        s("general.file_type") + struct.pack("<I", 4) + u32(10),
+        s("general.file_type") + struct.pack("<I", 4) + u32(file_type),
         s(f"{arch}.embedding_length") + struct.pack("<I", 4) + u32(2048),
         s(f"{arch}.attention.head_count") + struct.pack("<I", 4) + u32(32),
         s(f"{arch}.block_count") + struct.pack("<I", 4) + u32(48),
@@ -88,6 +88,86 @@ def test_scan_models_maps_gqa_dims():
     m = next(m for m in panel.scan_models()["models"] if m["name"] == "synth-b")
     assert (m["n_kv"], m["k_len"], m["v_len"]) == (4, 128, 128)
     assert m["blocks"] == 48 and m["moe"] is True
+
+
+# ------------------------------------------------------- general.file_type labels
+# Pinned from gguf-py 0.19.0 LlamaFileType, MOSTLY_/ALL_ stripped. Unconditional so the
+# check runs in any venv; the optional gguf cross-check below catches this fixture drifting
+# from the spec. Ids 4-6 and 33-35 are unassigned upstream; 1024 (GUESSED) is a sentinel.
+FILE_TYPE_SPEC = {
+    0: "F32", 1: "F16", 2: "Q4_0", 3: "Q4_1", 7: "Q8_0", 8: "Q5_0", 9: "Q5_1",
+    10: "Q2_K", 11: "Q3_K_S", 12: "Q3_K_M", 13: "Q3_K_L", 14: "Q4_K_S", 15: "Q4_K_M",
+    16: "Q5_K_S", 17: "Q5_K_M", 18: "Q6_K", 19: "IQ2_XXS", 20: "IQ2_XS", 21: "Q2_K_S",
+    22: "IQ3_XS", 23: "IQ3_XXS", 24: "IQ1_S", 25: "IQ4_NL", 26: "IQ3_S", 27: "IQ3_M",
+    28: "IQ2_S", 29: "IQ2_M", 30: "IQ4_XS", 31: "IQ1_M", 32: "BF16", 36: "TQ1_0",
+    37: "TQ2_0", 38: "MXFP4_MOE", 39: "NVFP4", 40: "Q1_0",
+}
+
+
+def test_file_type_table_matches_pinned_spec():
+    assert panel._file_type == FILE_TYPE_SPEC, (
+        "mismatch: " + ", ".join(
+            f"id {i}: panel={panel._file_type.get(i)!r} spec={v!r}"
+            for i, v in sorted(FILE_TYPE_SPEC.items()) if panel._file_type.get(i) != v)
+        + " | extra: " + repr({i: v for i, v in panel._file_type.items()
+                               if i not in FILE_TYPE_SPEC}))
+
+
+def test_file_type_table_has_no_duplicate_labels():
+    """The pre-fix table listed IQ4_XS twice (ids 26 and 30), which is how the off-by-one
+    cascade past 26 went unnoticed: a duplicated label looks like a valid row."""
+    labels = list(panel._file_type.values())
+    dupes = {x for x in labels if labels.count(x) > 1}
+    assert not dupes, f"duplicate quant labels: {sorted(dupes)}"
+    assert "?" not in labels and "" not in labels
+
+
+def test_file_type_table_covers_every_assigned_id():
+    missing = sorted(set(FILE_TYPE_SPEC) - set(panel._file_type))
+    assert not missing, f"ids with no label would render '?' in the library: {missing}"
+    # the ids the old table got wrong, pinned individually so a regression names itself
+    for i, want in ((26, "IQ3_S"), (27, "IQ3_M"), (28, "IQ2_S"), (29, "IQ2_M"),
+                    (31, "IQ1_M"), (32, "BF16"), (38, "MXFP4_MOE"), (39, "NVFP4")):
+        assert panel._file_type.get(i) == want, f"id {i}: {panel._file_type.get(i)} != {want}"
+
+
+def test_file_type_label_reaches_a_model_with_no_filename_token():
+    """The table is only consulted when the filename carries no quant token, which is the
+    path that was showing '?' for NVFP4 and a wrong label for BF16."""
+    nv = MODELS_DIR / "plain-weights-nvfp4-a.gguf"     # no quant token in the stem
+    gguf(nv, arch="llama", file_type=39)
+    bf = MODELS_DIR / "plain-weights-bf16-b.gguf"
+    gguf(bf, arch="llama", file_type=32)
+    try:
+        models = {m["name"]: m for m in panel.scan_models()["models"]}
+        assert models[nv.stem]["quant"] == "NVFP4", models[nv.stem]["quant"]
+        assert models[bf.stem]["quant"] == "BF16", models[bf.stem]["quant"]
+        # a filename token still wins over the table, unchanged by this fix. The quant
+        # regexes are case-sensitive uppercase, so this needs the conventional spelling.
+        tok = MODELS_DIR / "token-wins-Q4_K_M.gguf"
+        gguf(tok, arch="llama", file_type=39)
+        assert next(m for m in panel.scan_models()["models"]
+                    if m["name"] == tok.stem)["quant"] == "Q4_K_M"
+    finally:
+        panel._model_cache.clear()
+
+
+def test_file_type_table_matches_gguf_constants_when_importable():
+    """Optional cross-check so the pinned fixture itself cannot silently drift from spec."""
+    try:
+        from gguf.constants import LlamaFileType
+    except ImportError:
+        return          # gguf is not a panel dependency; the fixture test above still ran
+    import re as _re
+    spec = {}
+    for m in LlamaFileType:
+        if m.value == 1024:            # GUESSED sentinel, not a quant label
+            continue
+        spec[m.value] = _re.sub(r"^(MOSTLY_|ALL_)", "", m.name)
+    assert panel._file_type == spec, (
+        f"panel table disagrees with gguf-py {spec!r}: "
+        + repr({i: (panel._file_type.get(i), spec[i]) for i in set(spec) | set(panel._file_type)
+                if panel._file_type.get(i) != spec.get(i)}))
 
 
 # ---------------------------------------------------------------- VRAM fit

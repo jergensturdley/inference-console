@@ -202,7 +202,15 @@ def human_size(n):
             return f"{n:.1f} {u}" if u != "B" else f"{int(n)} B"
         n /= 1024
 
-_file_type = {0:"F32",1:"F16",2:"Q4_0",3:"Q4_1",7:"Q8_0",8:"Q5_0",9:"Q5_1",10:"Q2_K",11:"Q3_K_S",12:"Q3_K_M",13:"Q3_K_L",14:"Q4_K_S",15:"Q4_K_M",16:"Q5_K_S",17:"Q5_K_M",18:"Q6_K",19:"IQ2_XXS",20:"IQ2_XS",21:"Q2_K_S",22:"IQ3_XS",23:"IQ3_XXS",24:"IQ1_S",25:"IQ4_NL",26:"IQ4_XS",27:"Q3_K_XS",28:"IQ3_S",29:"IQ2_S",30:"IQ4_XS",32:"IQ1_M",36:"TQ1_0",37:"TQ2_0",38:"BF16"}
+# general.file_type -> quant label. Values are the gguf LlamaFileType names with the
+# MOSTLY_/ALL_ prefixes stripped; ids 4-6 and 33-35 are unassigned upstream, and 1024
+# (GUESSED) is a sentinel rather than a quant, so it stays absent and renders "?".
+# Kept as a literal rather than imported from gguf.constants: gguf pulls in numpy,
+# requests and tqdm and is not a declared dependency, so an import-with-fallback would
+# silently serve this table on any venv that lacks it. tests/test_panel_metrics.py
+# asserts this table against a pinned spec fixture, and against gguf.constants when it
+# happens to be importable, so drift fails loudly instead of quietly.
+_file_type = {0:"F32",1:"F16",2:"Q4_0",3:"Q4_1",7:"Q8_0",8:"Q5_0",9:"Q5_1",10:"Q2_K",11:"Q3_K_S",12:"Q3_K_M",13:"Q3_K_L",14:"Q4_K_S",15:"Q4_K_M",16:"Q5_K_S",17:"Q5_K_M",18:"Q6_K",19:"IQ2_XXS",20:"IQ2_XS",21:"Q2_K_S",22:"IQ3_XS",23:"IQ3_XXS",24:"IQ1_S",25:"IQ4_NL",26:"IQ3_S",27:"IQ3_M",28:"IQ2_S",29:"IQ2_M",30:"IQ4_XS",31:"IQ1_M",32:"BF16",36:"TQ1_0",37:"TQ2_0",38:"MXFP4_MOE",39:"NVFP4",40:"Q1_0"}
 
 _model_cache = {}
 
