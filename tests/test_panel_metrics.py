@@ -525,6 +525,125 @@ def test_vitals_memoized_across_calls():
         panel._vitals_cache["data"] = None
 
 
+class _FakeProc(type(Path())):
+    """Path subclass mapping a few absolute paths onto in-memory content, so the
+    Linux-only /proc branches in panel.py can be exercised on macOS. Anything not mapped
+    delegates to the real filesystem."""
+    files = {}      # str path -> bytes
+    dirs = set()    # str path -> treated as an existing directory
+    children = {}   # str dir path -> [child paths]
+
+    def read_text(self, *a, **k):
+        p = str(self)
+        if p in _FakeProc.files:
+            data = _FakeProc.files[p]
+            return data.decode() if isinstance(data, bytes) else data
+        return super().read_text(*a, **k)
+
+    def read_bytes(self):
+        p = str(self)
+        return _FakeProc.files[p] if p in _FakeProc.files else super().read_bytes()
+
+    def exists(self):
+        return str(self) in _FakeProc.files or str(self) in _FakeProc.dirs or super().exists()
+
+    def is_dir(self):
+        return str(self) in _FakeProc.dirs
+
+    def iterdir(self):
+        p = str(self)
+        if p in _FakeProc.children:
+            return iter(_FakeProc(c) for c in _FakeProc.children[p])
+        return super().iterdir()
+
+
+_MEMINFO = b"MemTotal:       32768000 kB\nMemAvailable:   16384000 kB\n"
+
+
+def _stat(user, idle):
+    # cpu  user nice system idle iowait irq softirq
+    return f"cpu  {user} 200 300 {idle} 100 10 20\n".encode()
+
+
+def test_vitals_first_cpu_sample_reports_a_value_instead_of_omitting_the_key():
+    """Before the fix the first sample after start had no /proc/stat delta window, so the
+    cpu key was absent and the CPU card did not render on the first poll."""
+    real_path, real_prev = panel.Path, panel._prev_cpu
+    _FakeProc.files = {"/proc/meminfo": _MEMINFO, "/proc/stat": _stat(1000, 5000)}
+    panel.Path = _FakeProc
+    panel._prev_cpu = None
+    try:
+        v = panel._vitals_now()
+        assert "cpu" in v, "first sample must still emit a cpu entry"
+        assert v["cpu"]["percent"] == 0, v["cpu"]
+        assert v["cpu"]["cores"] > 0
+        # 32768000 kB / 1048576 = 31.25 -> 31.2 (banker's rounding); proves the /proc
+        # branch ran rather than the macOS fallback (which reports 8.0 / 16.0)
+        assert v["mem"] == {"used_gb": 15.6, "total_gb": 31.2}, v["mem"]
+    finally:
+        panel.Path, panel._prev_cpu = real_path, real_prev
+        _FakeProc.files = {}
+
+
+def test_vitals_second_cpu_sample_reports_the_real_delta():
+    """The first sample must seed _prev_cpu so the next one reports real load, not 0."""
+    real_path, real_prev = panel.Path, panel._prev_cpu
+    _FakeProc.files = {"/proc/meminfo": _MEMINFO, "/proc/stat": _stat(1000, 5000)}
+    panel.Path = _FakeProc
+    panel._prev_cpu = None
+    try:
+        assert panel._vitals_now()["cpu"]["percent"] == 0
+        # user +500, idle +100 => 500/600 of the sampled time
+        _FakeProc.files["/proc/stat"] = _stat(1500, 5100)
+        second = panel._vitals_now()
+        assert second["cpu"]["percent"] == 83, second["cpu"]
+    finally:
+        panel.Path, panel._prev_cpu = real_path, real_prev
+        _FakeProc.files = {}
+
+
+def test_kill_orphans_survives_foreign_owned_pids():
+    """A foreign-owned avalon pid raises EPERM, not ESRCH. Before the fix that propagated
+    through stop() to the UI as a 500."""
+    real_path = panel.Path
+    real_kill = os.kill
+    real_free = panel.AvalonManager.__dict__["_port_free"]
+    pids = [424241, 424242]
+    _FakeProc.dirs = {"/proc"}
+    _FakeProc.children = {"/proc": [f"/proc/{p}" for p in pids]}
+    _FakeProc.files = {f"/proc/{p}/cmdline": b"/home/u/avalon/build/bin/llama-server\0-m\0x.gguf\0"
+                       for p in pids}
+    panel.Path = _FakeProc
+    os.kill = lambda pid, sig: (_ for _ in ()).throw(PermissionError())
+    panel.AvalonManager._port_free = staticmethod(lambda: True)
+    try:
+        assert panel.AvalonManager._kill_orphans() is True, "foreign victims were discovered"
+    finally:
+        panel.Path, os.kill = real_path, real_kill
+        panel.AvalonManager._port_free = real_free
+        _FakeProc.dirs = _FakeProc.children = _FakeProc.files = {}
+
+
+def test_stop_reports_honest_failure_when_a_foreign_orphan_keeps_the_port():
+    """Swallowing EPERM must not become a fake success: the port check still decides."""
+    real_free = panel.AvalonManager.__dict__["_port_free"]
+    real_orphans = panel.AvalonManager.__dict__["_kill_orphans"]
+    real_info = panel.SMGR.info
+    panel.AvalonManager._port_free = staticmethod(lambda: False)
+    panel.AvalonManager._kill_orphans = staticmethod(lambda: True)
+    panel.SMGR.info = {}
+    n_log = len(panel.SMGR.logbuf)
+    try:
+        assert panel.SMGR.stop() == {"stopped": False}
+        assert "still busy" in list(panel.SMGR.logbuf)[-1], list(panel.SMGR.logbuf)[-1]
+    finally:
+        panel.AvalonManager._port_free = real_free
+        panel.AvalonManager._kill_orphans = real_orphans
+        panel.SMGR.info = real_info
+        while len(panel.SMGR.logbuf) > n_log:
+            panel.SMGR.logbuf.pop()
+
+
 def test_sudo_rejects_empty_password():
     assert panel._sudo_ok("") is False
 
