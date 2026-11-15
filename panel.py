@@ -1212,7 +1212,7 @@ class AvalonManager:
                 victims.append(int(d.name))
         for v in victims:
             try: os.kill(v, signal.SIGTERM)
-            except ProcessLookupError: pass
+            except (ProcessLookupError, PermissionError): pass
         for _ in range(50):
             if AvalonManager._port_free():
                 break
@@ -1220,7 +1220,7 @@ class AvalonManager:
         for v in victims:
             if _pid_alive(v):
                 try: os.kill(v, signal.SIGKILL)
-                except ProcessLookupError: pass
+                except (ProcessLookupError, PermissionError): pass
         for _ in range(30):
             if AvalonManager._port_free():
                 break
@@ -1390,6 +1390,9 @@ def _vitals_now():
             d = [c - p for c, p in zip(cur, _prev_cpu)]
             tot = sum(d)
             v["cpu"] = {"percent": round(100 * d[0] / tot) if tot else 0, "cores": os.cpu_count()}
+        else:
+            # first sample after start: no delta window yet — report honest idle
+            v["cpu"] = {"percent": 0, "cores": os.cpu_count()}
         _prev_cpu = cur
     else:
         try:
