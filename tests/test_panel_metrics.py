@@ -1277,6 +1277,104 @@ def test_strata_key_endpoint_masks_by_default():
         stub.unlink(missing_ok=True)
 
 
+# ---------------------------------------------------------------- engine setup
+_ASSETS = [
+    {"name": "llama-b9999-bin-macos-arm64.tar.gz", "browser_download_url": "u1"},
+    {"name": "llama-b9999-bin-macos-x64.tar.gz", "browser_download_url": "u2"},
+    {"name": "llama-b9999-bin-ubuntu-x64.tar.gz", "browser_download_url": "u3"},
+    {"name": "llama-b9999-bin-ubuntu-vulkan-x64.tar.gz", "browser_download_url": "u4"},
+    {"name": "llama-b9999-bin-ubuntu-cuda-12.8-x64.tar.gz", "browser_download_url": "u5"},
+    {"name": "llama-b9999-bin-win-cpu-x64.zip", "browser_download_url": "u6"},
+    {"name": "llama-b9999-bin-win-vulkan-x64.zip", "browser_download_url": "u7"},
+    {"name": "cudart-llama-b9999-bin-win-cuda-12.4-x64.zip", "browser_download_url": "u8"},
+    {"name": "llama-b9999-ui.tar.gz", "browser_download_url": "u9"},
+]
+
+
+def test_llama_asset_picker_matches_platform_and_variant():
+    def pick(*a, **kw):
+        got = panel._pick_llama_asset(*a, **kw)
+        assert got is not None, a
+        return got
+    a = pick(_ASSETS, "darwin", "arm64")
+    assert a["name"].endswith("bin-macos-arm64.tar.gz")
+    a = pick(_ASSETS, "darwin", "x86_64")
+    assert a["name"].endswith("bin-macos-x64.tar.gz")
+    a = pick(_ASSETS, "linux", "x86_64")
+    assert a["name"].endswith("bin-ubuntu-vulkan-x64.tar.gz")
+    a = pick(_ASSETS, "linux", "x86_64", variant="cpu")
+    assert a["name"].endswith("bin-ubuntu-x64.tar.gz")
+    a = pick(_ASSETS, "linux", "x86_64", variant="cuda")
+    assert "cuda" in a["name"] and a["name"].startswith("llama-")   # never the cudart pack
+    a = pick(_ASSETS, "win32", "AMD64")
+    assert a["name"].endswith("bin-win-vulkan-x64.zip")
+    assert panel._pick_llama_asset(_ASSETS, "plan9", "mips") is None
+    assert panel._pick_llama_asset([], "darwin", "arm64") is None
+
+
+def test_setup_install_requires_confirmation():
+    try:
+        panel.api_setup_install(panel.SetupInstallBody(engine="llama", confirm=False))
+        assert False, "install without confirm must be refused"
+    except panel.HTTPException as e:
+        assert e.status_code == 400
+    try:
+        panel.api_setup_install(panel.SetupInstallBody(engine="bogus", confirm=True))
+        assert False
+    except panel.HTTPException as e:
+        assert e.status_code == 400
+
+
+def test_setup_job_is_single_flight():
+    ov = dict(panel.SETUP_JOB)
+    try:
+        panel.SETUP_JOB.update(name="other", state="running")
+        try:
+            panel._setup_start("mine", lambda: None)
+            assert False, "second concurrent job must be refused"
+        except panel.HTTPException as e:
+            assert e.status_code == 409
+    finally:
+        panel.SETUP_JOB.clear()
+        panel.SETUP_JOB.update(ov)
+
+
+def test_setup_job_records_failure_state():
+    ov = dict(panel.SETUP_JOB)
+    try:
+        panel.SETUP_JOB.update(name=None, state="idle")
+        panel.SETUP_JOB["log"].clear()
+        def boom():
+            raise panel.HTTPException(502, "installer exited 1")
+        panel._setup_job_wrap(boom)
+        assert panel.SETUP_JOB["state"] == "failed"
+        assert "installer exited 1" in list(panel.SETUP_JOB["log"])[-1]
+    finally:
+        panel.SETUP_JOB.clear()
+        panel.SETUP_JOB.update(ov)
+
+
+def test_setup_status_shape_without_binaries():
+    ov_bin, ov_sbin = panel.CFG.get("server_binary"), panel.CFG.get("strata_bin")
+    ov_env = os.environ.get("STRATA_BIN")
+    try:
+        missing = str(Path(HOME_TMP) / "no-llama-server")
+        panel.CFG["server_binary"] = missing
+        panel.CFG["strata_bin"] = missing
+        os.environ["STRATA_BIN"] = missing
+        st = panel.api_setup_status()
+        assert st["llama"]["installed"] is False
+        assert st["strata"]["installed"] is False
+        assert "avalon" in st and "job" in st
+    finally:
+        panel.CFG["server_binary"] = ov_bin
+        panel.CFG["strata_bin"] = ov_sbin
+        if ov_env is None:
+            os.environ.pop("STRATA_BIN", None)
+        else:
+            os.environ["STRATA_BIN"] = ov_env
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and isinstance(f, types.FunctionType)]
