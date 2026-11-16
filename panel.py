@@ -34,6 +34,14 @@ DEFAULT_CONFIG = {
     "hf_token": "",              # falls back to $HF_TOKEN
     "vram_reserve_mb": 512,      # headroom kept free by the fit estimator / optimizer
     "avalon_tune": {},           # overrides for the Avalon launch line (see AVALON_TUNE_DEFAULTS)
+    # Strata (github.com/Niko1221/Strata). strata_bin empty means "find it on PATH".
+    # strata_api_key is only used if you set it deliberately; Strata owns its own key.
+    "strata_bin": "",
+    "strata_port": 0,            # 0 = take the address the launch reported
+    "strata_alias": "",          # model name to advertise to coding agents
+    "strata_ctx": 8192,
+    "strata_api_key": "",
+    "strata_last": {},           # address/model reported by the last successful launch
 }
 
 # ---------------------------------------------------------------- config
@@ -107,9 +115,18 @@ def bin_caps(binary: str) -> dict:
         "mlock": "--mlock" in help_txt,
         "no_mmap": "--no-mmap" in help_txt,
         "parallel": "--parallel" in help_txt,
+        "draft": ("--model-draft" in help_txt) or ("--spec-type" in help_txt),
+        "draft_max": "--draft-max" in help_txt,
+        "ot": "--override-tensor" in help_txt,
+        "tensor_split": "--tensor-split" in help_txt,
+        "tbatch": "--threads-batch" in help_txt,
+        "keep": bool(re.search(r"--keep\s", help_txt)),
+        "jinja": "--jinja" in help_txt,
     }
     if not help_txt:   # unknown build: assume a modern llama.cpp
-        caps.update(fa_value=True, ncmoe=True, metrics=True, ctk=True, mlock=True, no_mmap=True, parallel=True)
+        caps.update(fa_value=True, ncmoe=True, metrics=True, ctk=True, mlock=True, no_mmap=True,
+                    parallel=True, draft=True, draft_max=True, ot=True, tensor_split=True,
+                    tbatch=True, keep=True, jinja=True)
     _caps_cache.clear()
     _caps_cache[key] = caps
     return caps
@@ -195,6 +212,26 @@ def find_mmproj(model_path: str):
         if best is None or cand[:2] > best[:2]:
             best = cand
     return str(best[2]) if best and best[0] > 0 else None
+
+def find_draft(model_path: str):
+    """Locate a speculative-decoding draft beside the weights: an MTP shared-expert file
+    (`mtp-…`) or a classic draft GGUF (`…-draft…`). Prefers the token-overlap closest match,
+    skips mmproj files and the model itself."""
+    p = Path(model_path)
+    want = _tokens(p.stem)
+    best = None
+    for sib in p.parent.glob("*.gguf"):
+        if sib == p:
+            continue
+        sl = sib.stem.lower()
+        if "mmproj" in sl or not ("mtp" in sl or "draft" in sl):
+            continue
+        toks = _tokens(sl.replace("mtp", "").replace("draft", ""))
+        overlap = len(want & toks) / max(1, len(want | toks))
+        cand = (round(overlap, 3), sib)
+        if best is None or cand[0] > best[0]:
+            best = cand
+    return str(best[1]) if best else None
 
 def human_size(n):
     for u in ("B", "KB", "MB", "GB", "TB"):
@@ -499,10 +536,18 @@ def recommend_model_config(model_meta: dict, target: str = "balanced") -> dict:
             fit = estimate_vram(model_meta, ctx=ctx, ngl=ngl, ctk=ctk, ctv=ctv, parallel=parallel, preset=preset, vit=vit, srv_running=srv_running)
 
     notes.append("Flash Attention enabled (-fa on) for faster prefill and reduced KV overhead.")
+    draft = ""
+    if target == "speed" and model_meta.get("path"):
+        d = find_draft(model_meta["path"])
+        if d:
+            draft = d
+            notes.append("Draft/MTP file found beside the weights — speculative decoding "
+                         "enabled (--model-draft --draft-max 16).")
     return {
         "preset": preset, "ctx": ctx, "ngl": ngl, "threads": phys_threads,
         "fa": "on", "ctk": ctk, "ctv": ctv, "parallel": parallel,
         "batch": 2048, "ubatch": 512, "ncmoe": ncmoe, "extra_args": "",
+        "draft": draft, "draft_max": 16, "jinja": "on",
         "fit": fit, "notes": notes,
     }
 
@@ -837,6 +882,9 @@ class ServerManager:
                    fa: str = "auto", ctk: str = "", ctv: str = "", parallel: int | None = None,
                    batch: int | None = None, ubatch: int | None = None,
                    ncmoe: int | None = None, mlock: bool = False, no_mmap: bool = False,
+                   draft: str = "", draft_max: int = 16, draft_min: int = 0,
+                   ot: str = "", tensor_split: str = "", tbatch: int | None = None,
+                   keep: int | None = None, jinja: str = "on",
                    port: int | None = None):
         mp = Path(model)
         meta = next((m for m in scan_models()["models"] if m["path"] == model), None)
@@ -873,12 +921,19 @@ class ServerManager:
         binary = CFG.get("server_binary", BIN)
         caps = bin_caps(binary)
 
-        args = [binary, "-m", model, "--host", "127.0.0.1", "--jinja",
+        args = [binary, "-m", model, "--host", "127.0.0.1",
                 "-c", str(eff_ctx), "--alias", mp.stem,
                 "-ngl", str(eff_ngl), "-t", str(eff_t)]
+        if jinja in ("on", "auto") and caps.get("jinja"):
+            args += ["--jinja"]
         if pd.get("dev"):
             args += ["--device", pd["dev"]]
-        if pd.get("ot") and not (ncmoe and ncmoe > 0):
+        # -ot: an explicit override wins over the preset default; the preset's own expert
+        # split stays in play only when the user left the field blank and isn't using ncmoe.
+        ot_val = [t for t in re.split(r"\s+", (ot or "").strip()) if t]
+        if ot_val and caps.get("ot"):
+            args += ["-ot"] + ot_val
+        elif pd.get("ot") and not (ncmoe and ncmoe > 0) and caps.get("ot"):
             args += ["-ot", pd["ot"]]
         if ncmoe and int(ncmoe) > 0 and caps.get("ncmoe"):
             args += ["--n-cpu-moe", str(int(ncmoe))]
@@ -897,12 +952,33 @@ class ServerManager:
             args += ["-b", str(int(batch))]
         if ubatch and int(ubatch) > 0:
             args += ["-ub", str(int(ubatch))]
+        # llama.cpp takes these as repeatable/positional argv values, so "0 1" or "0,1"
+        # must be split into separate args rather than passed as one string.
+        ts_vals = [t for t in re.split(r"[,\s]+", tensor_split.strip()) if t] if tensor_split else []
+        if ts_vals and caps.get("tensor_split"):
+            args += ["--tensor-split"] + ts_vals
+        if tbatch and int(tbatch) > 0 and caps.get("tbatch"):
+            args += ["--threads-batch", str(int(tbatch))]
+        if keep and int(keep) > 0 and caps.get("keep"):
+            args += ["--keep", str(int(keep))]
         if mlock and caps.get("mlock"):
             args += ["--mlock"]
         if no_mmap and caps.get("no_mmap"):
             args += ["--no-mmap"]
         if caps.get("metrics"):
             args += ["--metrics"]
+        # Speculative decoding: an MTP shared-expert or classic draft file beside the weights.
+        # Only emitted when the binary actually advertises a draft flag (--model-draft or the
+        # newer --spec-type), so an old build never gets a flag it rejects.
+        if draft and draft.strip():
+            dp = Path(draft.strip()).expanduser()
+            if not dp.exists():
+                raise HTTPException(400, f"draft model not found: {dp}")
+            if caps.get("draft"):
+                args += ["--model-draft", str(dp)]
+                if caps.get("draft_max"):
+                    args += ["--draft-max", str(max(1, int(draft_max))),
+                             "--draft-min", str(max(0, int(draft_min)))]
         mm = find_mmproj(model)
         if preset in ("vision", "igpu-vision") and not mm:
             raise HTTPException(400, "vision preset needs an mmproj file next to the model")
@@ -916,7 +992,8 @@ class ServerManager:
 
     def start(self, model, preset="auto", extra_args="", ctx=None, ngl=None, threads=None,
               fa="auto", ctk="", ctv="", parallel=None, batch=None, ubatch=None,
-              ncmoe=None, mlock=False, no_mmap=False, save_profile=True):
+              ncmoe=None, mlock=False, no_mmap=False, draft="", draft_max=16, draft_min=0,
+              ot="", tensor_split="", tbatch=None, keep=None, jinja="on", save_profile=True):
         if self.status()["running"]:
             self.stop()
         mp = Path(model)
@@ -932,7 +1009,9 @@ class ServerManager:
         args, resolved_preset, eff_ctx = self.build_args(
             model, preset=preset, extra_args=extra_args, ctx=ctx, ngl=ngl, threads=threads,
             fa=fa, ctk=ctk, ctv=ctv, parallel=parallel, batch=batch, ubatch=ubatch,
-            ncmoe=ncmoe, mlock=mlock, no_mmap=no_mmap, port=port,
+            ncmoe=ncmoe, mlock=mlock, no_mmap=no_mmap, draft=draft, draft_max=draft_max,
+            draft_min=draft_min, ot=ot, tensor_split=tensor_split, tbatch=tbatch, keep=keep,
+            jinja=jinja, port=port,
         )
         if save_profile:
             profs = _read_json(LAUNCH_PROFILES_PATH, {})
@@ -941,6 +1020,9 @@ class ServerManager:
                 "fa": fa, "ctk": ctk, "ctv": ctv, "parallel": parallel,
                 "batch": batch, "ubatch": ubatch, "ncmoe": ncmoe,
                 "mlock": mlock, "no_mmap": no_mmap, "extra_args": extra_args,
+                "draft": draft, "draft_max": draft_max, "draft_min": draft_min,
+                "ot": ot, "tensor_split": tensor_split, "tbatch": tbatch, "keep": keep,
+                "jinja": jinja,
                 "updated_at": time.time(),
             }
             _write_json(LAUNCH_PROFILES_PATH, profs)
@@ -2041,6 +2123,14 @@ class FitQueryBody(BaseModel):
     ncmoe: int = 0
     mlock: bool = False
     no_mmap: bool = False
+    draft: str = ""
+    draft_max: int = 16
+    draft_min: int = 0
+    ot: str = ""
+    tensor_split: str = ""
+    tbatch: int | None = None
+    keep: int | None = None
+    jinja: str = "on"
     extra_args: str = ""
 
 @app.post("/api/models/fit")
@@ -2058,7 +2148,9 @@ def api_model_fit(b: FitQueryBody):
             ngl=b.ngl, threads=b.threads, fa=b.fa, ctk=b.ctk, ctv=b.ctv,
             parallel=b.parallel, batch=b.batch, ubatch=b.ubatch,
             ncmoe=b.ncmoe, mlock=b.mlock, no_mmap=b.no_mmap,
-            port=int(CFG.get("port_base", 8830) or 8830),
+            draft=b.draft, draft_max=b.draft_max, draft_min=b.draft_min,
+            ot=b.ot, tensor_split=b.tensor_split, tbatch=b.tbatch, keep=b.keep,
+            jinja=b.jinja, port=int(CFG.get("port_base", 8830) or 8830),
         )
         cmd = " ".join(args)
     except HTTPException as e:
@@ -2083,7 +2175,8 @@ def api_model_optimize(b: OptimizeBody):
             ctx=rec["ctx"], ngl=rec["ngl"], threads=rec["threads"],
             fa=rec["fa"], ctk=rec["ctk"], ctv=rec["ctv"],
             parallel=rec["parallel"], batch=rec["batch"], ubatch=rec["ubatch"],
-            ncmoe=rec["ncmoe"], port=int(CFG.get("port_base", 8830) or 8830),
+            ncmoe=rec["ncmoe"], draft=rec.get("draft", ""), draft_max=rec.get("draft_max", 16),
+            jinja=rec.get("jinja", "on"), port=int(CFG.get("port_base", 8830) or 8830),
         )
         rec["cmd"] = " ".join(args)
     except Exception:
@@ -2416,6 +2509,386 @@ def _proc_ctx(pid):
         pass
     return 8192
 
+# ==================== STRATA (Niko1221/Strata) ====================
+# Strata is a separate inference engine (github.com/Niko1221/Strata) serving the same
+# Qwen3.8-Flash-Next family as the Avalon tab, but unlike Avalon it is a product: it ships
+# its own desktop app, terminal monitor, model downloader, preset store and key management.
+# So the panel drives it through its documented CLI (`strata launch --output json`,
+# `--status`, `--stop`, `--list-presets`, `--plan`) and never parses Strata internals such
+# as launch/<name>.json or the strata_control.management bridge — that bridge documents
+# itself as an unaudited preview still under integration work, and its plan/execute
+# preconditions belong to Strata's own Desktop host.
+#
+# Strata is not installed on this deployment yet. Every path therefore degrades to an
+# explicit "not installed" state carrying the install command, and anything the docs do not
+# define is returned as raw CLI output rather than mapped through invented field names.
+
+STRATA_INSTALL_CMD = ("curl -fsSL --connect-timeout 15 --max-time 120 "
+                      "https://github.com/Niko1221/Strata/releases/latest/download/install.sh "
+                      "-o install.sh && sh install.sh")
+
+STRATA_LOG = deque(maxlen=200)
+
+_STRATA_TTL = 5.0
+_strata_cache = {"ts": 0.0, "data": None}
+
+def strata_log(line: str):
+    STRATA_LOG.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
+
+def strata_bin() -> str | None:
+    """Resolve the strata launcher. A broken symlink (an uninstalled app whose helper link
+    survives) reads as absent, which is the correct answer here."""
+    for cand in (CFG.get("strata_bin"), os.environ.get("STRATA_BIN"), shutil.which("strata"),
+                 HOME / ".local/bin/strata", HOME / ".strata/bin/strata",
+                 "/usr/local/bin/strata", "/opt/strata/bin/strata"):
+        if cand and Path(str(cand)).exists():
+            return str(cand)
+    return None
+
+def _strata_run(args: list[str], timeout: int = 25) -> dict:
+    """Run the Strata CLI. Never raises. `json` is set only when stdout really was JSON, so
+    a caller can tell a parsed result from a text one instead of assuming."""
+    b = strata_bin()
+    if not b:
+        return {"ok": False, "rc": None, "installed": False, "json": None,
+                "stdout": "", "stderr": "", "error": "strata CLI not found",
+                "install_cmd": STRATA_INSTALL_CMD}
+    try:
+        p = subprocess.run([b] + args, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
+                "stderr": "", "error": f"strata timed out after {timeout}s"}
+    except OSError as e:
+        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
+                "stderr": "", "error": f"could not run strata: {e}"}
+    out = (p.stdout or "").strip()
+    err = (p.stderr or "").strip()
+    try:
+        parsed = json.loads(out)
+    except Exception:
+        parsed = None
+    return {"ok": p.returncode == 0, "rc": p.returncode, "installed": True,
+            "json": parsed if isinstance(parsed, (dict, list)) else None,
+            "stdout": out[:6000], "stderr": err[:2000], "error": None}
+
+class StrataLaunchBody(BaseModel):
+    preset: str | None = None
+    family: str | None = None
+    model: str | None = None
+    model_path: str | None = None
+    context: str | None = None          # Strata takes these as words, e.g. "128k"
+    kv: str | None = None               # int8 | q4_0 | k8v4 | fp16
+    parallel: int | None = None
+    vision: str | None = None           # on | off | gpu | cpu
+    mtp: str | None = None              # on | off (draft layer)
+    drafting: str | None = None         # auto | mtp | dflash2 | off
+    gpu: str | None = None              # e.g. "0,1"
+    tune: str | None = None             # quick | thorough | skip
+    retune: bool = False
+    access: str | None = None           # local | lan | cloudflare | tailscale
+    port: int | None = None
+    no_api_key: bool = False
+    new_key: bool = False
+    save_preset: str | None = None
+    restart: bool = False
+    set_: list[str] | None = None       # --set key=value pairs
+    plan: bool = False
+
+def strata_build_args(b: "StrataLaunchBody", plan: bool) -> list[str]:
+    """Translate the form into `strata launch` flags. Only documented flags are emitted, and
+    an unset field emits nothing so Strata's own defaults and presets stay in charge."""
+    args = ["launch"]
+    if b.preset:
+        args += ["--preset", b.preset]
+    if b.family:
+        args += ["--family", b.family]
+    if b.model:
+        args += ["--model", b.model]
+    if b.model_path:
+        args += ["--model-path", b.model_path]
+    if b.context:
+        args += ["--context", b.context]
+    if b.kv:
+        args += ["--kv", b.kv]
+    if b.parallel:
+        args += ["--parallel", str(b.parallel)]
+    if b.vision:
+        args += ["--vision", b.vision]
+    if b.mtp:
+        args += ["--mtp", b.mtp]
+    if b.drafting:
+        args += ["--drafting", b.drafting]
+    if b.gpu:
+        args += ["--gpu", b.gpu]
+    if b.tune:
+        args += ["--tune", b.tune]
+    if b.retune:
+        args += ["--retune"]
+    if b.access:
+        args += ["--access", b.access]
+    if b.port:
+        args += ["--port", str(b.port)]
+    if b.no_api_key:
+        args += ["--no-api-key"]
+    if b.new_key:
+        args += ["--new-key"]
+    if b.save_preset:
+        args += ["--save-preset", b.save_preset]
+    for kv in (b.set_ or []):
+        if kv and "=" in kv:
+            args += ["--set", kv]
+    if b.restart:
+        args += ["--restart"]
+    if plan:
+        args += ["--plan", "--output", "json"]
+    else:
+        args += ["--yes", "--no-tui", "--output", "json"]
+    return args
+
+def _strata_remember(addr: dict):
+    """Persist the address a launch reported, so liveness and agent sync can find the
+    server after a panel restart. The key is never stored in the clear here."""
+    st = dict(CFG.get("strata_last") or {})
+    for k in ("address", "port", "model", "profile", "preset"):
+        if addr.get(k) not in (None, ""):
+            st[k] = addr[k]
+    if st:
+        CFG["strata_last"] = st
+        _save_config_secure()
+
+def _parse_ctx_words(v) -> int | None:
+    """'128k' / '8192' / '1m' -> token count, matching how Strata spells contexts."""
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)\s*([km]?)", str(v).strip().lower())
+    if not m:
+        return None
+    n = float(m.group(1)) * (1024 if m.group(2) == "k" else 1024 * 1024 if m.group(2) == "m" else 1)
+    return int(n)
+
+def _strata_port() -> int | None:
+    last = CFG.get("strata_last") or {}
+    for cand in (last.get("port"), CFG.get("strata_port")):
+        try:
+            n = int(cand)
+            if n > 0:
+                return n
+        except (TypeError, ValueError):
+            pass
+    return None
+
+def strata_health(port: int | None = None, timeout: float = 1.5) -> str:
+    """Liveness from the HTTP surface, which is documented (OpenAI-compatible), rather than
+    from a CLI status shape the docs do not define. /health first, then /v1/models."""
+    port = port or _strata_port()
+    if not port:
+        return "unknown"
+    for path in ("/health", "/v1/models"):
+        try:
+            r = httpx.get(f"http://127.0.0.1:{port}{path}", timeout=timeout)
+            if r.status_code in (200, 503):
+                return "ready" if r.status_code == 200 else "loading"
+        except Exception:
+            continue
+    return "down"
+
+def strata_status(refresh: bool = False) -> dict:
+    """Memoized: _current_llm() and _chat_target() run on the 2.5s header poll, and each
+    would otherwise fork `strata launch --status` — the same amplification that vitals() had.
+    Only the CLI result is cached; liveness is re-checked over HTTP every call, which is a
+    cheap loopback GET, so a server stopped outside the panel is still noticed at once."""
+    now = time.time()
+    cached = _strata_cache["data"]
+    if not refresh and cached is not None and now - _strata_cache["ts"] < _STRATA_TTL:
+        out = dict(cached)
+        out["health"] = strata_health(out.get("port"))
+        out["running"] = out["running"] and out["health"] in ("ready", "loading")
+        return out
+    st = _strata_status_now()
+    _strata_cache["ts"] = now
+    _strata_cache["data"] = st
+    return dict(st)
+
+def _strata_status_now() -> dict:
+    b = strata_bin()
+    if not b:
+        return {"installed": False, "running": False, "health": "unknown",
+                "install_cmd": STRATA_INSTALL_CMD,
+                "note": "Strata CLI not found. Install it, or set strata_bin in config."}
+    r = _strata_run(["launch", "--status", "--output", "json"], timeout=15)
+    port = _strata_port()
+    out = {"installed": True, "bin": _redact_cmd(b), "running": False,
+           "health": strata_health(port), "port": port,
+           "parsed": isinstance(r["json"], dict), "error": r["error"],
+           "raw": r["stdout"] or r["stderr"] or ""}
+    j = r["json"]
+    if isinstance(j, dict):
+        # Only lift keys we can name. Anything else stays in `raw` for the operator to read.
+        for k in ("model", "profile", "preset", "address", "version"):
+            if j.get(k) not in (None, ""):
+                out[k] = j[k]
+        p = j.get("port")
+        try:
+            if p and int(p) > 0:
+                out["port"] = int(p)
+                out["health"] = strata_health(out["port"])
+        except (TypeError, ValueError):
+            pass
+        serving = j.get("serving")
+        if isinstance(serving, bool):
+            out["running"] = serving
+        elif serving is None and out["health"] in ("ready", "loading"):
+            out["running"] = True
+    elif out["health"] in ("ready", "loading"):
+        out["running"] = True
+    return out
+
+def strata_presets() -> list:
+    r = _strata_run(["launch", "--list-presets", "--output", "json"], timeout=15)
+    j = r["json"]
+    if isinstance(j, list):
+        return [p if isinstance(p, dict) else {"name": str(p)} for p in j]
+    if isinstance(j, dict) and isinstance(j.get("presets"), list):
+        return [p if isinstance(p, dict) else {"name": str(p)} for p in j["presets"]]
+    # Text output: keep one name per non-empty line rather than guessing at columns.
+    lines = [ln.strip() for ln in (r["stdout"] or "").splitlines() if ln.strip()]
+    return [{"name": ln} for ln in lines]
+
+@app.get("/api/strata/status")
+def api_strata_status():
+    return strata_status()
+
+@app.get("/api/strata/presets")
+def api_strata_presets():
+    return {"presets": strata_presets()}
+
+class StrataPresetDeleteBody(BaseModel):
+    name: str
+
+@app.post("/api/strata/presets/delete")
+def api_strata_preset_delete(b: StrataPresetDeleteBody):
+    if not strata_bin():
+        raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    name = b.name.strip()
+    if not name:
+        raise HTTPException(400, "preset name required")
+    r = _strata_run(["launch", "--delete-preset", name, "--output", "json"], timeout=30)
+    if not r["ok"]:
+        raise HTTPException(502, _redact_cmd(r["error"] or r["stderr"] or r["stdout"] or "delete-preset failed"))
+    strata_log(f"deleted preset {name}")
+    return {"deleted": name, "presets": strata_presets()}
+
+@app.get("/api/strata/key")
+def api_strata_key(reveal: bool = False):
+    """`strata launch --show-key` for the running launch. Masked by default; reveal=1 returns
+    the raw key for the operator who is already authenticated against the panel."""
+    if not strata_bin():
+        raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    r = _strata_run(["launch", "--show-key"], timeout=15)
+    key = (r["stdout"] or "").strip().splitlines()[-1] if r["ok"] and r["stdout"] else ""
+    if not key:
+        return {"key_set": False, "masked": "", "note": _redact_cmd(r["error"] or r["stderr"] or "no key reported")}
+    masked = (key[:4] + "…" + key[-4:]) if len(key) >= 8 else "(short key)"
+    return {"key_set": True, "masked": masked, "key": key if reveal else ""}
+
+@app.get("/api/strata/doctor")
+def api_strata_doctor():
+    """`strata doctor --live`: Strata's own environment/GPU/health report, raw text."""
+    r = _strata_run(["doctor", "--live"], timeout=90)
+    return {"ok": r["ok"], "raw": r["stdout"] or r["stderr"] or "", "error": r["error"]}
+
+@app.get("/api/strata/update")
+def api_strata_update():
+    """`strata update --check`: report-only update check; applying it is the operator's call."""
+    r = _strata_run(["update", "--check", "--output", "json"], timeout=60)
+    return {"ok": r["ok"], "json": r["json"], "raw": r["stdout"] or r["stderr"] or "", "error": r["error"]}
+
+@app.post("/api/strata/launch")
+def api_strata_launch(b: StrataLaunchBody):
+    if not strata_bin():
+        raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    args = strata_build_args(b, plan=b.plan)
+    # A plan is read-only, so it is worth the long timeout; a real launch downloads and
+    # loads a model and must not be cut off mid-download by a short client-side wait.
+    r = _strata_run(args, timeout=60 if b.plan else 900)
+    cmd = _redact_cmd(" ".join(["strata"] + args))
+    if b.plan:
+        return {"plan": True, "cmd": cmd, "json": r["json"],
+                "raw": r["stdout"] or r["stderr"] or "", "ok": r["ok"], "error": r["error"]}
+    if not r["ok"]:
+        raise HTTPException(502, _redact_cmd(r["error"] or r["stderr"] or r["stdout"]
+                                             or "strata launch failed"))
+    j = r["json"] if isinstance(r["json"], dict) else {}
+    addr = {"address": j.get("address") or j.get("url"), "port": j.get("port"),
+            "model": j.get("model"), "preset": j.get("preset"), "profile": j.get("profile")}
+    if addr.get("address"):
+        m = re.search(r":(\d{2,5})\b", str(addr["address"]))
+        if m and not addr.get("port"):
+            addr["port"] = int(m.group(1))
+    _strata_remember(addr)
+    # Remember the context so agent sync advertises the real window, not the config default.
+    ctx_src = j.get("context") or b.context
+    n = _parse_ctx_words(ctx_src) if ctx_src else None
+    if n:
+        CFG["strata_ctx"] = n
+        _save_config_secure()
+    strata_log(f"launch: {cmd}")
+    for ln in (r["stdout"] or r["stderr"] or "").splitlines()[-12:]:
+        strata_log(ln)
+    return {"started": True, "cmd": cmd, "json": r["json"],
+            "raw": r["stdout"] or r["stderr"] or "", "state": strata_status(refresh=True)}
+
+@app.post("/api/strata/stop")
+def api_strata_stop():
+    if not strata_bin():
+        raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    r = _strata_run(["launch", "--stop", "--output", "json"], timeout=120)
+    if not r["ok"]:
+        raise HTTPException(502, _redact_cmd(r["error"] or r["stderr"] or "strata stop failed"))
+    strata_log("stop requested")
+    return {"stopped": True, "json": r["json"], "raw": r["stdout"] or r["stderr"] or "",
+            "state": strata_status(refresh=True)}
+
+@app.get("/api/strata/telemetry")
+def api_strata_telemetry():
+    """Strata's server exposes /metrics and its own Monitor reads it, but the counter names
+    are not llama.cpp's. Parse generically and report the names actually seen, so a mapping
+    can be written against real output instead of guessed llama:* names."""
+    port = _strata_port()
+    out = {"port": port, "ready": False, "metrics": {}, "metric_keys": []}
+    if not port:
+        out["note"] = "no Strata address recorded yet — launch one from this tab"
+        return out
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/metrics", timeout=1.5)
+        out["ready"] = r.status_code == 200
+        if not out["ready"]:
+            out["note"] = f"/metrics returned {r.status_code}"
+            return out
+        seen, vals = [], {}
+        for ln in r.text.splitlines():
+            if ln.startswith("#") or not ln.strip():
+                continue
+            parts = ln.split()
+            if len(parts) < 2:
+                continue
+            try:
+                vals[parts[0]] = float(parts[-1])
+            except ValueError:
+                continue
+            seen.append(parts[0])
+        out["metric_keys"] = sorted(set(seen))[:120]
+        out["metrics"] = {k: vals[k] for k in sorted(set(seen))[:120]}
+    except Exception as e:
+        out["note"] = f"could not read /metrics: {type(e).__name__}"
+    return out
+
+@app.get("/api/strata/log")
+def api_strata_log():
+    return {"log": "\n".join(list(STRATA_LOG)[-120:])}
+
+def _strata_alias() -> str:
+    last = CFG.get("strata_last") or {}
+    return str(last.get("model") or CFG.get("strata_alias") or "strata")
+
 def _current_llm():
     """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running."""
     m = MGR.status()
@@ -2426,6 +2899,13 @@ def _current_llm():
         return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
     if m.get("running"):  # discovery adopted the systemd avalon on 8086
         return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+    s = strata_status()
+    if s.get("running") and s.get("port"):
+        # The key is only forwarded if the operator set strata_api_key deliberately. Strata
+        # owns its own key (`strata launch --show-key`); auto-reading it would push a real
+        # secret into every synced agent config and into panel state without being asked.
+        return _strata_alias(), s["port"], int(CFG.get("strata_ctx") or 8192), \
+            CFG.get("strata_api_key", ""), "strata"
     return None
 
 def _chat_target():
@@ -2438,6 +2918,9 @@ def _chat_target():
         return AVALON_PORT, CFG.get("avalon_api_key", "")
     if m.get("running") and m.get("ready"):  # discovery adopted the systemd avalon on 8086
         return AVALON_PORT, CFG.get("avalon_api_key", "")
+    s = strata_status()
+    if s.get("running") and s.get("port") and s.get("health") == "ready":
+        return s["port"], CFG.get("strata_api_key", "")
     return None
 
 def _yaml_merge(path, apply):
@@ -2640,6 +3123,14 @@ class StartBody(BaseModel):
     ncmoe: int | None = None
     mlock: bool = False
     no_mmap: bool = False
+    draft: str = ""
+    draft_max: int = 16
+    draft_min: int = 0
+    ot: str = ""
+    tensor_split: str = ""
+    tbatch: int | None = None
+    keep: int | None = None
+    jinja: str = "on"
     save_profile: bool = True
 
 @app.post("/api/server/start")
@@ -2649,7 +3140,9 @@ def api_start(b: StartBody):
         ngl=b.ngl, threads=b.threads, fa=b.fa, ctk=b.ctk, ctv=b.ctv,
         parallel=b.parallel, batch=b.batch, ubatch=b.ubatch,
         ncmoe=b.ncmoe, mlock=b.mlock, no_mmap=b.no_mmap,
-        save_profile=b.save_profile,
+        draft=b.draft, draft_max=b.draft_max, draft_min=b.draft_min,
+        ot=b.ot, tensor_split=b.tensor_split, tbatch=b.tbatch, keep=b.keep,
+        jinja=b.jinja, save_profile=b.save_profile,
     )
 
 @app.post("/api/server/stop")
@@ -2665,6 +3158,9 @@ class SettingsBody(BaseModel):
     idle_unload_min: int | None = None
     vram_reserve_mb: int | None = None
     hf_token: str | None = None
+    strata_bin: str | None = None
+    strata_alias: str | None = None
+    strata_api_key: str | None = None
 
 @app.get("/api/settings")
 def api_settings_get():
@@ -2684,6 +3180,9 @@ def api_settings_get():
     tok = CFG.get("hf_token", "")
     env_tok = bool(os.environ.get("HF_TOKEN"))
     masked = (tok[:4] + "…" + tok[-4:]) if len(tok) >= 8 else ("(from $HF_TOKEN)" if env_tok else "")
+    skey = CFG.get("strata_api_key", "")
+    skey_masked = (skey[:4] + "…" + skey[-4:]) if len(skey) >= 8 else ""
+    sbin = strata_bin()
     return {
         "model_dirs": CFG.get("model_dirs", []),
         "dirs_info": dirs_info,
@@ -2699,6 +3198,13 @@ def api_settings_get():
         "hf_token_masked": masked,
         "hf_token_preview": masked,
         "config_path": str(CONFIG_PATH),
+        "strata_bin": CFG.get("strata_bin", ""),
+        "strata_bin_resolved": sbin or "",
+        "strata_installed": bool(sbin),
+        "strata_alias": CFG.get("strata_alias", ""),
+        "strata_api_key_set": bool(skey),
+        "strata_api_key_masked": skey_masked,
+        "strata_ctx": int(CFG.get("strata_ctx", 8192) or 8192),
     }
 
 @app.post("/api/settings")
@@ -2725,6 +3231,16 @@ def api_settings_set(b: SettingsBody):
             CFG["hf_token"] = ""
         elif val and val != "__keep__":
             CFG["hf_token"] = val
+    if b.strata_bin is not None:
+        CFG["strata_bin"] = b.strata_bin.strip()
+    if b.strata_alias is not None:
+        CFG["strata_alias"] = b.strata_alias.strip()
+    if b.strata_api_key is not None:
+        val = b.strata_api_key.strip()
+        if val == "clear":
+            CFG["strata_api_key"] = ""
+        elif val and val != "__keep__":
+            CFG["strata_api_key"] = val
     _save_config_secure()
     return api_settings_get()
 
@@ -2732,7 +3248,7 @@ def api_settings_set(b: SettingsBody):
 async def api_chat(req: Request):
     tgt = _chat_target()
     if not tgt:
-        raise HTTPException(409, "no model ready — load one in the Models tab or start Avalon")
+        raise HTTPException(409, "no model ready — load one in the Models, Strata, or Avalon tab")
     MGR.touch()
     port, key = tgt
     body = await req.json()
@@ -3084,7 +3600,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
   <nav class="nav" id="nav" aria-label="Sections">
     <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
-    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>Server &amp; Bench</button>
+    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>llama.cpp</button>
+    <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg>Strata</button>
     <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Avalon</button>
     <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>Vitals</button>
     <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg>Chat</button>
@@ -3227,6 +3744,81 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn sm" id="logcopy">Copy</button><button class="btn sm" id="logsave">Save</button>
     </div>
     <pre class="log" id="log"></pre>
+  </div>
+</section>
+
+<!-- ==================== STRATA ==================== -->
+<section id="t-strata" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Strata · GGUF server engine</h2><span class="tag" id="stratchip">checking…</span></div>
+    <div id="stratainstall" class="hide" style="margin-bottom:10px">
+      <p class="hint" style="margin:0 0 8px">Strata is a standalone inference engine (OpenAI/Anthropic-compatible server on localhost) with
+        one-command model setup. Install it, or point the panel at an existing launcher in Settings.</p>
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+        <code id="stratainstcmd" class="cmdbox" style="flex:1;min-width:300px"></code>
+        <button class="btn xs" id="stratacopyinst">Copy install command</button>
+      </div>
+    </div>
+    <div id="stratadetail" class="kvs"></div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="st-toggleform">Launch setup…</button>
+      <button class="btn danger" id="stratastopbtn" disabled>Stop</button>
+      <button class="btn" id="stratadoctor">Run doctor</button>
+      <button class="btn" id="strataupdate">Check update</button>
+      <span class="tag hide" id="stratakeychip" title="API key of the running launch (strata launch --show-key)"></span>
+    </div>
+  </div>
+
+  <div class="card hide" id="strataformcard" style="margin-top:14px">
+    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed — Strata defaults stay in charge</span></div>
+    <div class="form-grid">
+      <div class="field"><label>Preset</label><select id="st-preset"><option value="">— none —</option></select></div>
+      <div class="field"><label>Family</label><select id="st-family"><option value="">auto</option><option value="qwen">qwen (Flash-Next)</option><option value="coder">coder</option><option value="unsloth">unsloth</option><option value="gyro">gyro</option><option value="swift">swift</option><option value="nvfp4">nvfp4</option><option value="qwen36">qwen36 (35B)</option></select></div>
+      <div class="field"><label>Model / quant</label><input id="st-model" type="text" placeholder="e.g. iq3_xxs, q2_0, UD-Q4_K_XL"></div>
+      <div class="field"><label>Model path (files I already have)</label><input id="st-modelpath" type="text" placeholder="/path/to/model folder or .gguf"></div>
+      <div class="field"><label>Context</label><select id="st-context"><option value="">default</option><option>8k</option><option>32k</option><option>64k</option><option>128k</option><option>256k</option><option>512k</option></select></div>
+      <div class="field"><label>KV format (--kv)</label><select id="st-kv"><option value="">default (int8)</option><option>int8</option><option>q4_0</option><option>k8v4</option><option>fp16</option></select></div>
+      <div class="field"><label>Parallel requests</label><select id="st-parallel"><option value="">fit to card</option><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option></select></div>
+      <div class="field"><label>Vision</label><select id="st-vision"><option value="">auto</option><option>on</option><option>off</option><option>gpu</option><option>cpu</option></select></div>
+      <div class="field"><label>MTP draft layer (--mtp)</label><select id="st-mtp"><option value="">auto (on)</option><option>on</option><option>off</option></select></div>
+      <div class="field"><label>Drafting mode</label><select id="st-drafting"><option value="">auto</option><option>mtp</option><option>dflash2</option><option>off</option></select></div>
+      <div class="field"><label>Tuning</label><select id="st-tune"><option value="">skip (CLI default)</option><option>quick</option><option>thorough</option></select></div>
+      <div class="field"><label>Access</label><select id="st-access"><option value="">local (127.0.0.1)</option><option>local</option><option>lan</option><option>cloudflare</option><option>tailscale</option></select></div>
+      <div class="field"><label>Port</label><input id="st-port" type="number" min="1024" max="65535" placeholder="8080"></div>
+      <div class="field"><label>GPU cards (--gpu)</label><input id="st-gpu" type="text" placeholder="e.g. 0,1 — default: all"></div>
+      <div class="field"><label>Save as preset</label><input id="st-savepreset" type="text" placeholder="preset name (optional)"></div>
+      <div class="field" style="grid-column:1 / -1"><label>Advanced engine settings (--set, space-separated key=value)</label><input id="st-set" type="text" placeholder="e.g. prefill=65536 STRATA_PIN_BY_NEED=1"></div>
+      <div class="field" style="grid-column:1 / -1">
+        <div style="display:flex;gap:16px;flex-wrap:wrap;padding-top:4px">
+          <label class="switch"><input type="checkbox" id="st-restart"><span class="track"></span><span class="hint">restart if busy</span></label>
+          <label class="switch"><input type="checkbox" id="st-retune"><span class="track"></span><span class="hint">re-tune</span></label>
+          <label class="switch"><input type="checkbox" id="st-newkey"><span class="track"></span><span class="hint">new API key</span></label>
+          <label class="switch"><input type="checkbox" id="st-nokey"><span class="track"></span><span class="hint">no API key</span></label>
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+        <span class="hint">Command preview</span>
+        <button type="button" class="btn xs" id="st-copycmd">Copy command</button>
+      </div>
+      <div class="cmdbox" id="st-cmd"></div>
+    </div>
+    <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap">
+      <button class="btn" id="st-plan">Preview plan (read-only)</button>
+      <button class="btn primary" id="st-launch">Download &amp; Launch</button>
+    </div>
+    <div class="cmdbox hide" id="st-out" style="margin-top:12px;white-space:pre-wrap;max-height:340px;overflow:auto"></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="hd"><h2>Strata presets</h2><button class="btn xs" id="st-refreshpresets">Refresh</button></div>
+    <div id="st-presets" class="kvs"></div>
+  </div>
+
+  <div class="card" style="margin-top:14px">
+    <div class="hd"><h2>Strata log</h2></div>
+    <pre class="log" id="stratalog" style="max-height:280px"></pre>
   </div>
 </section>
 
@@ -3402,6 +3994,18 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <label>Hugging Face Token (optional, for gated repos or higher rate limits) <span id="set-hf-status"></span></label>
         <input id="set-hftok" type="password" placeholder="hf_… (leave blank to keep existing)">
       </div>
+      <div class="field" style="grid-column:1 / -1">
+        <label>Strata CLI path (optional; blank = auto-detect: $STRATA_BIN, PATH, ~/.strata/bin, /usr/local/bin, app bundle) <span id="set-strata-status"></span></label>
+        <input id="set-stratabin" type="text" placeholder="/usr/local/bin/strata">
+      </div>
+      <div class="field">
+        <label>Strata model alias (advertised to coding agents)</label>
+        <input id="set-strataalias" type="text" placeholder="blank = use last launched model name">
+      </div>
+      <div class="field">
+        <label>Strata API key override (only if you manage the key yourself) <span id="set-stratakey-status"></span></label>
+        <input id="set-stratakey" type="password" placeholder="(leave blank to keep existing)">
+      </div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn" id="set-reload">Reload</button>
@@ -3512,6 +4116,41 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <div class="field" id="ld-ncmoe-wrap">
         <label>MoE CPU Expert Layers (--n-cpu-moe)</label>
         <input id="ld-ncmoe" type="number" min="0" max="128" value="0">
+      </div>
+      <div class="field" id="ld-draft-wrap">
+        <label>Speculative draft model (--model-draft)</label>
+        <input id="ld-draft" type="text" list="draftlist" placeholder="MTP / draft GGUF beside the model (blank = off)">
+        <datalist id="draftlist"></datalist>
+      </div>
+      <div class="field" id="ld-draftmax-wrap">
+        <label>Draft max / min tokens</label>
+        <div style="display:flex;gap:6px">
+          <input id="ld-draftmax" type="number" min="1" max="64" value="16" style="width:50%">
+          <input id="ld-draftmin" type="number" min="0" max="16" value="0" style="width:50%">
+        </div>
+      </div>
+      <div class="field">
+        <label>Tensor overrides (-ot, e.g. <code>*.ffn_.*_exps.=CPU</code>)</label>
+        <input id="ld-ot" type="text" placeholder="blank = preset default">
+      </div>
+      <div class="field">
+        <label>Tensor split (--tensor-split, per-device)</label>
+        <input id="ld-tsplit" type="text" placeholder="e.g. 1 1 or 0,3 — blank = off">
+      </div>
+      <div class="field">
+        <label>Batch threads (--threads-batch)</label>
+        <input id="ld-tbatch" type="number" min="0" max="256" value="0">
+      </div>
+      <div class="field">
+        <label>Keep system prompt in cache (--keep tokens)</label>
+        <input id="ld-keep" type="number" min="0" max="65536" value="0">
+      </div>
+      <div class="field">
+        <label>Chat template (--jinja)</label>
+        <select id="ld-jinja">
+          <option value="on">on (recommended)</option>
+          <option value="off">off (legacy template)</option>
+        </select>
       </div>
       <div class="field">
         <label>Memory Policy</label>
@@ -3704,22 +4343,23 @@ $('#logout').addEventListener('click',async()=>{
 });
 
 /* ============================== tabs ============================== */
-const TABS=['models','server','avalon','vitals','chat','hf','settings'];
+const TABS=['models','server','strata','avalon','vitals','chat','hf','settings'];
 let tab='models';
 function setTab(t){
   if(TABS.indexOf(t)<0)t='models';
   tab=t;localStorage.setItem('lfm.tab',t);
   $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
   $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
-  if(t==='vitals')refreshVitals();
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
+  if(t==='strata'){loadStrata();loadStrataPresets();}
   if(t==='avalon'){loadAvalon();loadAvalonAccess();}
   if(t==='settings')loadSettings();
+  if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
 
 /* ============================== models & launch modal ============================== */
-let MODELS=[],MMP=[],ACTIVE=null,AV=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
+let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
 const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 
@@ -3863,6 +4503,14 @@ function getLaunchForm(){
     ncmoe:Number($('#ld-ncmoe').value)||0,
     mlock:$('#ld-mlock').checked,
     no_mmap:$('#ld-nommap').checked,
+    draft:$('#ld-draft').value.trim(),
+    draft_max:Number($('#ld-draftmax').value)||16,
+    draft_min:Number($('#ld-draftmin').value)||0,
+    ot:$('#ld-ot').value.trim(),
+    tensor_split:$('#ld-tsplit').value.trim(),
+    tbatch:Number($('#ld-tbatch').value)||null,
+    keep:Number($('#ld-keep').value)||null,
+    jinja:$('#ld-jinja').value,
     extra_args:$('#ld-extra').value.trim(),
     save_profile:true
   };
@@ -3885,8 +4533,25 @@ function applyLaunchForm(p){
   $('#ld-ncmoe').value=p.ncmoe||0;
   $('#ld-mlock').checked=!!p.mlock;
   $('#ld-nommap').checked=!!p.no_mmap;
+  $('#ld-draft').value=p.draft||'';
+  $('#ld-draftmax').value=p.draft_max||16;
+  $('#ld-draftmin').value=p.draft_min||0;
+  $('#ld-ot').value=p.ot||'';
+  $('#ld-tsplit').value=p.tensor_split||'';
+  $('#ld-tbatch').value=p.tbatch||0;
+  $('#ld-keep').value=p.keep||0;
+  $('#ld-jinja').value=p.jinja||'on';
   $('#ld-extra').value=p.extra_args||'';
   $('#ld-ncmoe-wrap').classList.toggle('hide',!(LD_MODEL&&LD_MODEL.moe));
+  $('#ld-draft-wrap').classList.toggle('hide',!CAPS.draft);
+  $('#ld-draftmax-wrap').classList.toggle('hide',!CAPS.draft);
+}
+function siblingDraft(m){
+  if(!m)return '';
+  const dir=m.path.replace(/\/[^/]+$/,'/');
+  const hit=MODELS.find(x=>x.path.startsWith(dir)&&x.path!==m.path
+            &&/mtp|draft/i.test(x.name)&&!/mmproj/i.test(x.name));
+  return hit?hit.path:'';
 }
 async function updateLaunchPreview(){
   if(!LD_MODEL)return;
@@ -3927,6 +4592,11 @@ function openLaunchModal(m){
   $$('#ld-opt-btns button').forEach(b=>b.classList.remove('on'));
   const base=m.saved_profile||{preset:'auto',ctx:DEF_CTX,ngl:99,fa:'auto',ctk:'f16',ctv:'f16',parallel:1,batch:2048,ubatch:512};
   applyLaunchForm(base);
+  const dir=m.path.replace(/\/[^/]+$/,'/');
+  const cands=MODELS.filter(x=>x.path.startsWith(dir)&&x.path!==m.path
+              &&/mtp|draft/i.test(x.name)&&!/mmproj/i.test(x.name));
+  $('#draftlist').innerHTML=cands.map(x=>'<option value="'+esc(x.path)+'">'+esc(x.name)+'</option>').join('');
+  if(!$('#ld-draft').value&&CAPS.draft&&cands.length)$('#ld-draft').value=cands[0].path;
   $('#launchdlg').showModal();
   updateLaunchPreview();
 }
@@ -3971,6 +4641,7 @@ function chatTarget(){
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.port!==ap)return{alias:ACTIVE.alias,port:ACTIVE.port,src:'panel'};
   if(AV&&AV.running&&AV.state==='ready')return{alias:AV.model||'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.port===ap)return{alias:'qwen3.8-flash-next',port:ap,src:'avalon'};
+  if(STRATA&&STRATA.running&&STRATA.health==='ready'&&STRATA.port)return{alias:STRATA.model||'strata',port:STRATA.port,src:'strata'};
   return null;
 }
 function drawHeader(){
@@ -3978,7 +4649,7 @@ function drawHeader(){
   const ct=chatTarget();
   if(ct){
     p.className='pill ok';
-    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':'');
+    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':'');
     document.title='● '+ct.alias+' — LFM Panel';
   }else if(ACTIVE){
     p.className='pill warn';
@@ -3988,6 +4659,10 @@ function drawHeader(){
     p.className='pill warn';
     t.textContent='avalon · loading…';
     document.title='◌ Loading Avalon — LFM Panel';
+  }else if(STRATA&&STRATA.running){
+    p.className='pill warn';
+    t.textContent='strata · loading…';
+    document.title='◌ Loading Strata — LFM Panel';
   }else{
     p.className='pill';
     t.textContent='no server running';
@@ -4226,7 +4901,7 @@ function drawChatTarget(){
   if(ct){t.className='tag ok';t.textContent=ct.alias+' · :'+ct.port}
   else{t.className='tag warn';t.textContent='no model loaded'}
   $('#sendbtn').disabled=BUSY||!ct;
-  $('#chatnote').textContent=ct?'':'Start a model in the Models or Avalon tab to chat.';
+  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, or Avalon tab to chat.';
 }
 function md(src){
   const blocks=[];
@@ -4471,6 +5146,139 @@ $('#ag-apply').addEventListener('click',async()=>{
   toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
   pollStatus();
 });
+
+/* ============================== strata ============================== */
+async function loadStrata(){
+  try{const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget()}catch(e){}
+}
+function drawStrata(s){
+  const chip=$('#stratchip');
+  chip.textContent=!s.installed?'not installed':s.running?(s.health==='ready'?'serving · ready':'starting…'):'stopped';
+  chip.className='tag '+(s.running?(s.health==='ready'?'ok':'warn'):(s.installed?'mut':'err'));
+  $('#stratainstall').classList.toggle('hide',!!s.installed);
+  if(!s.installed)$('#stratainstcmd').textContent=s.install_cmd||'';
+  $('#stratadetail').innerHTML=s.installed?
+    [['bin',s.bin||''],['health',s.health||''],['port',s.port?':'+s.port:'—']]
+      .concat(s.model?[['model',s.model]]:[],s.preset?[['preset',s.preset]]:[],s.version?[['version',s.version]]:[])
+      .map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+    +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>'):''
+    :'<span class="hint">'+esc(s.note||'')+'</span>';
+  $('#stratastopbtn').disabled=!(s.running);
+  $('#stratakeychip').classList.add('hide');
+}
+function stForm(){
+  const sets=$('#st-set').value.trim().split(/\s+/).filter(x=>x.includes('='));
+  return {
+    preset:$('#st-preset').value||null,family:$('#st-family').value||null,
+    model:$('#st-model').value.trim()||null,model_path:$('#st-modelpath').value.trim()||null,
+    context:$('#st-context').value||null,kv:$('#st-kv').value||null,
+    parallel:Number($('#st-parallel').value)||null,vision:$('#st-vision').value||null,
+    mtp:$('#st-mtp').value||null,drafting:$('#st-drafting').value||null,
+    gpu:$('#st-gpu').value.trim()||null,tune:$('#st-tune').value||null,
+    retune:$('#st-retune').checked,access:$('#st-access').value||null,
+    port:Number($('#st-port').value)||null,no_api_key:$('#st-nokey').checked,
+    new_key:$('#st-newkey').checked,save_preset:$('#st-savepreset').value.trim()||null,
+    restart:$('#st-restart').checked,set_:sets.length?sets:null
+  };
+}
+function stPreview(){
+  const f=stForm();let c='strata launch';
+  const map={preset:'--preset',family:'--family',model:'--model',model_path:'--model-path',
+             context:'--context',kv:'--kv',vision:'--vision',mtp:'--mtp',drafting:'--drafting',
+             gpu:'--gpu',tune:'--tune',access:'--access',save_preset:'--save-preset'};
+  for(const k in map)if(f[k])c+=' '+map[k]+' '+f[k];
+  if(f.parallel)c+=' --parallel '+f.parallel;
+  if(f.port)c+=' --port '+f.port;
+  (f.set_||[]).forEach(kv=>c+=' --set '+kv);
+  if(f.retune)c+=' --retune';
+  if(f.no_api_key)c+=' --no-api-key';
+  if(f.new_key)c+=' --new-key';
+  if(f.restart)c+=' --restart';
+  c+=' --yes --no-tui';
+  $('#st-cmd').textContent=c;
+}
+$$('#strataformcard input,#strataformcard select').forEach(el=>el.addEventListener('input',stPreview));
+$('#st-toggleform').addEventListener('click',()=>{$('#strataformcard').classList.toggle('hide');stPreview()});
+$('#st-copycmd').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#st-cmd').textContent);toast('Command copied','ok')});
+$('#stratacopyinst').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#stratainstcmd').textContent);toast('Install command copied — run it in your own terminal','ok',6000)});
+async function loadStrataPresets(){
+  if(!$('#st-presets'))return;
+  try{
+    const d=await api('/api/strata/presets');
+    const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?{name:p.name,context:p.context,model:p.model}:null)).filter(Boolean);
+    $('#st-presets').innerHTML=ps.length?ps.map(p=>'<span class="tag">'+esc(p.name)
+      +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
+      +' <button class="btn xs" data-stp="'+esc(p.name)+'" data-act="use">Use</button>'
+      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset">×</button></span>').join('')
+      :'<span class="hint">No saved presets yet — name one in the launch form to save this exact configuration.</span>';
+    const sel=$('#st-preset'),cur=sel.value;
+    sel.innerHTML='<option value="">— none —</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
+    sel.value=cur;
+  }catch(e){}
+}
+$('#st-refreshpresets').addEventListener('click',loadStrataPresets);
+$('#st-presets').addEventListener('click',async e=>{
+  const b=e.target.closest('[data-stp]');if(!b)return;
+  if(b.dataset.act==='use'){$('#st-preset').value=b.dataset.stp;stPreview();toast('Preset '+b.dataset.stp+' selected','ok')}
+  else{
+    if(!await confirmDlg('Delete preset','Delete Strata preset <b>'+esc(b.dataset.stp)+'</b>?','Delete',true))return;
+    try{await post('/api/strata/presets/delete',{name:b.dataset.stp});loadStrataPresets();toast('Preset deleted','ok')}
+    catch(err){toast('Delete failed: '+err.message,'err',8000)}
+  }
+});
+function stOut(txt){const o=$('#st-out');o.classList.remove('hide');o.textContent=txt}
+$('#st-plan').addEventListener('click',async()=>{
+  const b=$('#st-plan');b.disabled=true;b.textContent='Planning…';
+  try{
+    const r=await post('/api/strata/launch',Object.assign(stForm(),{plan:true}));
+    stOut(r.json?JSON.stringify(r.json,null,1):(r.raw||r.error||'(empty plan)'));
+  }catch(e){stOut('Plan failed: '+e.message)}
+  b.disabled=false;b.textContent='Preview plan (read-only)';
+});
+$('#st-launch').addEventListener('click',async()=>{
+  const btn=$('#st-launch');
+  if(!await confirmDlg('Launch Strata','Strata may download model files (tens of GB) and load a server into memory. Continue?','Download & Launch',true))return;
+  btn.disabled=true;btn.textContent='Launching…';
+  try{
+    const r=await post('/api/strata/launch',stForm());
+    toast('Strata launch accepted — loading…','ok',4000);
+    if(r.state){STRATA=r.state;drawStrata(STRATA)}
+    pollStatus(true);loadStrataPresets();
+  }catch(e){toast('Strata launch failed: '+e.message,'err',15000)}
+  btn.disabled=false;btn.textContent='Download & Launch';
+});
+$('#stratastopbtn').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop Strata','Unload the Strata model?','Stop',true))return;
+  try{const r=await post('/api/strata/stop');STRATA=r.state;drawStrata(STRATA);pollStatus(true);toast('Strata stopped','ok')}
+  catch(e){toast('Stop failed: '+e.message,'err',8000)}
+});
+$('#stratadoctor').addEventListener('click',async()=>{
+  const b=$('#stratadoctor');b.disabled=true;b.textContent='Doctor running…';
+  try{const d=await api('/api/strata/doctor');$('#strataformcard').classList.remove('hide');stOut(d.raw||d.error||'(no output)')}
+  catch(e){toast('Doctor failed: '+e.message,'err')}
+  b.disabled=false;b.textContent='Run doctor';
+});
+$('#strataupdate').addEventListener('click',async()=>{
+  const b=$('#strataupdate');b.disabled=true;b.textContent='Checking…';
+  try{
+    const d=await api('/api/strata/update');
+    $('#strataformcard').classList.remove('hide');
+    stOut(d.json?JSON.stringify(d.json,null,1):(d.raw||d.error||'(no output)'));
+  }catch(e){toast('Update check failed: '+e.message,'err')}
+  b.disabled=false;b.textContent='Check update';
+});
+$('#stratakeychip').addEventListener('click',async()=>{
+  const c=$('#stratakeychip');
+  if(c.dataset.revealed==='1'){c.textContent='key '+(c.dataset.masked||'');c.dataset.revealed='0';return}
+  try{const k=await api('/api/strata/key?reveal=1');if(k.key){c.textContent='key '+k.key;c.dataset.revealed='1'}}
+  catch(e){toast('Could not read key: '+e.message,'err')}
+});
+async function loadStrataKey(){
+  try{const k=await api('/api/strata/key');
+    if(k.key_set){const c=$('#stratakeychip');c.dataset.masked=k.masked;c.textContent='key '+k.masked+' (click to reveal)';c.classList.remove('hide')}
+  }catch(e){}
+}
+async function refreshStrataLog(){try{const d=await api('/api/strata/log');paintInto($('#stratalog'),d.log)}catch(e){}}
 
 /* ============================== avalon & optimizer ============================== */
 let ASEL=null,ALIST=[];
@@ -4720,11 +5528,16 @@ async function loadSettings(){
     $('#set-reserve').value=s.vram_reserve_mb!=null?s.vram_reserve_mb:512;
     $('#set-hftok').value='';
     $('#set-hf-status').textContent=s.hf_token_set?'configured ('+s.hf_token_preview+')':'not set';
+    $('#set-stratabin').value=s.strata_bin||'';
+    $('#set-strata-status').textContent=s.strata_installed?'found: '+(s.strata_bin_resolved||''):'not found';
+    $('#set-strataalias').value=s.strata_alias||'';
+    $('#set-stratakey').value='';
+    $('#set-stratakey-status').textContent=s.strata_api_key_set?'overridden ('+s.strata_api_key_masked+')':'not set (Strata owns its key)';
     const c=s.caps||{};
     $('#set-caps-badge').textContent=c.exists?'binary verified':'binary missing';
     $('#set-caps-badge').className='tag '+(c.exists?'ok':'err');
     $('#set-bin-ver').textContent=c.version||'';
-    $('#set-bin-flags').innerHTML=['fa_value','ncmoe','metrics','fit','ctk','mlock','no_mmap','parallel']
+    $('#set-bin-flags').innerHTML=['fa_value','ncmoe','metrics','fit','ctk','mlock','no_mmap','parallel','draft','draft_max','ot','tensor_split','tbatch','keep','jinja']
       .map(k=>'<span class="tag '+(c[k]?'ok':'mut')+'">'+k+(c[k]?' ✓':' –')+'</span>').join('');
     $('#set-disks').innerHTML=(s.disks||[]).map(d=>d.exists?d.path+': '+d.free_gb+' GB free':d.path+': missing').join(' · ');
   }catch(e){toast('Failed to load settings: '+e.message,'err')}
@@ -4741,7 +5554,10 @@ $('#set-save').addEventListener('click',async()=>{
       port_base:Number($('#set-port').value)||8081,
       idle_unload_min:Number($('#set-idle').value)||0,
       vram_reserve_mb:Number($('#set-reserve').value)||0,
-      hf_token:$('#set-hftok').value.trim()
+      hf_token:$('#set-hftok').value.trim(),
+      strata_bin:$('#set-stratabin').value.trim(),
+      strata_alias:$('#set-strataalias').value.trim(),
+      strata_api_key:$('#set-stratakey').value.trim()
     });
     toast('Settings saved','ok');
     await loadSettings();await loadModels();
@@ -4754,10 +5570,14 @@ let PAL_ITEMS=[],PAL_IDX=0;
 function buildPaletteItems(){
   const items=[];
   TABS.forEach((t,i)=>items.push({label:'Go to '+t.toUpperCase()+' tab',sub:'Shortcut '+(i+1),run:()=>setTab(t)}));
-  items.push({label:'Run one-click benchmark on active server',sub:'Server & Bench',run:()=>{setTab('server');$('#benchrun').click()}});
+  items.push({label:'Run one-click benchmark on active server',sub:'llama.cpp',run:()=>{setTab('server');$('#benchrun').click()}});
   if(ACTIVE&&ACTIVE.running){
     items.push({label:'Stop active llama-server ('+ACTIVE.alias+')',sub:':'+ACTIVE.port,run:()=>$('#srvstop').click()});
   }
+  if(STRATA&&STRATA.running){
+    items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
+  }
+  items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Toggle light / dark theme',sub:'Appearance',run:()=>$('#theme').click()});
   items.push({label:'Rescan model directories',sub:'Models',run:()=>$('#rescan').click()});
   MODELS.forEach(m=>{
@@ -4814,11 +5634,13 @@ function tick(){
   if(document.hidden)return;
   pollStatus();
   pollTelemetry();
+  if(tab==='strata')loadStrata();
   if(tab==='avalon')loadAvalon();
 }
 setInterval(tick,2500);
 setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
 setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
+setInterval(()=>{if(!document.hidden&&tab==='strata')refreshStrataLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
 async function refreshAvalonLog(){try{const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log)}catch(e){}}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollStatus();pollTelemetry();refreshVitals()}});
@@ -4845,7 +5667,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('lfm.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('lfm.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();
+refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
