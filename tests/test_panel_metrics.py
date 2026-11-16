@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import unittest
 import types
 from pathlib import Path
 
@@ -1405,6 +1406,28 @@ def test_legacy_path_migration_moves_once_and_never_clobbers():
         (panel.HOME, panel.APP_DIR, panel.CONFIG_PATH,
          panel.LEGACY_APP_DIR, panel.LEGACY_CONFIG) = ov
         _sh.rmtree(root, ignore_errors=True)
+
+
+def test_inline_js_parses():
+    """Catch JS syntax errors in the served HTML (a bad paren blanks the whole UI)."""
+    import re
+    import shutil
+    import subprocess
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node not installed")
+    blocks = re.findall(r"<script>(.*?)</script>", panel.HTML, re.S)
+    assert blocks, "no inline <script> blocks found"
+    for i, src in enumerate(blocks):
+        with tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+            f.write(src)
+            path = f.name
+        try:
+            r = subprocess.run([node, "--check", path],
+                               capture_output=True, text=True)
+            assert r.returncode == 0, f"script block {i}: {r.stderr[:500]}"
+        finally:
+            os.unlink(path)
 
 
 if __name__ == "__main__":

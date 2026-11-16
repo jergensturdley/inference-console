@@ -5419,7 +5419,7 @@ function drawStrata(s){
     [['bin',s.bin||''],['health',s.health||''],['port',s.port?':'+s.port:'—']]
       .concat(s.model?[['model',s.model]]:[],s.preset?[['preset',s.preset]]:[],s.version?[['version',s.version]]:[])
       .map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
-    +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>'):''
+    +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>':'')
     :'<span class="hint">'+esc(s.note||'')+'</span>';
   $('#stratastopbtn').disabled=!(s.running);
   $('#stratakeychip').classList.add('hide');
