@@ -36,8 +36,14 @@ registry target automatically.
   mode), read-only plan preview before any download, preset save/delete,
   `doctor --live`, `update --check`, masked API key. Empty fields keep
   Strata's own defaults.
-- **Avalon** — profiles (`flagship`, `prefast`, `compact`), per-profile config
-  optimizer, LAN/API-key access, GPU-conflict guard against the other engines.
+- **Avalon** — profiles (`flagship`, `prefast`, `compact`) with fit-aware
+  launches (`-fit on` places dense + KV on the GPU, MoE experts in system
+  memory; no hardcoded full offload), per-profile config optimizer with
+  device/offload/`--n-cpu-moe`/FA/threads switches and recommendation hints,
+  auto-target: newest complete Flash-Next pack enters the tab on its own
+  (selectable from a dropdown, pinnable via `avalon_model`), one-click saved
+  launch snapshots, LAN/API-key access, GPU-conflict guard against the other
+  engines.
 
 ## Launch tuning
 
@@ -59,6 +65,8 @@ builds never receive flags they'd reject.
 
 - GGUF scan with metadata: arch, quant, params, ctx_len, blocks, experts,
   imatrix, mmproj
+- Multi-shard packs group into one collapsible entry (sizes summed; deleting a
+  pack removes all shards)
 - VRAM/RAM fit meter on every card before you launch
 - Pinning and recents
 - Hugging Face downloads: resumable `.part` transfers, pause/resume, disk

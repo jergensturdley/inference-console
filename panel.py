@@ -34,6 +34,9 @@ DEFAULT_CONFIG = {
     "hf_token": "",              # falls back to $HF_TOKEN
     "vram_reserve_mb": 512,      # headroom kept free by the fit estimator / optimizer
     "avalon_tune": {},           # overrides for the Avalon launch line (see AVALON_TUNE_DEFAULTS)
+    "avalon_snapshots": [],      # saved one-click launch profiles (exact tune per snapshot)
+    "avalon_model": "",          # pin the Avalon tab to one pack path (empty = auto: newest complete Flash-Next)
+    "avalon_draft": "",          # MTP draft override (empty = first mtp-*.gguf next to the detected pack)
     # Strata (github.com/Niko1221/Strata). strata_bin empty means "find it on PATH".
     # strata_api_key is only used if you set it deliberately; Strata owns its own key.
     "strata_bin": "",
@@ -205,6 +208,8 @@ def gguf_metadata(path: Path, limit_mb: int = 64):
 
 QUANT_END_RE = re.compile(r"((?:IQ|TQ)\d_[0-9A-Z_]+|Q\d_[0-9A-Z_]+|MXFP4|BF16|FP16|F16|F32)$")
 QUANT_ANY_RE = re.compile(r"((?:IQ|TQ)\d_[0-9A-Z_]+|Q\d_[0-9A-Z_]+|MXFP4|BF16|FP16|F16|F32)")
+# llama.cpp split files: <base>-00001-of-00033.gguf — the library groups these into one entry
+SPLIT_RE = re.compile(r"-(\d{5})-of-(\d{5})$")
 MOE_RE = re.compile(r"\bA\d+B\b|\bA\d+x\d+B\b|[Mm]oe\b|[Mm]ixture")
 _TOKEN_DROP = re.compile(r"^(i1|mmproj|[0-9.]+[bmk]?|[a-z])$", re.I)
 
@@ -284,6 +289,7 @@ _model_cache = {}
 def scan_models():
     models, accessories = [], []
     seen, _dupe_seen = set(), set()
+    split_groups: dict = {}  # (dir, base-stem) -> head entry for a multi-shard pack
     for d in CFG["model_dirs"]:
         p = Path(d).expanduser()
         if not p.is_dir():
@@ -306,8 +312,19 @@ def scan_models():
             if "mmproj" in name_l or name_l.startswith("mtp-"):
                 accessories.append({"path": str(f), "size": st.st_size})
                 continue
+            sm = SPLIT_RE.search(f.stem)
+            if sm:
+                gkey = (str(f.parent), f.stem[: sm.start()])
+                g = split_groups.get(gkey)
+                if g is not None:
+                    g["shards"].append({"path": str(f), "size": st.st_size, "name": f.name})
+                    continue
             if key in _model_cache:
-                models.append(_model_cache[key])
+                head = _model_cache[key]
+                if sm:
+                    head["shards"] = [{"path": str(f), "size": st.st_size, "name": f.name}]
+                    split_groups[gkey] = head
+                models.append(head)
                 continue
             dupe_key = (f.stem, st.st_size)
             if dupe_key in _dupe_seen:
@@ -319,6 +336,7 @@ def scan_models():
                 md = {"error": str(e)}
             arch = md.get("general.architecture", "?")
             stem = f.stem
+            disp_name = stem[: sm.start()] if sm else stem
             qm = QUANT_END_RE.search(stem) or QUANT_ANY_RE.search(stem)
             quant = qm.group(1) if qm else _file_type.get(md.get("general.file_type", -1), "?")
             expert_count = md.get(f"{arch}.expert_count", 0) or 0
@@ -333,7 +351,7 @@ def scan_models():
             blocks = md.get(f"{arch}.block_count", 0) or 0
             mmproj = find_mmproj(str(f))
             m = {
-                "path": str(f), "name": stem, "arch": arch,
+                "path": str(f), "name": disp_name, "arch": arch,
                 "quant": quant, "size": st.st_size, "size_h": human_size(st.st_size),
                 "moe": moe, "vl": bool(VL_NAME_RE.search(stem)),
                 "params": name_label, "ctx_len": md.get(f"{arch}.context_length", 0),
@@ -343,9 +361,17 @@ def scan_models():
                 "imatrix": bool(md.get("general.quantization_imatrix", False)),
                 "mmproj": mmproj,
             }
+            if sm:
+                m["shards"] = [{"path": str(f), "size": st.st_size, "name": f.name}]
+                split_groups[(str(f.parent), disp_name)] = m
             _model_cache[key] = m
             models.append(m)
     models.sort(key=lambda m: m["name"].lower())
+    # Group totals: one entry per pack shows the sum of its shard sizes.
+    for m in models:
+        if m.get("shards"):
+            m["size"] = sum(s["size"] for s in m["shards"])
+            m["size_h"] = human_size(m["size"])
     # Cache keys carry mtime+size, so every re-download or re-quant adds an entry that a
     # scan never drops on its own. Forget entries for files that are gone.
     live_paths = {m["path"] for m in models}
@@ -1121,15 +1147,110 @@ MGR = ServerManager()
 
 # ---------------------------------------------------------------- avalon
 AVALON_BIN = str(HOME / "avalon/build/bin/llama-server")
-AVALON_MODEL = HOME / "models/qwen3.8-flash-next-avalon/Qwen3.8-Flash-Next-Avalon-IQ3KS-00001-of-00033.gguf"
-AVALON_DRAFT = HOME / "models/qwen3.8-flash-next-avalon/mtp-Qwen3.8-Flash-Next-shared-IQ3K-IQ4NL-FR65k.gguf"
+
+# ---------------------------------------------------------------- avalon target detection
+# The Avalon tab runs one Flash-Next pack. Which pack is resolved automatically:
+# newest complete Flash-Next GGUF (split packs must have all shards) in the model
+# dirs, so a fresh download enters the tab on its own. avalon_model / avalon_draft
+# in config.json pin a specific pack and skip detection.
+_AVALON_TTL = 60.0
+_AVALON_FLASH_NEXT_RE = re.compile(r"flash[-_.]?next", re.I)
+_avalon_cache: dict = {"at": 0.0, "target": None}
+
+def _avalon_target_invalidate():
+    _avalon_cache["at"] = 0.0
+
+def _avalon_scan() -> list:
+    """All complete Flash-Next packs in the model dirs, newest first.
+    Complete = split packs have every -of-N shard; partial packs are invisible."""
+    groups: dict = {}  # (dir, base) -> pack accumulator
+    for d in CFG["model_dirs"]:
+        p = Path(d).expanduser()
+        if not p.is_dir():
+            continue
+        for f in sorted(p.rglob("*.gguf")):
+            nl = f.name.lower()
+            if "mmproj" in nl or nl.startswith("mtp-"):
+                continue
+            if not _AVALON_FLASH_NEXT_RE.search(f.name) and not _AVALON_FLASH_NEXT_RE.search(str(f.parent.name)):
+                continue
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if st.st_size < 1_000_000:
+                continue
+            sm = SPLIT_RE.search(f.stem)
+            if sm:
+                base = f.stem[: sm.start()]
+                expected = int(sm.group(2))
+                key = (str(f.parent), base)
+                g = groups.get(key)
+                if g is None:
+                    g = groups[key] = {"mtime": 0.0, "head": f, "n": expected, "shards": 0, "size": 0}
+                g["mtime"] = max(g["mtime"], st.st_mtime)
+                g["shards"] += 1
+                g["size"] += st.st_size
+            else:
+                groups[(str(f.parent), f.stem)] = {"mtime": st.st_mtime, "head": f, "n": 1, "shards": 1, "size": st.st_size}
+    out = []
+    for g in groups.values():
+        if g["shards"] != g["n"]:
+            continue
+        head = g["head"]
+        drafts = sorted(d for d in head.parent.glob("mtp-*.gguf") if d.is_file())
+        try:
+            mmproj = find_mmproj(str(head))
+        except Exception:
+            mmproj = None
+        out.append({
+            "path": str(head), "base": SPLIT_RE.sub("", head.stem),
+            "mtime": g["mtime"], "size": g["size"], "size_h": human_size(g["size"]),
+            "shards": g["shards"],
+            "draft": str(drafts[0]) if drafts else None, "mmproj": mmproj,
+        })
+    out.sort(key=lambda x: (x["mtime"], x["size"]), reverse=True)
+    return out
+
+def _avalon_target() -> dict:
+    """Returns {'model': Path|None, 'draft': Path|None, 'mmproj': str|None, 'base': str}."""
+    now = time.time()
+    if _avalon_cache["at"] and now - _avalon_cache["at"] < _AVALON_TTL:
+        return _avalon_cache["target"]
+    tgt = {"model": None, "draft": None, "mmproj": None, "base": ""}
+    pinned = CFG.get("avalon_model")
+    if pinned:
+        tgt["model"] = Path(pinned).expanduser()
+        tgt["base"] = SPLIT_RE.sub("", tgt["model"].stem)
+        if CFG.get("avalon_draft"):
+            tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
+        else:
+            drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
+            if drafts:
+                tgt["draft"] = drafts[0]
+    else:
+        packs = _avalon_scan()
+        if packs:
+            p0 = packs[0]
+            tgt["model"] = Path(p0["path"])
+            tgt["base"] = p0["base"]
+            tgt["draft"] = Path(p0["draft"]) if p0["draft"] else None
+            tgt["mmproj"] = p0["mmproj"]
+    if tgt["model"] and not tgt.get("mmproj"):
+        try:
+            tgt["mmproj"] = find_mmproj(str(tgt["model"]))
+        except Exception:
+            tgt["mmproj"] = None
+    _avalon_cache["at"] = now
+    _avalon_cache["target"] = tgt
+    return tgt
 AVALON_STATE_PATH = APP_DIR / "avalon-state.json"
 AVALON_PORT = 8086
 AVALON_PROFILES = {
     "flagship": {
         "label": "Flash-Next 262k (flagship)",
         "desc": "125B MoE IQ3KS · 262k context · MTP drafting on",
-        "speed": "≈98 tok/s gen · needs the llama.cpp server stopped (VRAM)",
+        "speed": "auto-fit: attention + KV on the eGPU, experts stream from RAM · ≈98 tok/s gen · needs the llama.cpp server stopped (VRAM)",
         "exclusive": True,
         "draft": True,
         "defaults": {"ctx": 262144, "batch": 9536, "ubatch": 9536, "ctk": "q8_0", "ctv": "q4_0", "draft_n": 2, "ubd": 256, "parallel": 1},
@@ -1211,8 +1332,9 @@ class AvalonManager:
             "adopted": st.get("adopted", False),
         }
 
-    def build_args(self, profile: str, tune_override: dict | None = None) -> list[str]:
+    def build_args(self, profile: str, tune_override: dict | None = None, target: dict | None = None) -> list[str]:
         p = AVALON_PROFILES.get(profile) or AVALON_PROFILES["flagship"]
+        tgt = target or _avalon_target()
         defs = dict(p.get("defaults", {}))
         saved_tune = (CFG.get("avalon_tune") or {}).get(profile, {})
         if saved_tune:
@@ -1227,15 +1349,37 @@ class AvalonManager:
         parallel = int(defs.get("parallel", 1))
         draft_n = int(defs.get("draft_n", 2 if p.get("draft") else 0))
         ubd = int(defs.get("ubd", 256))
+        # Offload placement. Default is the fork's -fit: llama.cpp counts the model's
+        # dense weights, KV cache and buffers against each --device's memory and sizes
+        # the GPU-side layer count itself. This 88 GiB pack (40 GiB dense + 48 GiB
+        # experts + ~10 GiB KV at 262k) cannot fully offload to the 20 GB eGPU, so
+        # hardcoded -ngl 99 -fit off aborted every launch; see device hints in the UI.
+        device = str(defs.get("device") or "ROCm0")
+        ngl = defs.get("ngl")
+        fa = str(defs.get("fa") or "on")
+        mlock = bool(defs.get("mlock", False))
 
-        args = [AVALON_BIN, "-m", str(AVALON_MODEL),
-                "--device", "ROCm0", "-ngl", "99", "-fit", "off",
-                "-fa", "on", "-ctk", ctk, "-ctv", ctv,
-                "-b", str(batch), "-ub", str(ubatch), "-c", str(ctx),
-                "--parallel", str(parallel), "--jinja", "--temp", "0.6",
-                "--metrics", "--port", str(AVALON_PORT)]
-        if draft_n > 0 and AVALON_DRAFT.exists():
-            args += ["-md", str(AVALON_DRAFT), "--spec-type", "draft-mtp",
+        args = [AVALON_BIN, "-m", str(tgt["model"]), "--device", device]
+        if tgt.get("mmproj"):
+            args += ["--mmproj", tgt["mmproj"]]
+        if ngl is None:
+            args += ["-fit", "on"]
+        else:
+            args += ["-ngl", str(int(ngl)), "-fit", "off"]
+        args += ["-fa", fa, "-ctk", ctk, "-ctv", ctv,
+                 "-b", str(batch), "-ub", str(ubatch), "-c", str(ctx),
+                 "--parallel", str(parallel), "--jinja", "--temp", "0.6",
+                 "--metrics", "--port", str(AVALON_PORT)]
+        n_cmoe = defs.get("n_cmoe")
+        if n_cmoe is not None:
+            args += ["--n-cpu-moe", str(int(n_cmoe))]
+        threads = defs.get("threads")
+        if threads is not None:
+            args += ["-t", str(int(threads))]
+        if mlock:
+            args += ["--mlock"]
+        if draft_n > 0 and tgt.get("draft") and tgt["draft"].exists():
+            args += ["-md", str(tgt["draft"]), "--spec-type", "draft-mtp",
                      "--spec-draft-n-max", str(draft_n), "-ubd", str(ubd), "-ctkd", "q8_0", "-ctvd", "q8_0"]
         if CFG.get("avalon_lan"):
             args += ["--host", "0.0.0.0"]
@@ -1247,10 +1391,11 @@ class AvalonManager:
         p = AVALON_PROFILES.get(profile)
         if not p:
             raise HTTPException(400, f"unknown avalon profile: {profile}")
+        tgt = _avalon_target()
         if not Path(AVALON_BIN).exists():
             raise HTTPException(503, "Avalon build not found — build ~/avalon first (cmake --build build --target llama-server).")
-        if not AVALON_MODEL.exists():
-            raise HTTPException(404, "model shards missing — finish the Qwen3.8-Flash-Next download first.")
+        if not tgt["model"] or not tgt["model"].exists():
+            raise HTTPException(404, "no Flash-Next pack detected in the model dirs — finish a download first or set avalon_model in config.json.")
         if p["exclusive"] and self._gpu_conflict():
             raise HTTPException(409, "Stop the llama.cpp server first — this profile needs its VRAM.")
         if self.status()["running"] or not self._port_free():
@@ -1264,7 +1409,7 @@ class AvalonManager:
         if tune:
             CFG.setdefault("avalon_tune", {})[profile] = tune
             _save_config_secure()
-        args = self.build_args(profile, tune)
+        args = self.build_args(profile, tune, target=tgt)
         cmd_str = " ".join(args)
         self.log(f"starting profile {profile}{' [lan]' if CFG.get('avalon_lan') else ''}: {cmd_str}")
         self.proc = subprocess.Popen(
@@ -1886,6 +2031,7 @@ def _download_worker(did: str):
                     raise RuntimeError("paused")
                 tmp.rename(dest)
                 d["status"] = "done"
+                _avalon_target_invalidate()
                 return
             r.raise_for_status()
             cl = int(r.headers.get("content-length", 0))
@@ -1908,6 +2054,7 @@ def _download_worker(did: str):
             raise RuntimeError("paused")
         tmp.rename(dest)
         d["status"] = "done"
+        _avalon_target_invalidate()
         _model_cache.clear()
         MGR.log(f"pulled {dest.name}")
     except Exception as e:
@@ -2055,13 +2202,28 @@ def api_model_delete(b: DeleteBody):
             break
     if target.is_dir():
         size = sum(f.stat().st_size for f in target.rglob("*") if f.is_file())
+        count = sum(1 for f in target.rglob("*") if f.is_file())
         shutil.rmtree(target)
     else:
-        size = target.stat().st_size
-        target.unlink(missing_ok=True)
+        # A split shard deletes its whole pack: llama.cpp treats the group as one model,
+        # and leaving the remaining shards behind would show a broken entry.
+        size = 0
+        victims = [target]
+        sm = SPLIT_RE.search(target.stem)
+        if sm:
+            base = target.stem[: sm.start()]
+            victims = sorted(
+                f for f in target.parent.iterdir()
+                if f.is_file() and f.suffix.lower() == ".gguf"
+                and (m := SPLIT_RE.search(f.stem)) and f.stem[: m.start()] == base
+            )
+        for f in victims:
+            size += f.stat().st_size
+            f.unlink(missing_ok=True)
+        count = len(victims)
     _model_cache.clear()
     MGR.log(f"deleted {target.name} ({human_size(size)} freed)")
-    return {"deleted": str(target), "freed_h": human_size(size)}
+    return {"deleted": str(target), "freed_h": human_size(size), "count": count}
 
 @app.get("/api/models")
 def api_models():
@@ -2273,7 +2435,7 @@ def api_benchmark_run(b: BenchRunBody):
     alias = cur[0] if cur else "model"
     source = cur[4] if cur else "panel"
     srv = MGR.status()
-    model_path = srv.get("model", "") if source == "panel" else str(AVALON_MODEL)
+    model_path = srv.get("model", "") if source == "panel" else str(_avalon_target().get("model") or "")
     preset = srv.get("preset", "avalon") if source == "panel" else (SMGR.status().get("profile") or "avalon")
 
     prompt_txt = BENCH_PROMPTS.get(b.prompt_key, BENCH_PROMPTS["standard"])
@@ -2364,26 +2526,63 @@ def api_benchmark_run(b: BenchRunBody):
     return entry
 
 # ---------------------------------------------------------------- avalon api
+@app.get("/api/avalon/targets")
+def api_avalon_targets():
+    packs = _avalon_scan()
+    pinned = CFG.get("avalon_model") or ""
+    known = {p["path"] for p in packs}
+    out = [{"path": "", "base": "Auto · newest complete pack", "size_h": "", "shards": 0, "draft": None, "current": not pinned}]
+    for p in packs:
+        out.append({"path": p["path"], "base": p["base"], "size_h": p["size_h"], "shards": p["shards"],
+                    "draft": p["draft"], "current": pinned == p["path"]})
+    if pinned and pinned not in known:
+        bp = Path(pinned)
+        out.append({"path": pinned, "base": SPLIT_RE.sub("", bp.stem) + " (pinned)", "size_h": "", "shards": 0,
+                    "draft": None, "current": True})
+    return {"targets": out, "has_draft": bool(_avalon_target().get("draft"))}
+
+class AvalonTargetBody(BaseModel):
+    model: str  # "" = back to auto
+
+@app.post("/api/avalon/target")
+def api_avalon_target_set(b: AvalonTargetBody):
+    if b.model:
+        p = Path(b.model).expanduser()
+        if not p.is_file():
+            raise HTTPException(404, f"model not found: {b.model}")
+        CFG["avalon_model"] = str(p)
+    else:
+        CFG["avalon_model"] = ""
+    _save_config_secure()
+    _avalon_target_invalidate()
+    tgt = _avalon_target()
+    return {"ok": True, "model": CFG["avalon_model"], "base": tgt["base"],
+            "has_draft": bool(tgt.get("draft"))}
+
 @app.get("/api/avalon/profiles")
 def api_avalon_profiles():
     out = []
     saved_all = CFG.get("avalon_tune") or {}
+    tgt = _avalon_target()
+    tgt_label = tgt["base"] if tgt["model"] else "no Flash-Next pack detected"
     for key, p in AVALON_PROFILES.items():
         defs = dict(p.get("defaults", {}))
         if key in saved_all and isinstance(saved_all[key], dict):
             defs.update(saved_all[key])
         cmd_str = " ".join(SMGR.build_args(key))
         out.append({
-            "key": key, "label": p["label"], "desc": p["desc"],
+            "key": key, "label": p["label"],
+            "desc": p["desc"].replace("125B MoE IQ3KS", tgt_label),
             "speed": p["speed"], "exclusive": p["exclusive"],
-            "draft": p.get("draft", False),
+            "draft": p.get("draft", False) and bool(tgt.get("draft")),
+            "model": tgt_label, "has_draft": bool(tgt.get("draft")),
             "defaults": defs,
             # What the user explicitly saved (empty = inherit profile defaults) — the tune
             # form restores this, not `defaults`, so unset fields stay unset.
             "saved": saved_all.get(key) if isinstance(saved_all.get(key), dict) else {},
             "cmd": _redact_cmd(cmd_str),
             "cmd_preview": _redact_cmd(cmd_str),
-            "available": Path(AVALON_BIN).exists() and AVALON_MODEL.exists(),
+            "available": Path(AVALON_BIN).exists() and bool(tgt.get("model")) and tgt["model"].exists(),
         })
     return out
 
@@ -2414,6 +2613,12 @@ class AvalonTuneBody(BaseModel):
     draft_n: int | None = None
     ubd: int | None = None
     parallel: int | None = None
+    device: str | None = None
+    ngl: int | None = None       # unset (absent) = auto-fit (-fit on); set = -ngl N -fit off
+    n_cmoe: int | None = None
+    fa: str | None = None
+    threads: int | None = None
+    mlock: bool | None = None
     preview: bool = False
 
 @app.post("/api/avalon/tune")
@@ -2423,11 +2628,13 @@ def api_avalon_tune(b: AvalonTuneBody):
     tune_dict = dict(b.tune or {})
     # The select-backed fields use 0 to mean "profile default"; draft_n/ubd are free number
     # inputs where an empty box is unset and a typed 0 means "drafting off" — so 0 is a value.
-    for k in ("ctx", "batch", "ubatch", "ctk", "ctv", "draft_n", "ubd", "parallel"):
+    for k in ("ctx", "batch", "ubatch", "ctk", "ctv", "draft_n", "ubd", "parallel",
+              "device", "ngl", "n_cmoe", "fa", "threads", "mlock"):
         val = getattr(b, k, None)
         if val is None or val == "":
             continue
-        if k in ("ctx", "parallel") and val == 0:
+        # 0 is "unset" for the count fields where 0 equals the default anyway.
+        if k in ("ctx", "parallel", "n_cmoe", "threads") and val == 0:
             continue
         tune_dict[k] = val
     cmd_str = " ".join(SMGR.build_args(b.profile, tune_dict))
@@ -2440,6 +2647,59 @@ def api_avalon_tune(b: AvalonTuneBody):
 @app.post("/api/avalon/stop")
 def api_avalon_stop():
     return SMGR.stop()
+
+# ---------------------------------------------------------------- avalon snapshots
+# A snapshot freezes one resolved launch (profile + exact tune) for one-click
+# restarts. Launch replays the stored tune through build_args, so the command is
+# byte-identical as long as the Avalon binary and model stay the same.
+
+class AvalonSnapBody(BaseModel):
+    name: str
+    profile: str | None = None
+    tune: dict | None = None
+
+class AvalonSnapLaunchBody(BaseModel):
+    id: str
+
+def _snap_list() -> list:
+    return CFG.setdefault("avalon_snapshots", [])
+
+@app.get("/api/avalon/snapshots")
+def api_avalon_snapshots():
+    return {"snapshots": _snap_list()}
+
+@app.post("/api/avalon/snapshots")
+def api_avalon_snapshot_save(b: AvalonSnapBody):
+    prof = b.profile or SMGR.status().get("profile") or "flagship"
+    if prof not in AVALON_PROFILES:
+        raise HTTPException(400, f"unknown avalon profile: {prof}")
+    tune = b.tune if b.tune is not None else (CFG.get("avalon_tune") or {}).get(prof)
+    cmd_str = " ".join(SMGR.build_args(prof, tune))
+    snap = {"id": uuid.uuid4().hex[:8], "name": (b.name or "").strip()[:80] or f"{prof} snapshot",
+            "profile": prof, "tune": tune, "created": int(time.time()),
+            "cmd": _redact_cmd(cmd_str)}
+    snaps = _snap_list()
+    snaps.insert(0, snap)
+    CFG["avalon_snapshots"] = snaps[:20]
+    _save_config_secure()
+    return snap
+
+@app.post("/api/avalon/snapshots/launch")
+def api_avalon_snapshot_launch(b: AvalonSnapLaunchBody):
+    snap = next((s for s in _snap_list() if s.get("id") == b.id), None)
+    if not snap:
+        raise HTTPException(404, "snapshot not found")
+    return SMGR.start(snap["profile"], snap.get("tune"))
+
+@app.delete("/api/avalon/snapshots/{sid}")
+def api_avalon_snapshot_delete(sid: str):
+    snaps = _snap_list()
+    kept = [s for s in snaps if s.get("id") != sid]
+    if len(kept) == len(snaps):
+        raise HTTPException(404, "snapshot not found")
+    CFG["avalon_snapshots"] = kept
+    _save_config_secure()
+    return {"ok": True}
 
 # ---------------------------------------------------------------- avalon access
 def _save_config_secure():
@@ -2905,18 +3165,21 @@ def _strata_alias() -> str:
     last = CFG.get("strata_last") or {}
     return str(last.get("model") or CFG.get("strata_alias") or "strata")
 
-def _current_llm():
-    """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running."""
+def _current_llm(prefer: str | None = None):
+    """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running.
+    `prefer` pins the source: None/'auto' keeps the fallback order; a source name answers
+    only that server, so the sync endpoint can say "this tab's server isn't running"."""
+    want = lambda s: prefer in (None, "auto", s)
     m = MGR.status()
-    if m.get("running") and m["port"] != AVALON_PORT:
+    if want("panel") and m.get("running") and m["port"] != AVALON_PORT:
         return m.get("alias"), m["port"], _proc_ctx(m["pid"]), "", "panel"
     a = SMGR.status()
-    if a.get("running"):
-        return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
-    if m.get("running"):  # discovery adopted the systemd avalon on 8086
-        return "qwen3.8-flash-next", AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+    if want("avalon") and a.get("running"):
+        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+    if want("avalon") and m.get("running"):  # discovery adopted the systemd avalon on 8086
+        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
     s = strata_status()
-    if s.get("running") and s.get("port"):
+    if want("strata") and s.get("running") and s.get("port"):
         # The key is only forwarded if the operator set strata_api_key deliberately. Strata
         # owns its own key (`strata launch --show-key`); auto-reading it would push a real
         # secret into every synced agent config and into panel state without being asked.
@@ -3090,18 +3353,30 @@ AGENTS = {
 
 @app.get("/api/agents")
 def api_agents():
+    m = MGR.status()
+    a = SMGR.status()
+    s = strata_status()
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
-            "running": _current_llm()}
+            "running": _current_llm(),
+            "sources": {
+                "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
+                "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
+                "strata": bool(s.get("running") and s.get("port")),
+            }}
 
 class AgentSyncBody(BaseModel):
     agents: list[str]
+    source: str | None = None  # auto | panel | avalon | strata
 
 @app.post("/api/agents/sync")
 def api_agents_sync(b: AgentSyncBody):
-    cur = _current_llm()
+    src = (b.source or "auto").lower()
+    cur = _current_llm(None if src == "auto" else src)
     if not cur:
-        raise HTTPException(409, "no running server — start a model first")
+        if src == "auto":
+            raise HTTPException(409, "no running server — start a model first")
+        raise HTTPException(409, f"the {src} server isn't running — start it on its tab first")
     alias, port, ctx, key, source = cur
     base = f"http://127.0.0.1:{port}"
     st = _load_agents_state()
@@ -3701,6 +3976,11 @@ input[type=range]{accent-color:var(--acc);width:100%;cursor:pointer}
 .fitbox .fit-top{display:flex;justify-content:space-between;gap:6px;color:var(--fg-2);font-weight:600}
 .fitbox .fit-sub{color:var(--mut);font-size:10.5px}
 .mrow .acts{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.shardlist{display:grid;gap:2px;margin:-4px 0 6px;padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
+.shardlist .shrow{display:flex;justify-content:space-between;gap:10px;padding:2px 4px;border-radius:5px;cursor:copy}
+.shardlist .shrow:hover{background:var(--border)}
+.shardlist .shrow code{font-size:10.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shardlist .shrow .hint{flex:none}
 .empty{text-align:center;color:var(--mut);padding:26px 12px;border:1px dashed var(--bd-2);border-radius:11px}
 .empty b{display:block;color:var(--fg-2);font-size:13.5px;margin-bottom:4px}
 
@@ -3993,6 +4273,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn danger" id="stratastopbtn" disabled>Stop</button>
       <button class="btn" id="stratadoctor">Run doctor</button>
       <button class="btn" id="strataupdate">Check update</button>
+      <button class="btn" id="strataagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at the running Strata server">Register in coding agents…</button>
       <span class="tag hide" id="stratakeychip" title="API key of the running launch (strata launch --show-key)"></span>
     </div>
   </div>
@@ -4055,11 +4336,17 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   <div class="card">
     <div class="hd"><h2>Avalon · Qwen3.8-Flash-Next (125B MoE)</h2><span class="tag" id="avalonchip">checking…</span></div>
     <div id="avalondetail" class="kvs" style="margin-bottom:10px"></div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:10px">
+      <span class="hint">Avalon target</span>
+      <select id="avtargetsel" style="min-width:280px;flex:1"><option>loading…</option></select>
+      <span class="hint" id="avtargetdraft"></span>
+    </div>
     <div id="avalonprofiles"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
       <button class="btn primary" id="avalonstart">Start selected profile</button>
       <button class="btn danger" id="avalonstop">Stop</button>
       <button class="btn acc2" id="avalontunebtn">Config Optimizer &amp; Tuning…</button>
+      <button class="btn" id="avalonagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at this Avalon server">Register in coding agents…</button>
       <span class="hint">OpenAI-compatible · streams <code>reasoning_content</code></span>
     </div>
 
@@ -4087,6 +4374,28 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <div style="display:flex;gap:6px"><input id="av-draft" type="number" placeholder="draft_n (3)" min="0" max="16" style="width:50%"><input id="av-ubd" type="number" placeholder="ubd (512)" min="64" max="2048" step="64" style="width:50%"></div></div>
         <div class="field"><label>Parallel slots (-np)</label>
           <select id="av-np"><option value="0">Profile default (1)</option><option value="1">1 slot</option><option value="2">2 slots</option><option value="4">4 slots</option></select></div>
+        <div class="field"><label>GPU device (--device)</label>
+          <select id="av-device">
+            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB) — recommended</option>
+            <option value="ROCm1">ROCm1 · 780M iGPU (32 GB GTT, shares system RAM)</option>
+            <option value="ROCm0,ROCm1">ROCm0 + ROCm1 split</option>
+          </select>
+          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build — any launch that touches it dies with “invalid device function”.</div></div>
+        <div class="field"><label>GPU layers (-ngl) · empty = auto-fit</label>
+          <input id="av-ngl" type="number" placeholder="auto-fit (-fit on)" min="0" max="999">
+          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM — this 88 GiB pack (40 dense + 48 expert + ~10 KV at 262k) never does.</div></div>
+        <div class="field"><label>MoE experts in CPU RAM (--n-cpu-moe)</label>
+          <input id="av-cmoe" type="number" placeholder="fork default (none forced)" min="0" max="999">
+          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM — forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
+        <div class="field"><label>Flash Attention (-fa)</label>
+          <select id="av-fa"><option value="">default (on)</option><option value="on">on — recommended on ROCm0</option><option value="off">off</option></select>
+          <div class="hint">On cuts KV memory and speeds prefill on NAVI31. Only relevant if you force the iGPU, which lacks the kernels anyway.</div></div>
+        <div class="field"><label>CPU threads (-t)</label>
+          <input id="av-threads" type="number" placeholder="fork default (all cores)" min="1" max="256">
+          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box) — SMT threads add contention, not throughput.</div></div>
+        <div class="field"><label>Lock weights in RAM (--mlock)</label>
+          <select id="av-mlock"><option value="">off — recommended</option><option value="on">on</option></select>
+          <div class="hint">With 48 GiB of experts, mlock would pin them resident and OOM this 61 GB machine. Leave off; the page cache does the job.</div></div>
       </div>
       <div style="margin-top:10px">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
@@ -4100,6 +4409,16 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <button class="btn sm primary" id="avapplystart">Save &amp; Restart Avalon</button>
       </div>
     </div>
+  </div>
+
+  <div class="card">
+    <div class="hd"><h2>One-click launches</h2>
+      <div style="display:flex;gap:6px;align-items:center">
+        <input id="avsnapname" type="text" placeholder="name this launch…" style="width:220px">
+        <button class="btn sm" id="avsnapsave">Save current</button>
+      </div></div>
+    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile + every tuning field exactly as resolved right now, and relaunches with one click — same command line, no re-tuning.</div>
+    <div id="avsnaps"></div>
   </div>
 
   <div class="card">
@@ -4618,6 +4937,7 @@ $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t))
 
 /* ============================== models & launch modal ============================== */
 let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
+const SHX=new Set(); // expanded multi-shard groups
 const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 
@@ -4653,7 +4973,9 @@ function modelRow(m,i){
   if(m.bench&&m.bench.gen_tps)tags.push('<span class="tag ok" title="Last benchmark speed">'+m.bench.gen_tps+' tok/s</span>');
   if(m.saved_profile)tags.push('<span class="tag mut" title="Custom launch profile saved">tuned</span>');
   if(running)tags.push('<span class="tag ok">loaded</span>');
-  return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'">'
+  const sh=m.shards&&m.shards.length>1;
+  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+(SHX.has(m.path)?'▾':'▸')+' '+m.shards.length+' shards</button>');
+  return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'"'+(sh?' data-shards="'+m.shards.length+'"':'')+'">'
     +'<button class="pinbtn'+(m.pinned?' on':'')+'" data-act="pin" title="'+(m.pinned?'Unpin model':'Pin model to top')+'" aria-label="Pin '+esc(m.name)+'">'+(m.pinned?STAR_ON:STAR_OFF)+'</button>'
     +'<div style="min-width:0"><div class="nm" title="'+esc(m.path)+'"><span>'+esc(m.name)+'</span></div>'
     +'<div class="pth">'+esc(m.path.replace(/^\/[^/]*\//,'/…/'))+'</div>'
@@ -4667,7 +4989,13 @@ function modelRow(m,i){
     +'<button class="btn primary sm" data-act="start">'+(running?'Reload':'Load')+'</button>'
     +'<button class="btn sm acc2" data-act="tune" title="Open Launch &amp; Config Optimizer">Tune &amp; Launch…</button>'
     +'<button class="btn xs" data-act="copy" title="Copy file path">Path</button>'
-    +'<button class="btn xs danger" data-act="del" title="Delete model file">Del</button></div></div>';
+    +'<button class="btn xs danger" data-act="del" title="'+(sh?'Delete all shard files of this pack':'Delete model file')+'">Del</button></div></div>';
+}
+function shardListHtml(m){
+  if(!(m.shards&&m.shards.length>1&&SHX.has(m.path)))return '';
+  return '<div class="shardlist">'+m.shards.map(s=>
+    '<div class="shrow" data-shardpath="'+esc(s.path)+'" title="Click to copy path"><code>'+esc(s.name)+'</code><span class="hint">'+gib(s.size)+'</span></div>'
+  ).join('')+'</div>';
 }
 function renderModels(){
   const q=$('#msearch').value.trim().toLowerCase();
@@ -4701,7 +5029,7 @@ function renderModels(){
       +(MODELS.length?'Clear the filter or press Rescan.':'Add files under a configured model dir in Settings, or use the HF Pull tab.')+'</div>';
     return;
   }
-  $('#modellist').innerHTML=list.map(m=>modelRow(m,MODELS.indexOf(m))).join('');
+  $('#modellist').innerHTML=list.map(m=>modelRow(m,MODELS.indexOf(m))+shardListHtml(m)).join('');
 }
 $('#msearch').addEventListener('input',renderModels);
 $('#msort').addEventListener('change',e=>{SORT=e.target.value;renderModels()});
@@ -4714,9 +5042,15 @@ $('#rescan').addEventListener('click',async()=>{
   b.disabled=false;
 });
 $('#modellist').addEventListener('click',async e=>{
+  const shr=e.target.closest('.shrow');
+  if(shr)return copy(shr.dataset.shardpath,'Shard path');
   const b=e.target.closest('[data-act]');if(!b)return;
   const row=b.closest('.mrow');const path=row.dataset.path;
   const m=MODELS.find(x=>x.path===path);
+  if(b.dataset.act==='shards'){
+    SHX.has(path)?SHX.delete(path):SHX.add(path);
+    renderModels();return;
+  }
   if(b.dataset.act==='pin'){
     try{const r=await post('/api/models/pin',{path,pinned:!(m&&m.pinned)});
       if(m)m.pinned=r.pinned;renderModels();}catch(err){toast('Pin failed: '+err.message,'err')}
@@ -4725,8 +5059,10 @@ $('#modellist').addEventListener('click',async e=>{
   if(b.dataset.act==='copy')return copy(path,'Path');
   if(b.dataset.act==='tune'){if(m)openLaunchModal(m);return;}
   if(b.dataset.act==='del'){
-    if(!await confirmDlg('Delete model','<b>'+esc(row.dataset.name)+'</b> ('+esc(row.dataset.size)+')<br><code>'
-      +esc(path)+'</code><br><br>This permanently removes the file from disk.','Delete',true))return;
+    const ns=row.dataset.shards;
+    const what=ns?('<b>'+ns+' shard files</b> of'):('the file');
+    if(!await confirmDlg('Delete model',what+' <b>'+esc(row.dataset.name)+'</b> ('+esc(row.dataset.size)+')<br><code>'
+      +esc(path)+(ns?'<br><span class="hint">…and '+(ns-1)+' more shards of this pack</span>':'')+'</code><br><br>This permanently removes '+(ns?'them all':'it')+' from disk.','Delete',true))return;
     b.disabled=true;
     try{const d=await post('/api/models/delete',{path});
       toast('Deleted · '+d.freed_h+' freed','ok');await loadModels()}
@@ -5375,10 +5711,14 @@ async function send(){
 }
 
 /* ============================== agents registry ============================== */
-$('#agentsbtn').addEventListener('click',async()=>{
+let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
+async function openAgentsDlg(source){
+  AGSRC=source||null;
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
   const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
+  const srcOk=!AGSRC||(d.sources&&d.sources[AGSRC]);
+  const srcLbl=AGSRC?('this tab’s server ('+AGSRC+')'):'any running server';
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
     return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'">'
@@ -5386,16 +5726,21 @@ $('#agentsbtn').addEventListener('click',async()=>{
       +(r?' <span class="tag ok">'+esc(r.alias)+'@'+r.port+' · '+esc(ago(r.synced_at))+'</span>':'')
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
-  $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>.</p>'
+  $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>'
+    +(AGSRC?' <span class="tag">'+esc(srcLbl)+'</span>':'')+'.</p>'
+    +(!srcOk?'<p class="hint" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'')
     +'<div style="max-height:46vh;overflow:auto">'+rows+'</div><div id="agres" style="margin-top:10px"></div>';
   $('#agentsdlg').showModal();
-});
+}
+$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
+$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
+$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata'));
 $('#ag-apply').addEventListener('click',async()=>{
   const apply=$('#ag-apply');
   const picks=$$('.agchk',$('#agentsdlg')).filter(x=>x.checked).map(x=>x.value);
   if(!picks.length)return toast('Pick at least one agent','warn');
   apply.disabled=true;apply.textContent='Applying…';
-  let r;try{r=await post('/api/agents/sync',{agents:picks})}
+  let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
   catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
   $('#agres').innerHTML=Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
@@ -5572,6 +5917,8 @@ async function loadAvalon(){
     if(selProf&&selProf.cmd_preview&&!$('#avcmdpreview').textContent)$('#avcmdpreview').textContent=selProf.cmd_preview;
     const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log);
     drawHeader();drawChatTarget();
+    loadAvalonSnaps();
+    loadAvalonTargets();
   }catch(e){}
 }
 function getAvalonTuneForm(){
@@ -5586,7 +5933,13 @@ function getAvalonTuneForm(){
     ctv:$('#av-ctv').value,
     draft_n:num($('#av-draft').value),
     ubd:num($('#av-ubd').value),
-    parallel:Number($('#av-np').value)||0
+    parallel:Number($('#av-np').value)||0,
+    device:$('#av-device').value||null,
+    ngl:num($('#av-ngl').value),
+    n_cmoe:num($('#av-cmoe').value),
+    fa:$('#av-fa').value||null,
+    threads:num($('#av-threads').value),
+    mlock:$('#av-mlock').value==='on'?true:null
   };
 }
 function setAvalonTuneForm(t){
@@ -5601,6 +5954,12 @@ function setAvalonTuneForm(t){
   $('#av-draft').value=v(t.draft_n);
   $('#av-ubd').value=v(t.ubd);
   $('#av-np').value=String(t.parallel||0);
+  $('#av-device').value=t.device||'ROCm0';
+  $('#av-ngl').value=v(t.ngl);
+  $('#av-cmoe').value=v(t.n_cmoe);
+  $('#av-fa').value=t.fa||'';
+  $('#av-threads').value=v(t.threads);
+  $('#av-mlock').value=t.mlock?'on':'';
 }
 async function previewAvalonTune(){
   try{
@@ -5629,6 +5988,58 @@ $('#avsavetune').addEventListener('click',async()=>{
 $('#avapplystart').addEventListener('click',async()=>{
   try{await post('/api/avalon/tune',getAvalonTuneForm());$('#avalonstart').click();}
   catch(e){toast('Failed: '+e.message,'err')}
+});
+/* ---- avalon target picker ---- */
+async function loadAvalonTargets(){
+  try{
+    const d=await api('/api/avalon/targets');
+    const sel=$('#avtargetsel');
+    sel.innerHTML=(d.targets||[]).map(t=>'<option value="'+esc(t.path)+'"'+(t.current?' selected':'')+'>'
+      +esc(t.base)+(t.size_h?' · '+esc(t.size_h):'')+(t.shards>1?' · '+t.shards+' shards':'')+(t.draft?' · MTP':'')+'</option>').join('');
+    $('#avtargetdraft').textContent=d.has_draft?'MTP draft available':'no MTP draft for this pack';
+  }catch(e){}
+}
+$('#avtargetsel').addEventListener('change',async()=>{
+  const v=$('#avtargetsel').value;
+  try{
+    const r=await post('/api/avalon/target',{model:v});
+    toast('Avalon target: '+(r.base||'auto'),'ok');
+    loadAvalon();
+  }catch(e){toast('Target change failed: '+e.message,'err');loadAvalonTargets();}
+});
+/* ---- one-click snapshots ---- */
+async function loadAvalonSnaps(){
+  try{
+    const d=await api('/api/avalon/snapshots');
+    const el=$('#avsnaps');
+    if(!(d.snapshots||[]).length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
+    el.innerHTML=d.snapshots.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
+      +'<span style="flex:1;min-width:0"><b>'+esc(s.name)+'</b> <span class="tag mut">'+esc(s.profile)+'</span><br>'
+      +'<span class="hint">'+esc(s.cmd||'')+'</span></span>'
+      +'<button class="btn sm primary" data-snaplaunch="'+esc(s.id)+'">Launch</button>'
+      +'<button class="btn xs" data-snapdel="'+esc(s.id)+'">✕</button></div>').join('');
+    $$('[data-snaplaunch]').forEach(b=>b.addEventListener('click',async()=>{
+      b.disabled=true;
+      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting — a 125B load takes a while','ok');loadAvalon();}
+      catch(e){toast('Launch failed: '+e.message,'err',12000);b.disabled=false;}
+    }));
+    $$('[data-snapdel]').forEach(b=>b.addEventListener('click',async()=>{
+      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});loadAvalonSnaps();}
+      catch(e){toast('Delete failed: '+e.message,'err')}
+    }));
+  }catch(e){}
+}
+$('#avsnapsave').addEventListener('click',async()=>{
+  const name=$('#avsnapname').value.trim();
+  const f=getAvalonTuneForm();
+  const prof=f.profile||ASEL||'flagship';
+  delete f.profile;
+  try{
+    const r=await post('/api/avalon/snapshots',{name:name,profile:prof,tune:f});
+    $('#avsnapname').value='';
+    toast('Saved launch “'+(r.name||name)+'”','ok');
+    loadAvalonSnaps();
+  }catch(e){toast('Save failed: '+e.message,'err')}
 });
 function paintInto(el,text){
   if(el.dataset.raw===text)return;el.dataset.raw=text;
