@@ -4,7 +4,7 @@
 Single-file FastAPI app. Dependencies: fastapi, uvicorn, httpx.
 Config: ~/.config/lfm-panel/config.json (created with defaults on first run).
 """
-import json, os, re, secrets, shutil, signal, socket, struct, subprocess, threading, time, uuid
+import json, os, re, secrets, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, uuid, zipfile, platform
 from collections import deque
 from pathlib import Path
 
@@ -3244,6 +3244,218 @@ def api_settings_set(b: SettingsBody):
     _save_config_secure()
     return api_settings_get()
 
+# ---------------------------------------------------------------- engine setup (one-click installs)
+# One background job at a time: download/build runs stream log lines the UI polls.
+# The panel admin API can already launch arbitrary binaries, so installing official
+# upstream artifacts here stays inside the same trust boundary — but every install
+# still requires an explicit confirm from the UI.
+SETUP_JOB = {"name": None, "state": "idle", "log": deque(maxlen=500), "started": 0.0}
+_SETUP_LOCK = threading.Lock()
+
+def _setup_log(line: str):
+    SETUP_JOB["log"].append(line)
+
+def _llama_asset_name(sysname: str, machine: str, variant: str = "auto") -> str | None:
+    """Which official llama.cpp release asset fits this host + backend variant."""
+    machine = (machine or "").lower()
+    arch = "arm64" if machine in ("arm64", "aarch64") else "x64"
+    if sysname.startswith("darwin"):
+        return f"bin-macos-{'arm64' if arch == 'arm64' else 'x64'}.tar.gz"
+    if sysname.startswith("win"):
+        if variant == "cpu":
+            return f"bin-win-cpu-{arch}.zip"
+        return f"bin-win-vulkan-{arch}.zip"
+    if sysname.startswith("linux"):
+        if variant == "cpu":
+            return f"bin-ubuntu-{arch}.tar.gz"
+        return f"bin-ubuntu-vulkan-{arch}.tar.gz"
+    return None
+
+def _pick_llama_asset(assets: list[dict], sysname: str, machine: str,
+                      variant: str = "auto") -> dict | None:
+    """assets = [{name, browser_download_url}]. cuda variants match any cuda build."""
+    want = _llama_asset_name(sysname, machine, variant)
+    if not want:
+        return None
+    names = [a.get("name", "") for a in assets]
+    if variant.startswith("cuda"):
+        arch = "arm64" if (machine or "").lower() in ("arm64", "aarch64") else "x64"
+        toks = ("cuda", arch)
+        for n in names:
+            if n.startswith("llama-") and all(t in n for t in toks) and (n.endswith(".tar.gz") or n.endswith(".zip")):
+                return next(a for a in assets if a.get("name") == n)
+        return None
+    for a in assets:
+        if a.get("name", "").endswith(want) and a["name"].startswith("llama-"):
+            return a
+    return None
+
+def _latest_llama_release() -> tuple[str, dict] | None:
+    """First recent release that actually carries binary assets (the 'latest' endpoint
+    sometimes points at an assets-less nightly tag)."""
+    try:
+        r = httpx.get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8",
+                      headers={"User-Agent": "lfm-panel"}, timeout=20)
+        r.raise_for_status()
+        for rel in r.json():
+            assets = rel.get("assets") or []
+            if assets:
+                return rel.get("tag_name", ""), {a["name"]: a.get("browser_download_url", "") for a in assets}
+    except Exception as e:
+        _setup_log(f"llama.cpp: release lookup failed: {type(e).__name__}: {e}")
+    return None
+
+def _install_llama(variant: str = "auto"):
+    rel = _latest_llama_release()
+    if not rel:
+        raise HTTPException(503, "could not reach the llama.cpp releases API")
+    tag, urls = rel
+    assets = [{"name": n, "browser_download_url": u} for n, u in urls.items()]
+    asset = _pick_llama_asset(assets, sys.platform, platform.machine(), variant)
+    if not asset or not asset.get("browser_download_url"):
+        raise HTTPException(400, f"no llama.cpp build for {sys.platform}/{platform.machine()} variant={variant}")
+    name = asset["name"]
+    dest = APP_DIR / f"llama-{tag}"
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    archive = dest / name
+    _setup_log(f"llama.cpp: downloading {name}")
+    got = 0
+    last_report = 0.0
+    with httpx.stream("GET", asset["browser_download_url"], timeout=httpx.Timeout(30, read=300),
+                      follow_redirects=True) as r:
+        r.raise_for_status()
+        with open(archive, "wb") as f:
+            for chunk in r.iter_bytes(1 << 16):
+                f.write(chunk)
+                got += len(chunk)
+                if time.time() - last_report > 2:
+                    last_report = time.time()
+                    _setup_log(f"  … {got / 2**20:.0f} MB")
+    _setup_log(f"llama.cpp: extracting into {dest}")
+    if name.endswith(".tar.gz"):
+        with tarfile.open(archive, "r:gz") as tf:
+            tf.extractall(dest, filter="data")
+    else:
+        with zipfile.ZipFile(archive) as zf:
+            zf.extractall(dest)
+    archive.unlink(missing_ok=True)
+    exe = "llama-server.exe" if sys.platform.startswith("win") else "llama-server"
+    hits = [p for p in dest.rglob(exe) if p.is_file()]
+    if not hits:
+        raise HTTPException(500, "archive extracted but no llama-server binary found")
+    binary = hits[0]
+    binary.chmod(0o755)
+    CFG["server_binary"] = str(binary)
+    _save_config_secure()
+    caps = bin_caps(str(binary))
+    _setup_log(f"llama.cpp: installed {caps.get('version') or tag} at {binary}")
+    _setup_log("server_binary updated in config — the llama.cpp tab now uses this build")
+
+def _install_strata():
+    _setup_log("Strata: running the official installer")
+    try:
+        p = subprocess.run(["sh", "-c", STRATA_INSTALL_CMD], capture_output=True, text=True,
+                           timeout=900)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "Strata installer timed out after 900s")
+    for ln in ((p.stdout or "") + "\n" + (p.stderr or "")).splitlines():
+        if ln.strip():
+            _setup_log(ln)
+    if p.returncode != 0:
+        raise HTTPException(502, f"Strata installer exited {p.returncode}")
+    b = strata_bin()
+    if not b:
+        raise HTTPException(502, "installer finished but no strata binary was found")
+    _setup_log(f"Strata: installed at {b}")
+
+def _build_avalon():
+    src = HOME / "avalon"
+    if not src.is_dir():
+        raise HTTPException(400, f"no Avalon source at {src} — clone it there first")
+    _setup_log("Avalon: configuring cmake build")
+    steps = [["cmake", "-B", "build"], ["cmake", "--build", "build", "--config", "Release",
+                                        "--target", "llama-server", "-j", str(os.cpu_count() or 4)]]
+    for cmd in steps:
+        p = subprocess.run(cmd, cwd=str(src), capture_output=True, text=True, timeout=3600)
+        for ln in ((p.stdout or "") + "\n" + (p.stderr or "")).splitlines()[-40:]:
+            if ln.strip():
+                _setup_log(ln)
+        if p.returncode != 0:
+            raise HTTPException(502, f"{cmd[1] if len(cmd)>1 else cmd[0]} exited {p.returncode}")
+    if Path(AVALON_BIN).exists():
+        _setup_log(f"Avalon: built {AVALON_BIN}")
+    else:
+        raise HTTPException(502, "build finished but build/bin/llama-server is missing")
+
+def _setup_job_wrap(fn):
+    try:
+        fn()
+        SETUP_JOB["state"] = "done"
+        _setup_log("done.")
+    except HTTPException as e:
+        SETUP_JOB["state"] = "failed"
+        _setup_log(f"failed: {e.detail}")
+    except Exception as e:
+        SETUP_JOB["state"] = "failed"
+        _setup_log(f"failed: {type(e).__name__}: {e}")
+
+def _setup_start(name: str, fn):
+    with _SETUP_LOCK:
+        if SETUP_JOB["state"] == "running":
+            raise HTTPException(409, f"setup job already running: {SETUP_JOB['name']}")
+        SETUP_JOB.update(name=name, state="running", started=time.time())
+        SETUP_JOB["log"].clear()
+    threading.Thread(target=_setup_job_wrap, args=(fn,), daemon=True).start()
+    return {"started": name}
+
+class SetupInstallBody(BaseModel):
+    engine: str                 # llama | strata | avalon
+    variant: str = "auto"       # llama only: auto | cpu | vulkan | cuda
+    confirm: bool = False
+
+@app.get("/api/setup/status")
+def api_setup_status():
+    bin_path = CFG.get("server_binary", BIN)
+    caps = bin_caps(bin_path)
+    latest = None
+    updatable = False
+    if caps.get("exists"):
+        rel = _latest_llama_release()
+        if rel:
+            latest = rel[0]
+            # Release tags look like "b12430"; `--version` reports "build 12430" —
+            # compare the build number, not the raw tag substring.
+            build = re.sub(r"^[A-Za-z]+", "", latest or "")
+            updatable = bool(build and build not in (caps.get("version") or ""))
+    sbin = strata_bin()
+    return {
+        "llama": {"installed": bool(caps.get("exists")), "binary": bin_path,
+                  "version": caps.get("version", ""), "latest": latest or "",
+                  "update_available": updatable,
+                  "platform": f"{sys.platform}/{platform.machine()}"},
+        "strata": {"installed": bool(sbin), "binary": sbin or "",
+                   "install_cmd": STRATA_INSTALL_CMD},
+        "avalon": {"installed": Path(AVALON_BIN).exists(), "binary": AVALON_BIN,
+                   "source": str(HOME / "avalon"), "source_exists": (HOME / "avalon").is_dir()},
+        "job": {"name": SETUP_JOB["name"], "state": SETUP_JOB["state"],
+                "log": list(SETUP_JOB["log"])[-60:], "started": SETUP_JOB["started"]},
+    }
+
+@app.post("/api/setup/install")
+def api_setup_install(b: SetupInstallBody):
+    if not b.confirm:
+        raise HTTPException(400, "install requires confirm: true")
+    if b.engine == "llama":
+        return _setup_start(f"llama.cpp ({b.variant})", lambda: _install_llama(b.variant))
+    if b.engine == "strata":
+        return _setup_start("Strata", _install_strata)
+    if b.engine == "avalon":
+        return _setup_start("Avalon build", _build_avalon)
+    raise HTTPException(400, f"unknown engine: {b.engine}")
+
+# ---------------------------------------------------------------- chat api
 @app.post("/api/chat")
 async def api_chat(req: Request):
     tgt = _chat_target()
@@ -3962,6 +4174,36 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 
 <!-- ==================== SETTINGS ==================== -->
 <section id="t-settings" class="hide">
+  <div class="card" style="margin-bottom:14px">
+    <div class="hd"><h2>Engine setup</h2><span class="tag mut" id="setupjobchip">idle</span></div>
+    <p class="hint" style="margin:0 0 10px">One-click installs pull official upstream artifacts (llama.cpp GitHub releases, the official Strata installer). Avalon builds from your local source tree. Each action asks for confirmation and streams its log below.</p>
+    <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+      <div class="field">
+        <label>llama.cpp <span id="setup-llama-chip" class="tag mut">checking…</span></label>
+        <div class="kvs" id="setup-llama-detail" style="margin-bottom:6px"></div>
+        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <select id="setup-llama-variant" style="width:130px">
+            <option value="auto">auto backend</option>
+            <option value="cpu">cpu only</option>
+            <option value="vulkan">vulkan</option>
+            <option value="cuda">cuda</option>
+          </select>
+          <button class="btn primary sm" id="setup-llama-btn">Install latest</button>
+        </div>
+      </div>
+      <div class="field">
+        <label>Strata <span id="setup-strata-chip" class="tag mut">checking…</span></label>
+        <div class="kvs" id="setup-strata-detail" style="margin-bottom:6px"></div>
+        <button class="btn primary sm" id="setup-strata-btn">Install (official installer)</button>
+      </div>
+      <div class="field">
+        <label>Avalon <span id="setup-avalon-chip" class="tag mut">checking…</span></label>
+        <div class="kvs" id="setup-avalon-detail" style="margin-bottom:6px"></div>
+        <button class="btn sm" id="setup-avalon-btn">Build from source</button>
+      </div>
+    </div>
+    <pre class="log hide" id="setuplog" style="max-height:220px;margin-top:10px"></pre>
+  </div>
   <div class="card">
     <div class="hd"><h2>Panel &amp; Runtime Settings</h2><span class="tag mut" id="set-caps-badge"></span></div>
     <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
@@ -4353,7 +4595,7 @@ function setTab(t){
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
   if(t==='strata'){loadStrata();loadStrataPresets();}
   if(t==='avalon'){loadAvalon();loadAvalonAccess();}
-  if(t==='settings')loadSettings();
+  if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
@@ -5517,6 +5759,54 @@ $('#downloads').addEventListener('click',e=>{
 });
 
 /* ============================== settings ============================== */
+/* ============================== engine setup ============================== */
+let SETUP=null,SETUPTIMER=null;
+async function loadSetup(){
+  try{SETUP=await api('/api/setup/status');drawSetup()}catch(e){}
+}
+function drawSetup(){
+  if(!SETUP)return;
+  const L=SETUP.llama||{},S=SETUP.strata||{},A=SETUP.avalon||{},J=SETUP.job||{};
+  const chip=(id,ok,txt)=>{const c=$(id);c.textContent=txt;c.className='tag '+(ok?'ok':'err')};
+  chip('#setup-llama-chip',L.installed,L.installed?(L.update_available?'update available':'installed'):'not installed');
+  $('#setup-llama-detail').innerHTML=[L.version?('version '+L.version):null,L.binary?('bin '+L.binary):null,
+    L.update_available?('latest release '+(L.latest||'')):null,L.platform?('target '+L.platform):null]
+    .filter(Boolean).map(x=>'<span class="tag">'+esc(x)+'</span>').join('');
+  $('#setup-llama-btn').textContent=L.installed?(L.update_available?'Update to '+(L.latest||'latest'):'Reinstall latest'):'Install latest';
+  chip('#setup-strata-chip',S.installed,S.installed?'installed':'not installed');
+  $('#setup-strata-detail').innerHTML=S.binary?'<span class="tag">bin '+esc(S.binary)+'</span>':'<span class="hint">official one-line installer</span>';
+  chip('#setup-avalon-chip',A.installed,A.installed?'built':(A.source_exists?'source present':'no source'));
+  $('#setup-avalon-detail').innerHTML=[A.source?('src '+A.source):null,A.installed?('bin '+A.binary):null]
+    .filter(Boolean).map(x=>'<span class="tag">'+esc(x)+'</span>').join('')||'<span class="hint">clone Avalon into ~/avalon first</span>';
+  $('#setup-avalon-btn').disabled=!A.source_exists;
+  const jc=$('#setupjobchip');
+  jc.textContent=J.state==='running'?(J.name||'job')+'…':J.state;
+  jc.className='tag '+(J.state==='running'?'warn':J.state==='failed'?'err':J.state==='done'?'ok':'mut');
+  const box=$('#setuplog');
+  if(J.log&&J.log.length){box.classList.remove('hide');paintInto(box,J.log.join('\n'))}
+  const running=J.state==='running';
+  $$('#t-settings button[id^="setup-"][id$="-btn"]').forEach(b=>b.disabled=running);
+  if(running&&!SETUPTIMER)SETUPTIMER=setInterval(()=>{loadSetup();if(tab!=='settings'){clearInterval(SETUPTIMER);SETUPTIMER=null}},1500);
+  if(!running&&SETUPTIMER){clearInterval(SETUPTIMER);SETUPTIMER=null}
+  if(J.state==='done'&&!SETUP._told){SETUP._told=true;toast('Engine setup finished','ok');loadSettings();loadModels();pollStatus(true)}
+  if(J.state==='failed'&&!SETUP._toldf){SETUP._toldf=true;toast('Engine setup failed — see log','err',8000)}
+}
+async function setupInstall(engine,variant,msg){
+  if(!await confirmDlg('Engine setup',msg,'Install',false))return;
+  try{await post('/api/setup/install',{engine,variant,confirm:true});toast('Setup started: '+engine,'ok');loadSetup()}
+  catch(e){toast('Setup failed: '+e.message,'err',8000)}
+}
+$('#setup-llama-btn').addEventListener('click',()=>{
+  const v=$('#setup-llama-variant').value;
+  setupInstall('llama',v,'Download the latest official llama.cpp release build for this machine ('+(SETUP&&SETUP.llama.platform||'')+'), unpack it under the panel data dir, and point server_binary at it?');
+});
+$('#setup-strata-btn').addEventListener('click',()=>{
+  setupInstall('strata','auto','Run the official Strata installer script on this machine? It downloads the engine for your GPU.');
+});
+$('#setup-avalon-btn').addEventListener('click',()=>{
+  setupInstall('avalon','auto','Configure and build llama-server from ~/avalon (cmake, full target)? This can take a while.');
+});
+
 async function loadSettings(){
   try{
     const s=await api('/api/settings');
@@ -5578,6 +5868,7 @@ function buildPaletteItems(){
     items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
   }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
+  items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
   items.push({label:'Toggle light / dark theme',sub:'Appearance',run:()=>$('#theme').click()});
   items.push({label:'Rescan model directories',sub:'Models',run:()=>$('#rescan').click()});
   MODELS.forEach(m=>{
@@ -5667,7 +5958,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('lfm.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('lfm.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();
+refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
