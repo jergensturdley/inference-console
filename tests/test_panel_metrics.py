@@ -18,7 +18,7 @@ import types
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
-HOME_TMP = tempfile.mkdtemp(prefix="lfm-panel-home-")
+HOME_TMP = tempfile.mkdtemp(prefix="inference-console-home-")
 os.environ["HOME"] = HOME_TMP          # must be set before panel is imported
 sys.path.insert(0, str(REPO))
 
@@ -1055,7 +1055,7 @@ def test_launch_secrets_are_redacted_in_every_exposed_surface():
 def test_agent_toml_invalid_leaves_file_untouched():
     """A TOML error must fail before the write, not after leaving the config mangled."""
     real_home = panel.HOME
-    h = Path(tempfile.mkdtemp(prefix="lfm-agents-"))
+    h = Path(tempfile.mkdtemp(prefix="inference-console-agents-"))
     panel.HOME = h
     try:
         p = h / ".codex" / "config.toml"
@@ -1074,7 +1074,7 @@ def test_agent_toml_invalid_leaves_file_untouched():
         p.write_text('model = "o3"\n')
         panel._w_codex("model-a", "http://127.0.0.1:8830", 8192)
         after = p.read_text()
-        assert "model_providers.lfm-panel" in after and 'model = "o3"' in after
+        assert "model_providers.inference-console" in after and 'model = "o3"' in after
         import tomllib
         tomllib.loads(after)
     finally:
@@ -1373,6 +1373,38 @@ def test_setup_status_shape_without_binaries():
             os.environ.pop("STRATA_BIN", None)
         else:
             os.environ["STRATA_BIN"] = ov_env
+
+
+def test_legacy_path_migration_moves_once_and_never_clobbers():
+    import shutil as _sh
+    from pathlib import Path as _P
+    root = _P(HOME_TMP) / "migr"
+    ov = (panel.HOME, panel.APP_DIR, panel.CONFIG_PATH,
+          panel.LEGACY_APP_DIR, panel.LEGACY_CONFIG)
+    try:
+        _sh.rmtree(root, ignore_errors=True)
+        (root / ".config" / "lfm-panel").mkdir(parents=True)
+        (root / ".config" / "lfm-panel" / "config.json").write_text('{"ctx": 12345}')
+        (root / ".local" / "share" / "lfm-panel").mkdir(parents=True)
+        (root / ".local" / "share" / "lfm-panel" / "state.json").write_text('{"a": 1}')
+        panel.APP_DIR = root / ".local" / "share" / "inference-console"
+        panel.CONFIG_PATH = root / ".config" / "inference-console" / "config.json"
+        panel.LEGACY_APP_DIR = root / ".local" / "share" / "lfm-panel"
+        panel.LEGACY_CONFIG = root / ".config" / "lfm-panel" / "config.json"
+        panel._migrate_legacy_paths()
+        assert json.loads(panel.CONFIG_PATH.read_text())["ctx"] == 12345
+        assert json.loads((panel.APP_DIR / "state.json").read_text()) == {"a": 1}
+        assert not panel.LEGACY_CONFIG.exists()      # moved, not copied
+        # Second run is a no-op even when new files change: never clobber.
+        panel.CONFIG_PATH.write_text('{"ctx": 999}')
+        (root / ".config" / "lfm-panel").mkdir(parents=True, exist_ok=True)  # dir survives; only the file moved
+        (root / ".config" / "lfm-panel" / "config.json").write_text('{"ctx": 1}')
+        panel._migrate_legacy_paths()
+        assert json.loads(panel.CONFIG_PATH.read_text())["ctx"] == 999
+    finally:
+        (panel.HOME, panel.APP_DIR, panel.CONFIG_PATH,
+         panel.LEGACY_APP_DIR, panel.LEGACY_CONFIG) = ov
+        _sh.rmtree(root, ignore_errors=True)
 
 
 if __name__ == "__main__":

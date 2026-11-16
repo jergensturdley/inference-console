@@ -1,26 +1,30 @@
-# LFM Panel
+# Inference Console
 
 Single-file FastAPI app: local model library, engine managers (llama.cpp, Strata,
 Avalon), system vitals, chat.
-Runs at `:8817` as the `lfm-panel.service` systemd user unit; manages one llama.cpp
+Runs at `:8817` as the `inference-console.service` systemd user unit; manages one llama.cpp
 child server (ports 8830-8839), the Strata CLI (`strata launch`), and the
 `avalon-flashnext.service` eGPU llama-server.
+
+Formerly `lfm-panel`; config and data migrate automatically from
+`~/.config/lfm-panel` / `~/.local/share/lfm-panel` on first run. The port env var
+`LFM_PANEL_PORT` still works as a fallback for `INFER_CONSOLE_PORT`.
 
 ## Run
 
 ```bash
 python3 -m venv venv
 venv/bin/pip install -r requirements.txt
-systemctl --user enable --now ~/.config/systemd/user/lfm-panel.service
+systemctl --user enable --now ~/.config/systemd/user/inference-console.service
 # http://127.0.0.1:8817  (login = your sudo password)
 ```
 
 ## Layout
 
 - `panel.py` — the whole app (UI is an inline HTML string)
-- `deploy/lfm-panel.service` — systemd user unit
-- Config: `~/.config/lfm-panel/config.json`
-- Runtime state (git-ignored): `venv/`, `bin/` (llama-server build), `chats/`, `*.json`, `*.bak.*`
+- `deploy/inference-console.service` — systemd user unit
+- Config: `~/.config/inference-console/config.json`
+- Runtime state (git-ignored): `venv/`, `bin/` (llama-server builds), `chats/`, `*.json`, `*.bak.*`
 
 ## Features
 

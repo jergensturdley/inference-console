@@ -1,0 +1,14 @@
+[Unit]
+Description=Inference Console - local model library, engine managers, vitals
+After=network.target
+
+[Service]
+Environment=INFER_CONSOLE_PORT=8817
+KillMode=process
+ExecStart=%h/.local/share/inference-console/venv/bin/python %h/.local/share/inference-console/panel.py
+WorkingDirectory=%h/.local/share/inference-console
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target
