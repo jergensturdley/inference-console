@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""LFM Panel — local model library, llama-server control, system vitals, chat.
+"""Inference Console — local model library, llama-server control, system vitals, chat.
 
 Single-file FastAPI app. Dependencies: fastapi, uvicorn, httpx.
-Config: ~/.config/lfm-panel/config.json (created with defaults on first run).
+Config: ~/.config/inference-console/config.json (created with defaults on first run).
 """
 import json, os, re, secrets, shutil, signal, socket, struct, subprocess, sys, tarfile, threading, time, uuid, zipfile, platform
 from collections import deque
@@ -15,11 +15,11 @@ from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse, Red
 from pydantic import BaseModel
 
 HOME = Path.home()
-APP_DIR = HOME / ".local/share/lfm-panel"
-CONFIG_PATH = HOME / ".config/lfm-panel/config.json"
+APP_DIR = HOME / ".local/share/inference-console"
+CONFIG_PATH = HOME / ".config/inference-console/config.json"
 STATE_PATH = APP_DIR / "state.json"
 BIN = str(APP_DIR / "bin/llama-server")
-PORT = int(os.environ.get("LFM_PANEL_PORT", "8817"))
+PORT = int(os.environ.get("INFER_CONSOLE_PORT") or os.environ.get("LFM_PANEL_PORT") or "8817")
 CHILD_PORTS = list(range(8830, 8840))
 
 DEFAULT_CONFIG = {
@@ -45,6 +45,21 @@ DEFAULT_CONFIG = {
 }
 
 # ---------------------------------------------------------------- config
+LEGACY_APP_DIR = HOME / ".local/share/lfm-panel"
+LEGACY_CONFIG = HOME / ".config/lfm-panel/config.json"
+
+def _migrate_legacy_paths():
+    """One-time rename from the old lfm-panel install layout. Only moves when the new
+    location is absent, so it is a no-op after the first run and never clobbers."""
+    try:
+        if not CONFIG_PATH.exists() and LEGACY_CONFIG.exists():
+            CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            shutil.move(str(LEGACY_CONFIG), str(CONFIG_PATH))
+        if not APP_DIR.exists() and LEGACY_APP_DIR.exists():
+            shutil.move(str(LEGACY_APP_DIR), str(APP_DIR))
+    except OSError:
+        pass  # a failed migration must not brick the panel; it just starts with defaults
+
 def load_config():
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     if not CONFIG_PATH.exists():
@@ -54,6 +69,7 @@ def load_config():
         cfg.setdefault(k, v)
     return cfg
 
+_migrate_legacy_paths()
 CFG = load_config()
 APP_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1113,7 +1129,7 @@ AVALON_PROFILES = {
     "flagship": {
         "label": "Flash-Next 262k (flagship)",
         "desc": "125B MoE IQ3KS · 262k context · MTP drafting on",
-        "speed": "≈98 tok/s gen · needs the LFM server stopped (VRAM)",
+        "speed": "≈98 tok/s gen · needs the llama.cpp server stopped (VRAM)",
         "exclusive": True,
         "draft": True,
         "defaults": {"ctx": 262144, "batch": 9536, "ubatch": 9536, "ctk": "q8_0", "ctv": "q4_0", "draft_n": 2, "ubd": 256, "parallel": 1},
@@ -1121,7 +1137,7 @@ AVALON_PROFILES = {
     "prefast": {
         "label": "Fast ingestion",
         "desc": "125B MoE IQ3KS · 262k context · drafting off · prompt reading ≈2× faster",
-        "speed": "needs the LFM server stopped (VRAM)",
+        "speed": "needs the llama.cpp server stopped (VRAM)",
         "exclusive": True,
         "draft": False,
         "defaults": {"ctx": 262144, "batch": 9536, "ubatch": 9536, "ctk": "q8_0", "ctv": "q4_0", "draft_n": 0, "ubd": 256, "parallel": 1},
@@ -1236,7 +1252,7 @@ class AvalonManager:
         if not AVALON_MODEL.exists():
             raise HTTPException(404, "model shards missing — finish the Qwen3.8-Flash-Next download first.")
         if p["exclusive"] and self._gpu_conflict():
-            raise HTTPException(409, "Stop the LFM server first — this profile needs its VRAM.")
+            raise HTTPException(409, "Stop the llama.cpp server first — this profile needs its VRAM.")
         if self.status()["running"] or not self._port_free():
             self.stop()
         for _ in range(150):
@@ -1310,7 +1326,7 @@ class AvalonManager:
                 cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
             except Exception:
                 continue
-            if "lfm-panel" in cmd or "panel.py" in cmd:
+            if "inference-console" in cmd or "panel.py" in cmd:
                 continue
             if "avalon/build/bin/llama-server" in cmd:
                 victims.append(int(d.name))
@@ -1527,22 +1543,22 @@ def _chat_file(cid: str) -> Path:
         raise HTTPException(400, "bad chat id")
     return CHATS_DIR / f"{cid}.json"
 
-app = FastAPI(title="LFM Panel")
+app = FastAPI(title="Inference Console")
 
 # ---------------------------------------------------------------- auth (sudo password)
 # Password is validated live against sudo (same credential as terminal sudo).
 # Every failed check counts toward PAM faillock (deny=10, unlock=120s), so the
 # web limiter below must trip first: 5 failures / 5 min per IP.
-SESSION_COOKIE = "lfm_sid"
+SESSION_COOKIE = "ic_sid"
 SESSION_TTL = 7 * 24 * 3600
 _sessions: dict = {}   # token -> expiry (unix time)
 _fails: dict = {}      # ip -> deque(failure unix times)
 
 LOGIN_HTML = r"""<!doctype html>
-<html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>LFM Panel — Sign in</title>
+<html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>Inference Console — Sign in</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<script>try{const t=localStorage.getItem('lfm.theme');if(t==='light'||t==='dark'){document.documentElement.dataset.theme=t;document.querySelector('meta[name="color-scheme"]').content=t}}catch(_){}</script>
+<script>try{const t=localStorage.getItem('ic.theme');if(t==='light'||t==='dark'){document.documentElement.dataset.theme=t;document.querySelector('meta[name="color-scheme"]').content=t}}catch(_){}</script>
 <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2311161f'/><path d='M8 9h16M8 16h10M8 23h13' stroke='%2322d3ee' stroke-width='2.6' stroke-linecap='round'/><circle cx='23' cy='16' r='2.6' fill='%23f59e0b'/></svg>">
 <style>
 :root{
@@ -1595,7 +1611,7 @@ button.sub:hover{filter:brightness(1.06)}button.sub:active{transform:translateY(
 <div class="card">
  <div class="brand">
   <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 7h14M5 12h9M5 17h11"/><circle cx="18" cy="12" r="2" fill="currentColor"/></svg></span>
-  <div><b>LFM Panel</b><span class="sub">Local inference &amp; telemetry console</span></div>
+  <div><b>Inference Console</b><span class="sub">Local inference &amp; telemetry console</span></div>
  </div>
  <form>
   <label for="pw">Host sudo password</label>
@@ -1612,15 +1628,15 @@ function $(s){return document.querySelector(s)}
 function sysScheme(){return matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'}
 function applyTheme(t){
  document.documentElement.dataset.theme=t;
- $('meta[name="color-scheme"]').content=localStorage.getItem('lfm.theme')||'light dark';
+ $('meta[name="color-scheme"]').content=localStorage.getItem('ic.theme')||'light dark';
  $('#theme').innerHTML=t==='dark'?SUN:MOON;
 }
-applyTheme(localStorage.getItem('lfm.theme')||sysScheme());
+applyTheme(localStorage.getItem('ic.theme')||sysScheme());
 $('#theme').onclick=()=>{
  const cur=document.documentElement.dataset.theme;
  const next=cur==='dark'?'light':'dark';
- if(next===sysScheme())localStorage.removeItem('lfm.theme');
- else localStorage.setItem('lfm.theme',next);
+ if(next===sysScheme())localStorage.removeItem('ic.theme');
+ else localStorage.setItem('ic.theme',next);
  applyTheme(next);
 };
 async function go(ev){ev.preventDefault();
@@ -2487,7 +2503,7 @@ class StartReq(Request):
 
 # ------------------------------------------------------- coding-agent registry
 AGENTS_STATE_PATH = APP_DIR / "agent-registry.json"
-PANEL_PROVIDER_ID = "lfm-panel"
+PANEL_PROVIDER_ID = "inference-console"
 
 def _load_agents_state():
     if AGENTS_STATE_PATH.exists():
@@ -2960,7 +2976,7 @@ def _w_omp(alias, base, ctx):
                             "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                             "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
         cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = prov
-    return _yaml_merge(HOME / ".omp/agent/models.yml", apply) + " — omp: omp --model lfm-panel/" + alias
+    return _yaml_merge(HOME / ".omp/agent/models.yml", apply) + " — omp: omp --model inference-console/" + alias
 
 def _w_opencode(alias, base, ctx):
     def apply(cfg):
@@ -2968,13 +2984,13 @@ def _w_opencode(alias, base, ctx):
             "npm": "@ai-sdk/openai-compatible",
             "options": {"baseURL": base + "/v1"},
             "models": {alias: {"name": alias}}}
-    return _json_merge(HOME / ".config/opencode/opencode.json", apply) + " — opencode: provider lfm-panel"
+    return _json_merge(HOME / ".config/opencode/opencode.json", apply) + " — opencode: provider inference-console"
 
 def _w_codex(alias, base, ctx):
     path = Path(HOME / ".codex/config.toml")
     old = path.read_text() if path.exists() else ""
     old = _toml_strip_section(old, {"[model_providers." + PANEL_PROVIDER_ID + "]", "[profiles." + PANEL_PROVIDER_ID + "]"})
-    block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"LFM Panel\"\n"
+    block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"Inference Console\"\n"
              f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n"
              f"\n[profiles.{PANEL_PROVIDER_ID}]\nmodel_provider = \"{PANEL_PROVIDER_ID}\"\nmodel = \"{alias}\"\n")
     import tomllib
@@ -2982,7 +2998,7 @@ def _w_codex(alias, base, ctx):
     tomllib.loads(merged)  # validate before touching the user's config
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(merged)
-    return str(path) + " — codex: codex --profile lfm-panel"
+    return str(path) + " — codex: codex --profile inference-console"
 
 def _w_aider(alias, base, ctx):
     def apply(cfg):
@@ -3035,41 +3051,41 @@ def _w_pi(alias, base, ctx, key):
                     "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2))
-    return str(path) + " — pi: provider lfm-panel"
+    return str(path) + " — pi: provider inference-console"
 
 def _w_hermes(alias, base, ctx, key):
     def apply(cfg):
         prov = cfg.setdefault("providers", {}).setdefault(PANEL_PROVIDER_ID, {})
-        prov.update({"name": "LFM Panel", "base_url": base + "/v1",
+        prov.update({"name": "Inference Console", "base_url": base + "/v1",
                      "default_model": alias, "model": alias,
                      "models": {alias: {}}, "models_discovered": True})
-    return _yaml_merge(HOME / ".hermes/config.yaml", apply) + " — hermes: pick /model custom:lfm-panel"
+    return _yaml_merge(HOME / ".hermes/config.yaml", apply) + " — hermes: pick /model custom:inference-console"
 
 def _w_kimi(alias, base, ctx, key):
     path = HOME / ".kimi-code/config.toml"
     old = path.read_text() if path.exists() else ""
     old = _toml_strip_section(old, {"[providers." + PANEL_PROVIDER_ID + "]", '[models."' + alias + '"]'})
-    block = (f"\n[providers.{PANEL_PROVIDER_ID}]\nname = \"LFM Panel\"\ntype = \"openai\"\n"
+    block = (f"\n[providers.{PANEL_PROVIDER_ID}]\nname = \"Inference Console\"\ntype = \"openai\"\n"
              f"baseUrl = \"{base}/v1\"\napiKey = \"{key or 'panel'}\"\n"
-             f"\n[models.\"{alias}\"]\nprovider = \"{PANEL_PROVIDER_ID}\"\nname = \"{alias} via LFM Panel\"\n")
+             f"\n[models.\"{alias}\"]\nprovider = \"{PANEL_PROVIDER_ID}\"\nname = \"{alias} via Inference Console\"\n")
     import tomllib
     merged = old + block
     tomllib.loads(merged)  # validate before touching the user's config
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(merged)
-    return str(path) + " — kimi: model lfm-panel/" + alias
+    return str(path) + " — kimi: model inference-console/" + alias
 
 AGENTS = {
-    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c),        "selector lfm-panel/<alias>"),
-    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),      "selector lfm-panel/<alias>"),
-    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c),   "provider lfm-panel"),
-    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c),      "codex --profile lfm-panel"),
+    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c),        "selector inference-console/<alias>"),
+    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),      "selector inference-console/<alias>"),
+    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c),   "provider inference-console"),
+    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c),      "codex --profile inference-console"),
     "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c),      "openai/<alias>"),
     "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),        "replaces Zed openai available_models"),
     "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c),   "adds model row"),
     "claude-code": ("Claude Code",        _w_claude,                                 "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
-    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),  "then pick /model custom:lfm-panel"),
-    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),    "model lfm-panel/<alias>"),
+    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),  "then pick /model custom:inference-console"),
+    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),    "model inference-console/<alias>"),
 }
 
 @app.get("/api/agents")
@@ -3295,7 +3311,7 @@ def _latest_llama_release() -> tuple[str, dict] | None:
     sometimes points at an assets-less nightly tag)."""
     try:
         r = httpx.get("https://api.github.com/repos/ggml-org/llama.cpp/releases?per_page=8",
-                      headers={"User-Agent": "lfm-panel"}, timeout=20)
+                      headers={"User-Agent": "inference-console"}, timeout=20)
         r.raise_for_status()
         for rel in r.json():
             assets = rel.get("assets") or []
@@ -3489,13 +3505,13 @@ HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark">
 <head>
 <meta charset="utf-8">
-<title>LFM Panel · Local Inference Console</title>
+<title>Inference Console · Local Inference Manager</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <script>
 (() => {
   try {
-    const s = localStorage.getItem('lfm.theme');
+    const s = localStorage.getItem('ic.theme');
     const m = document.querySelector('meta[name="color-scheme"]');
     const t = (s === 'light' || s === 'dark') ? s : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     if (m) m.content = t;
@@ -3808,7 +3824,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 <header>
   <div class="brand">
     <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
-    <span class="nm">LFM Panel<span class="sub">local inference console</span></span>
+    <span class="nm">Inference Console<span class="sub">local inference console</span></span>
   </div>
   <nav class="nav" id="nav" aria-label="Sections">
     <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
@@ -4575,8 +4591,8 @@ $('#theme').addEventListener('click',()=>{
   const next=document.documentElement.dataset.theme==='dark'?'light':'dark';
   applyTheme(next);
   const sys=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
-  if(next===sys)localStorage.removeItem('lfm.theme');
-  else localStorage.setItem('lfm.theme',next);
+  if(next===sys)localStorage.removeItem('ic.theme');
+  else localStorage.setItem('ic.theme',next);
 });
 $('#logout').addEventListener('click',async()=>{
   if(!await confirmDlg('Sign out','End this panel session?','Sign out',true))return;
@@ -4589,7 +4605,7 @@ const TABS=['models','server','strata','avalon','vitals','chat','hf','settings']
 let tab='models';
 function setTab(t){
   if(TABS.indexOf(t)<0)t='models';
-  tab=t;localStorage.setItem('lfm.tab',t);
+  tab=t;localStorage.setItem('ic.tab',t);
   $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
   $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
@@ -4892,23 +4908,23 @@ function drawHeader(){
   if(ct){
     p.className='pill ok';
     t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':'');
-    document.title='● '+ct.alias+' — LFM Panel';
+    document.title='● '+ct.alias+' — Inference Console';
   }else if(ACTIVE){
     p.className='pill warn';
     t.textContent=ACTIVE.alias+' · loading…';
-    document.title='◌ Loading '+ACTIVE.alias+' — LFM Panel';
+    document.title='◌ Loading '+ACTIVE.alias+' — Inference Console';
   }else if(AV&&AV.running){
     p.className='pill warn';
     t.textContent='avalon · loading…';
-    document.title='◌ Loading Avalon — LFM Panel';
+    document.title='◌ Loading Avalon — Inference Console';
   }else if(STRATA&&STRATA.running){
     p.className='pill warn';
     t.textContent='strata · loading…';
-    document.title='◌ Loading Strata — LFM Panel';
+    document.title='◌ Loading Strata — Inference Console';
   }else{
     p.className='pill';
     t.textContent='no server running';
-    document.title='LFM Panel — Local Inference Console';
+    document.title='Inference Console — Local Inference Manager';
   }
   const idleChip=$('#hdridle'),srvIdle=$('#srvidlechip');
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.idle_unload_min>0&&ACTIVE.idle_remaining_s!=null){
@@ -5057,7 +5073,7 @@ $('#logwrap').addEventListener('change',e=>$('#log').classList.toggle('wrapoff',
 $('#logcopy').addEventListener('click',()=>copy(LOGTEXT,'Log'));
 $('#logsave').addEventListener('click',()=>{
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([LOGTEXT],{type:'text/plain'}));
-  a.download='lfm-server-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.log';
+  a.download='inference-console-'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.log';
   a.click();setTimeout(()=>URL.revokeObjectURL(a.href),4000)});
 
 /* ============================== vitals ============================== */
@@ -5116,7 +5132,7 @@ $('#vrefresh').addEventListener('click',refreshVitals);
 /* ============================== chat ============================== */
 let HIST=[],CHATS_CACHE=[],CID=null,BUSY=false,AC=null;
 const DEF_SYS='You are a helpful local assistant. Be concise.';
-$('#sysprompt').value=localStorage.getItem('lfm.sys')||DEF_SYS;
+$('#sysprompt').value=localStorage.getItem('ic.sys')||DEF_SYS;
 function syncSamplingLabels(){
   $('#sp-temp-v').textContent=Number($('#sp-temp').value).toFixed(2);
   $('#sp-topp-v').textContent=Number($('#sp-topp').value).toFixed(2);
@@ -5126,17 +5142,17 @@ function syncSamplingLabels(){
   $('#sp-max-v').textContent=mx>0?n0(mx)+' tok':'default';
 }
 ['sp-temp','sp-topp','sp-minp','sp-rep','sp-max'].forEach(id=>{
-  const saved=localStorage.getItem('lfm.'+id);
+  const saved=localStorage.getItem('ic.'+id);
   if(saved!=null)$('#'+id).value=saved;
-  $('#'+id).addEventListener('input',()=>{syncSamplingLabels();localStorage.setItem('lfm.'+id,$('#'+id).value)});
+  $('#'+id).addEventListener('input',()=>{syncSamplingLabels();localStorage.setItem('ic.'+id,$('#'+id).value)});
 });
 syncSamplingLabels();
 $('#sysbtn').addEventListener('click',()=>{
   const box=$('#sysbox');box.classList.toggle('hide');
-  if(box.classList.contains('hide'))localStorage.setItem('lfm.sys',$('#sysprompt').value||DEF_SYS);
+  if(box.classList.contains('hide'))localStorage.setItem('ic.sys',$('#sysprompt').value||DEF_SYS);
   else $('#sysprompt').focus();
 });
-$('#sysprompt').addEventListener('change',()=>localStorage.setItem('lfm.sys',$('#sysprompt').value||DEF_SYS));
+$('#sysprompt').addEventListener('change',()=>localStorage.setItem('ic.sys',$('#sysprompt').value||DEF_SYS));
 
 function drawChatTarget(){
   const ct=chatTarget(),t=$('#chatmodel');
@@ -5255,7 +5271,7 @@ $('#chatlist').addEventListener('click',async e=>{
 });
 async function openChat(id,quiet){
   try{
-    const c=await api('/api/chats/'+id);CID=id;localStorage.setItem('lfm.cid',id);
+    const c=await api('/api/chats/'+id);CID=id;localStorage.setItem('ic.cid',id);
     $('#chattitle').textContent=c.title||'Conversation';
     HIST=(c.messages||[]).filter(m=>m.role!=='system');
     redrawThread();loadChatList();return true;
@@ -5265,7 +5281,7 @@ function emptyThread(){
   $('#chattitle').textContent='Conversation';
   $('#chat').innerHTML='<div class="empty"><b>New conversation</b>Pick a saved chat on the left, or type a message below.</div>';
 }
-function newChat(){CID=null;HIST=[];localStorage.removeItem('lfm.cid');emptyThread();loadChatList();$('#prompt').focus()}
+function newChat(){CID=null;HIST=[];localStorage.removeItem('ic.cid');emptyThread();loadChatList();$('#prompt').focus()}
 $('#newchat').addEventListener('click',newChat);
 
 $('#chatexportmd').addEventListener('click',()=>{
@@ -5628,10 +5644,10 @@ $('#avalonstart').addEventListener('click',async()=>{
   try{await post('/api/avalon/start',{profile:ASEL,tune:getAvalonTuneForm()});toast('Avalon starting — a 125B load takes a while','ok')}
   catch(e){
     const t=e.message;
-    if(t.indexOf('Stop the LFM server')>=0){
-      if(await confirmDlg('VRAM conflict','This profile needs the VRAM the LFM server is holding.<br><br>Stop the LFM server and start Avalon?','Stop LFM & start Avalon',true)){
+    if(t.indexOf('Stop the llama.cpp server')>=0){
+      if(await confirmDlg('VRAM conflict','This profile needs the VRAM the llama.cpp server is holding.<br><br>Stop the llama.cpp server and start Avalon?','Stop llama.cpp & start Avalon',true)){
         try{await post('/api/server/stop');pollStatus(true);$('#avalonstart').click()}
-        catch(e2){toast('Could not stop the LFM server: '+e2.message,'err')}}
+        catch(e2){toast('Could not stop the llama.cpp server: '+e2.message,'err')}}
     }else toast('Start failed: '+t,'err',12000);
   }
   loadAvalon();
@@ -5953,11 +5969,11 @@ document.addEventListener('keydown',e=>{
 });
 
 /* ============================== boot ============================== */
-setTab(localStorage.getItem('lfm.tab')||'models');
+setTab(localStorage.getItem('ic.tab')||'models');
 loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel load failed: '+e.message,'err'));
 loadChatList();
-(async()=>{const s=localStorage.getItem('lfm.cid');
-  if(!s||!(await openChat(s,true))){localStorage.removeItem('lfm.cid');emptyThread()}})();
+(async()=>{const s=localStorage.getItem('ic.cid');
+  if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
 refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
