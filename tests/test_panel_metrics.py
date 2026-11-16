@@ -1081,6 +1081,202 @@ def test_agent_toml_invalid_leaves_file_untouched():
         panel.HOME = real_home
 
 
+# ---------------------------------------------------------------- llama.cpp extra knobs
+_FULL_CAPS = {"exists": True, "metrics": True, "fa_value": True, "ctk": True, "mlock": True,
+              "no_mmap": True, "parallel": True, "ncmoe": True, "draft": True, "draft_max": True,
+              "ot": True, "tensor_split": True, "tbatch": True, "keep": True, "jinja": True}
+
+
+def test_new_llama_flags_emitted_when_supported():
+    mp = MODELS_DIR / "specme.gguf"
+    gguf(mp, arch="qwen2")
+    draft = MODELS_DIR / "mtp-specme.gguf"
+    gguf(draft, arch="qwen2")
+    meta = {"path": str(mp), "name": mp.stem, "moe": False, "vl": False, "blocks": 48}
+    ov = (panel.scan_models, panel.bin_caps, panel.igpu_device)
+    panel.scan_models = lambda: {"models": [meta], "mmproj": []}
+    panel.bin_caps = lambda b: dict(_FULL_CAPS)
+    panel.igpu_device = lambda refresh=False: (None, 0)
+    try:
+        args, _, _ = panel.MGR.build_args(
+            str(mp), preset="dense-gpu", ctx=8192, threads=8,
+            draft=str(draft), draft_max=24, ot="exps=CPU", tensor_split="1 2",
+            tbatch=6, keep=128)
+        line = " ".join(args)
+        assert f"--model-draft {draft}" in line
+        assert "--draft-max 24" in line and "--draft-min 0" in line
+        assert "-ot exps=CPU" in line
+        assert "--tensor-split 1 2" in line          # separate argv values, not one string
+        assert "--threads-batch 6" in line and "--keep 128" in line
+        assert "--jinja" in line
+        args, _, _ = panel.MGR.build_args(str(mp), preset="dense-gpu", ctx=8192, threads=8,
+                                          jinja="off")
+        assert "--jinja" not in " ".join(args)
+    finally:
+        panel.scan_models, panel.bin_caps, panel.igpu_device = ov
+
+
+def test_new_llama_flags_suppressed_on_old_builds():
+    mp = MODELS_DIR / "oldbuild.gguf"
+    gguf(mp, arch="qwen2")
+    draft = MODELS_DIR / "mtp-oldbuild.gguf"
+    gguf(draft, arch="qwen2")
+    meta = {"path": str(mp), "name": mp.stem, "moe": False, "vl": False, "blocks": 48}
+    ov = (panel.scan_models, panel.bin_caps, panel.igpu_device)
+    panel.scan_models = lambda: {"models": [meta], "mmproj": []}
+    # A build without the newer flags must never receive them.
+    panel.bin_caps = lambda b: {"exists": True, "metrics": True, "fa_value": True,
+                                "ctk": True, "mlock": True, "no_mmap": True, "parallel": True}
+    panel.igpu_device = lambda refresh=False: (None, 0)
+    try:
+        args, _, _ = panel.MGR.build_args(
+            str(mp), preset="dense-gpu", ctx=8192, threads=8,
+            draft=str(draft), tensor_split="1 1", tbatch=4, keep=64)
+        line = " ".join(args)
+        for flag in ("--model-draft", "--draft-max", "--tensor-split",
+                     "--threads-batch", "--keep", "--jinja"):
+            assert flag not in line, f"{flag} leaked on a build without it: {line}"
+    finally:
+        panel.scan_models, panel.bin_caps, panel.igpu_device = ov
+
+
+def test_draft_path_validated_before_launch():
+    mp = MODELS_DIR / "validatedraft.gguf"
+    gguf(mp, arch="qwen2")
+    meta = {"path": str(mp), "name": mp.stem, "moe": False, "vl": False, "blocks": 48}
+    ov = (panel.scan_models, panel.bin_caps, panel.igpu_device)
+    panel.scan_models = lambda: {"models": [meta], "mmproj": []}
+    panel.bin_caps = lambda b: dict(_FULL_CAPS)
+    panel.igpu_device = lambda refresh=False: (None, 0)
+    try:
+        try:
+            panel.MGR.build_args(str(mp), preset="dense-gpu", ctx=8192,
+                                 draft=str(MODELS_DIR / "nope-draft.gguf"))
+            assert False, "missing draft file must raise, not launch without spec-decode"
+        except panel.HTTPException as e:
+            assert e.status_code == 400
+    finally:
+        panel.scan_models, panel.bin_caps, panel.igpu_device = ov
+
+
+def test_find_draft_finds_mtp_sibling_skips_mmproj():
+    d = MODELS_DIR / "draftdir"
+    d.mkdir(exist_ok=True)
+    model = d / "Qwen3-Foo-IQ3.gguf"
+    gguf(model, arch="qwen3moe")
+    mtp = d / "mtp-Qwen3-Foo-shared-IQ4.gguf"
+    gguf(mtp, arch="qwen3moe")
+    (d / "Qwen3-Foo-mmproj-f16.gguf").write_bytes(b"GGUF")
+    assert panel.find_draft(str(model)) == str(mtp)
+    plain = d / "Other-Bar.gguf"
+    gguf(plain, arch="qwen2")
+    assert panel.find_draft(str(plain)) == str(mtp)  # falls back to the only draft in the dir
+    solo = MODELS_DIR / "draftdir" / "lonely.gguf"
+    gguf(solo, arch="qwen2")
+    assert panel.find_draft(str(solo)) == str(mtp)
+
+
+def test_optimizer_speed_target_enables_found_draft():
+    d = MODELS_DIR / "optdir"
+    d.mkdir(exist_ok=True)
+    mp = d / "Qwen3-Spec.gguf"
+    gguf(mp, arch="qwen2")
+    (d / "mtp-Qwen3-Spec.gguf").write_bytes(b"GGUF")
+    meta = {"path": str(mp), "name": mp.stem, "size": 4 * 1024**3, "blocks": 48,
+            "n_kv": 8, "k_len": 128, "v_len": 128, "moe": False, "vl": False,
+            "mmproj": None, "ctx_len": 32768}
+    class St:
+        @staticmethod
+        def status():
+            return {"running": False}
+    ov = (panel.vitals, panel.MGR, panel.SMGR)
+    panel.vitals = lambda refresh=False: VIT_24G
+    panel.MGR, panel.SMGR = St, St
+    try:
+        rec = panel.recommend_model_config(meta, "speed")
+        assert rec["draft"] == str(d / "mtp-Qwen3-Spec.gguf")
+        assert rec["draft_max"] == 16
+        assert any("speculative" in n for n in rec["notes"])
+        rec = panel.recommend_model_config(meta, "balanced")
+        assert rec["draft"] == ""
+    finally:
+        panel.vitals, panel.MGR, panel.SMGR = ov
+
+
+# ---------------------------------------------------------------- strata
+def test_strata_build_args_documented_flags_only():
+    b = panel.StrataLaunchBody(
+        preset="mywork", family="qwen", model="iq3_xxs", model_path="/m/here",
+        context="128k", kv="q4_0", parallel=4, vision="gpu", mtp="on", drafting="mtp",
+        gpu="0,1", tune="quick", retune=True, access="lan", port=8123,
+        no_api_key=False, new_key=True, save_preset="mywork", restart=True,
+        set_=["prefill=65536", "STRATA_PIN_BY_NEED=1", "badpair"])
+    args = panel.strata_build_args(b, plan=False)
+    line = " ".join(args)
+    for want in ("--preset mywork", "--family qwen", "--model iq3_xxs",
+                 "--model-path /m/here", "--context 128k", "--kv q4_0",
+                 "--parallel 4", "--vision gpu", "--mtp on", "--drafting mtp",
+                 "--gpu 0,1", "--tune quick", "--retune", "--access lan", "--port 8123",
+                 "--new-key", "--save-preset mywork", "--restart",
+                 "--set prefill=65536", "--set STRATA_PIN_BY_NEED=1"):
+        assert want in line, f"missing {want!r} in {line}"
+    assert "badpair" not in line                      # malformed --set pairs are dropped
+    assert "--no-tui" in args and "--yes" in args and "--output" in args
+    # An empty form emits nothing but the safe non-interactive launch tail.
+    empty = panel.strata_build_args(panel.StrataLaunchBody(), plan=False)
+    assert empty == ["launch", "--yes", "--no-tui", "--output", "json"]
+    plan = panel.strata_build_args(panel.StrataLaunchBody(preset="x"), plan=True)
+    assert plan == ["launch", "--preset", "x", "--plan", "--output", "json"]
+    assert "--yes" not in plan
+
+
+def test_parse_ctx_words():
+    assert panel._parse_ctx_words("128k") == 131072
+    assert panel._parse_ctx_words("8192") == 8192
+    assert panel._parse_ctx_words("1m") == 1048576
+    assert panel._parse_ctx_words(" 64K ") == 65536
+    assert panel._parse_ctx_words("huge") is None
+
+
+def test_strata_status_without_cli_is_not_installed():
+    ov = panel.CFG.get("strata_bin")
+    ov_env = os.environ.get("STRATA_BIN")
+    try:
+        panel.CFG["strata_bin"] = str(Path(HOME_TMP) / "definitely-missing-strata")
+        os.environ["STRATA_BIN"] = panel.CFG["strata_bin"]
+        st = panel.strata_status()
+        assert st["installed"] is False
+        assert "install.sh" in st["install_cmd"]
+        assert st["running"] is False
+    finally:
+        panel.CFG["strata_bin"] = ov
+        if ov_env is None:
+            os.environ.pop("STRATA_BIN", None)
+        else:
+            os.environ["STRATA_BIN"] = ov_env
+
+
+def test_strata_key_endpoint_masks_by_default():
+    ov_bin, ov_run = panel.CFG.get("strata_bin"), panel._strata_run
+    stub = Path(HOME_TMP) / "strata-stub"
+    try:
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        panel.CFG["strata_bin"] = str(stub)
+        panel._strata_run = lambda args, timeout=20: {
+            "ok": True, "json": None, "stdout": "sk-strata-abcdefghijklmnop\n",
+            "stderr": "", "error": None}
+        k = panel.api_strata_key(reveal=False)
+        assert k["key_set"] and k["key"] == ""
+        assert "abcdefghijklmnop" not in k["masked"]
+        k = panel.api_strata_key(reveal=True)
+        assert k["key"] == "sk-strata-abcdefghijklmnop"
+    finally:
+        panel.CFG["strata_bin"] = ov_bin
+        panel._strata_run = ov_run
+        stub.unlink(missing_ok=True)
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and isinstance(f, types.FunctionType)]
