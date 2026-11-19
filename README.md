@@ -1,7 +1,7 @@
 # Inference Console
 
-One web app for running local models. It manages three inference engines —
-**llama.cpp**, **Strata**, and **Avalon** — plus your GGUF library, live
+One web app for running local models. It manages three inference engines,
+**llama.cpp**, **Strata**, and **Avalon**, plus your GGUF library, live
 telemetry, downloads, and chat, all from a single FastAPI file at
 `http://127.0.0.1:8817`.
 
@@ -28,15 +28,15 @@ Each engine gets its own tab with status, launch controls, presets, and logs.
 Whichever one is serving becomes the chat backend and the coding-agent
 registry target automatically.
 
-- **llama.cpp** — launches and supervises a `llama-server` child. Presets for
+- **llama.cpp**, launches and supervises a `llama-server` child. Presets for
   dense GPU, MoE CPU/GPU split, vision, and iGPU (Vulkan `--device` resolved
   via `--list-devices`, with a fit guard against free VRAM).
-- **Strata** — wraps the `strata launch` CLI: launch form (preset, family,
+- **Strata**, wraps the `strata launch` CLI: launch form (preset, family,
   quant, context, KV format, parallel, vision, MTP, drafting, GPU, access
   mode), read-only plan preview before any download, preset save/delete,
   `doctor --live`, `update --check`, masked API key. Empty fields keep
   Strata's own defaults.
-- **Avalon** — profiles (`flagship`, `prefast`, `compact`) with fit-aware
+- **Avalon**, profiles (`flagship`, `prefast`, `compact`) with fit-aware
   launches (`-fit on` places dense + KV on the GPU, MoE experts in system
   memory; no hardcoded full offload), per-profile config optimizer with
   device/offload/`--n-cpu-moe`/FA/threads switches and recommendation hints,
@@ -78,13 +78,13 @@ builds never receive flags they'd reject.
   parallel slots, idle auto-unload watchdog
 - **Benchmarks**: one-click `standard` / `code` / `short` suites with saved
   history for comparison
-- **Chat**: sampling controls, edit & regenerate, Markdown/JSON export —
+- **Chat**: sampling controls, edit & regenerate, Markdown/JSON export,
   backed by whichever engine is up
 - **Coding-agent registry**: writes the running model into omp, pi, opencode,
   codex, aider, zed, continue, claude-code, hermes, and kimi configs
 - **Setup**: Settings installs the latest official llama.cpp release for your
   platform (Metal / Vulkan / cpu / cuda), the Strata CLI, or builds Avalon
-  from source — each behind an explicit confirm, with a streamed log
+  from source, each behind an explicit confirm, with a streamed log
 - **⌘K / Ctrl+K** command palette
 
 ## Layout
