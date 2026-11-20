@@ -1222,12 +1222,6 @@ def _avalon_target() -> dict:
     if pinned:
         tgt["model"] = Path(pinned).expanduser()
         tgt["base"] = SPLIT_RE.sub("", tgt["model"].stem)
-        if CFG.get("avalon_draft"):
-            tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
-        else:
-            drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
-            if drafts:
-                tgt["draft"] = drafts[0]
     else:
         packs = _avalon_scan()
         if packs:
@@ -1236,6 +1230,13 @@ def _avalon_target() -> dict:
             tgt["base"] = p0["base"]
             tgt["draft"] = Path(p0["draft"]) if p0["draft"] else None
             tgt["mmproj"] = p0["mmproj"]
+    # avalon_draft is an override, so it wins in both modes; the pinned branch used to be the
+    # only one that honoured it, which silently ignored the setting whenever the tab was on auto.
+    if CFG.get("avalon_draft"):
+        tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
+    elif tgt["draft"] is None and tgt["model"]:
+        drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
+        tgt["draft"] = drafts[0] if drafts else None
     if tgt["model"] and not tgt.get("mmproj"):
         try:
             tgt["mmproj"] = find_mmproj(str(tgt["model"]))
@@ -2766,15 +2767,20 @@ AGENTS_STATE_PATH = APP_DIR / "agent-registry.json"
 PANEL_PROVIDER_ID = "inference-console"
 
 def _load_agents_state():
-    if AGENTS_STATE_PATH.exists():
-        try:
-            return json.loads(AGENTS_STATE_PATH.read_text())
-        except Exception:
-            pass
-    return {"agents": {}}
+    st = _read_json(AGENTS_STATE_PATH, {})
+    if not isinstance(st, dict):
+        st = {}
+    if not isinstance(st.get("agents"), dict):
+        st["agents"] = {}
+    return st
 
 def _save_agents_state(st):
-    AGENTS_STATE_PATH.write_text(json.dumps(st, indent=1))
+    """Atomic, and never fatal: the agent configs are already written by the time this runs,
+    so a read-only state dir must not turn a successful sync into a 500."""
+    try:
+        _write_json(AGENTS_STATE_PATH, st)
+    except OSError as e:
+        print(f"agent registry not saved: {e}", flush=True)
 
 def _proc_ctx(pid):
     try:
@@ -2784,6 +2790,32 @@ def _proc_ctx(pid):
     except Exception:
         pass
     return 8192
+
+def _server_facts(port, timeout: float = 1.5):
+    """(model id, n_ctx) as the running server reports them over HTTP. /proc only exists on
+    Linux, so the old cmdline probe told every agent `-c 8192` on macOS no matter what the
+    server was really loaded with; /props answers the same question on every platform."""
+    alias = nctx = None
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=timeout)
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data") or []
+            if data and isinstance(data[0], dict) and data[0].get("id"):
+                alias = str(data[0]["id"])
+    except Exception:
+        pass
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/props", timeout=timeout)
+        if r.status_code == 200:
+            j = r.json() or {}
+            nctx = (j.get("default_generation_settings") or {}).get("n_ctx") or j.get("n_ctx")
+            nctx = int(nctx) if nctx else None
+    except Exception:
+        nctx = None
+    if alias and ("/" in alias or "\\" in alias or alias.lower().endswith(".gguf")):
+        alias = Path(alias.replace("\\", "/")).name.removesuffix(".gguf")
+        alias = SPLIT_RE.sub("", alias) or None
+    return alias, nctx
 
 # ==================== STRATA (Niko1221/Strata) ====================
 # Strata is a separate inference engine (github.com/Niko1221/Strata) serving the same
@@ -3168,23 +3200,31 @@ def _strata_alias() -> str:
 def _current_llm(prefer: str | None = None):
     """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running.
     `prefer` pins the source: None/'auto' keeps the fallback order; a source name answers
-    only that server, so the sync endpoint can say "this tab's server isn't running"."""
+    only that server, so the sync endpoint can say "this tab's server isn't running".
+    Alias and context come from the server itself, falling back to manifest/panel state."""
     want = lambda s: prefer in (None, "auto", s)
+
+    def from_server(fallback_alias, port, pid, fallback_ctx, key, source):
+        alias, ctx = _server_facts(port)
+        return (alias or fallback_alias), port, (ctx or fallback_ctx), key, source
+
     m = MGR.status()
     if want("panel") and m.get("running") and m["port"] != AVALON_PORT:
-        return m.get("alias"), m["port"], _proc_ctx(m["pid"]), "", "panel"
+        return from_server(m.get("alias"), m["port"], m.get("pid"), _proc_ctx(m.get("pid")), "", "panel")
     a = SMGR.status()
     if want("avalon") and a.get("running"):
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           a.get("pid"), _proc_ctx(a.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     if want("avalon") and m.get("running"):  # discovery adopted the systemd avalon on 8086
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           m.get("pid"), _proc_ctx(m.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     s = strata_status()
     if want("strata") and s.get("running") and s.get("port"):
         # The key is only forwarded if the operator set strata_api_key deliberately. Strata
         # owns its own key (`strata launch --show-key`); auto-reading it would push a real
         # secret into every synced agent config and into panel state without being asked.
-        return _strata_alias(), s["port"], int(CFG.get("strata_ctx") or 8192), \
-            CFG.get("strata_api_key", ""), "strata"
+        return from_server(_strata_alias(), s["port"], None, int(CFG.get("strata_ctx") or 8192),
+                           CFG.get("strata_api_key", ""), "strata")
     return None
 
 def _chat_target():
@@ -3212,14 +3252,119 @@ def _yaml_merge(path, apply):
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     return str(path)
 
+def _jsonc_load(text):
+    """json.loads that survives JSONC (// and /* */ comments, trailing commas) — Zed and
+    opencode both ship comment-bearing settings files, and a plain json.loads turns a
+    perfectly good settings file into a hard "Expecting value: line 1" failure."""
+    out, inner, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.extend(text[i:j]); inner.extend([True] * (j - i)); i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c); inner.append(False); i += 1
+    chars = []
+    for idx, ch in enumerate(out):
+        if ch == "," and not inner[idx]:
+            k = idx + 1
+            while k < len(out) and out[k] in " \t\r\n":
+                k += 1
+            if k < len(out) and out[k] in "}]":
+                continue  # trailing comma
+        chars.append(ch)
+    return json.loads("".join(chars))
+
 def _json_merge(path, apply):
     path = Path(path)
     cfg = {}
     if path.exists():
-        cfg = json.loads(path.read_text())
+        text = path.read_text()
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError:
+            cfg = _jsonc_load(text)  # raises with a usable message if it really is broken
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a JSON object")
     apply(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2))
+    return str(path)
+
+def _yaml_upsert(path, parent, key, value):
+    """Set <parent>.<key> in a YAML file and leave every other byte alone. Round-tripping the
+    whole document through safe_load/safe_dump (the old approach) re-indented and stripped
+    the comments out of files like ~/.hermes/config.yaml on every single sync."""
+    path = Path(path)
+    text = path.read_text() if path.exists() else ""
+    try:
+        root = yaml.compose(text) if text.strip() else None
+    except yaml.YAMLError:
+        raise HTTPException(400, f"{path} is not valid YAML — fix it first")
+
+    def dump_block(val, col):
+        s = yaml.safe_dump(val, sort_keys=False, default_flow_style=False).rstrip("\n")
+        pad = " " * col
+        return "\n".join(pad + ln if ln.strip() else ln for ln in s.splitlines())
+
+    if isinstance(root, yaml.MappingNode):
+        tops = {k.value: v for k, v in root.value if isinstance(k, yaml.ScalarNode)}
+        pval = tops.get(parent)
+        if isinstance(pval, yaml.MappingNode) and not pval.flow_style:
+            pair = next(((kn, vn) for kn, vn in pval.value
+                         if isinstance(kn, yaml.ScalarNode) and kn.value == key), None)
+            if pair:
+                knode, old = pair
+                start, end = old.start_mark.index, old.end_mark.index
+                line_start = text.rfind("\n", 0, start) + 1
+                seg = text[start:end]
+                tail_nl = "\n" if seg.endswith("\n") else ""
+                if text[line_start:start].strip() == "":     # value sits on its own lines
+                    text = text[:line_start] + dump_block(value, start - line_start) + tail_nl + text[end:]
+                else:                                        # inline value after `key: `
+                    col = knode.start_mark.column + 2
+                    text = text[:start] + "\n" + dump_block(value, col) + "\n" + text[end:].lstrip("\n")
+            elif pval.value:
+                col = pval.value[0][0].start_mark.column
+                at = pval.value[-1][1].end_mark.index
+                tail = text[at:]
+                if tail.startswith("\n"):
+                    tail = tail[1:]
+                text = text[:at].rstrip("\n") + "\n" + dump_block({key: value}, col) + "\n" + tail
+            else:
+                root = None  # empty/flow-style parent: fall through to the full rewrite
+        elif parent not in tops:
+            text = (text.rstrip("\n") + "\n" if text.strip() else "") + \
+                f"{parent}:\n" + dump_block({key: value}, 2)
+        else:
+            root = None  # parent is a scalar/flow mapping: full rewrite below
+    else:
+        root = None
+    if root is None:
+        cfg = yaml.safe_load(text) or {}
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a YAML mapping — fix it first")
+        sub = cfg.setdefault(parent, {})
+        if not isinstance(sub, dict):
+            raise HTTPException(400, f"{path}: '{parent}' is not a mapping — fix it first")
+        sub[key] = value
+        text = yaml.safe_dump(cfg, sort_keys=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n")
     return str(path)
 
 def _toml_strip_section(text, headers):
@@ -3232,14 +3377,13 @@ def _toml_strip_section(text, headers):
     return "\n".join(out).rstrip() + "\n"
 
 def _w_omp(alias, base, ctx):
-    def apply(cfg):
-        prov = {"baseUrl": base + "/v1", "api": "openai-completions", "auth": "none",
-                "models": [{"id": alias, "name": alias, "api": "openai-completions",
-                            "reasoning": False, "input": ["text"],
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                            "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
-        cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = prov
-    return _yaml_merge(HOME / ".omp/agent/models.yml", apply) + " — omp: omp --model inference-console/" + alias
+    prov = {"baseUrl": base + "/v1", "api": "openai-completions", "auth": "none",
+            "models": [{"id": alias, "name": alias, "api": "openai-completions",
+                        "reasoning": False, "input": ["text"],
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
+    return _yaml_upsert(HOME / ".omp/agent/models.yml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — omp: omp --model inference-console/" + alias
 
 def _w_opencode(alias, base, ctx):
     def apply(cfg):
@@ -3274,7 +3418,10 @@ def _w_zed(alias, base, ctx):
     def apply(cfg):
         lm = cfg.setdefault("language_models", {}).setdefault("openai", {})
         lm["api_url"] = base + "/v1"
-        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}]
+        # Merge instead of replacing: available_models is the user's own list of models
+        # behind the openai provider, and wiping it unregisters everything else they had.
+        keep = [m for m in (lm.get("available_models") or []) if (m or {}).get("name") != alias]
+        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}] + keep
     return _json_merge(HOME / ".config/zed/settings.json", apply) + " — zed: openai provider model " + alias
 
 def _w_continue(alias, base, ctx):
@@ -3286,16 +3433,19 @@ def _w_continue(alias, base, ctx):
     return _yaml_merge(HOME / ".continue/config.yaml", apply) + " — continue: model " + alias
 
 def _w_claude(alias, base, ctx, key):
-    import httpx
     try:
-        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 8,
+        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]},
                        headers={"anthropic-version": "2023-06-01",
-                                "x-api-key": key or "panel"}, timeout=15)
-        if r.status_code == 404:
-            raise HTTPException(400, "this llama-server has no Anthropic-compat /v1/messages endpoint")
+                                "x-api-key": key or "panel"}, timeout=20)
     except httpx.HTTPError:
         raise HTTPException(400, "server unreachable for /v1/messages probe")
+    if r.status_code == 404:
+        raise HTTPException(400, "this llama-server has no Anthropic-compat /v1/messages endpoint")
+    if r.status_code >= 400:
+        # 401/403 here almost always means a mismatched key; writing the env block anyway
+        # leaves Claude Code pointing at a server that will refuse every request.
+        raise HTTPException(400, f"/v1/messages returned {r.status_code}: {(r.text or '')[:200]}")
     def apply(cfg):
         cfg.setdefault("env", {}).update({
             "ANTHROPIC_BASE_URL": base,
@@ -3317,12 +3467,11 @@ def _w_pi(alias, base, ctx, key):
     return str(path) + " — pi: provider inference-console"
 
 def _w_hermes(alias, base, ctx, key):
-    def apply(cfg):
-        prov = cfg.setdefault("providers", {}).setdefault(PANEL_PROVIDER_ID, {})
-        prov.update({"name": "Inference Console", "base_url": base + "/v1",
-                     "default_model": alias, "model": alias,
-                     "models": {alias: {}}, "models_discovered": True})
-    return _yaml_merge(HOME / ".hermes/config.yaml", apply) + " — hermes: pick /model custom:inference-console"
+    prov = {"name": "Inference Console", "base_url": base + "/v1",
+            "default_model": alias, "model": alias,
+            "models": {alias: {}}, "models_discovered": True}
+    return _yaml_upsert(HOME / ".hermes/config.yaml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — hermes: pick /model custom:inference-console"
 
 def _w_kimi(alias, base, ctx, key):
     path = HOME / ".kimi-code/config.toml"
@@ -5712,6 +5861,7 @@ async function send(){
 
 /* ============================== agents registry ============================== */
 let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
+let AGRES='';  // last Apply's per-agent result rows, kept across re-renders
 async function openAgentsDlg(source){
   AGSRC=source||null;
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
@@ -5721,16 +5871,18 @@ async function openAgentsDlg(source){
   const srcLbl=AGSRC?('this tab’s server ('+AGSRC+')'):'any running server';
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
-    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'">'
+    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'"'+(r?' checked':'')+'>'
       +'<span style="flex:1;min-width:0"><b>'+esc(a.label)+'</b>'
       +(r?' <span class="tag ok">'+esc(r.alias)+'@'+r.port+' · '+esc(ago(r.synced_at))+'</span>':'')
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
+  const dlg=$('#agentsdlg');
   $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>'
     +(AGSRC?' <span class="tag">'+esc(srcLbl)+'</span>':'')+'.</p>'
     +(!srcOk?'<p class="hint" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'')
-    +'<div style="max-height:46vh;overflow:auto">'+rows+'</div><div id="agres" style="margin-top:10px"></div>';
-  $('#agentsdlg').showModal();
+    +'<div style="max-height:46vh;overflow:auto">'+rows+'</div>'
+    +'<div id="agres" style="margin-top:10px">'+AGRES+'</div>';
+  if(!dlg.open)dlg.showModal();
 }
 $('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
 $('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
@@ -5742,11 +5894,14 @@ $('#ag-apply').addEventListener('click',async()=>{
   apply.disabled=true;apply.textContent='Applying…';
   let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
   catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
-  $('#agres').innerHTML=Object.keys(r.results).map(k=>{const v=r.results[k];
+  const rs=Object.keys(r.results).map(k=>r.results[k]);
+  const okN=rs.filter(v=>v.ok).length;
+  AGRES=Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
-  toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
+  toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':'warn', 8000);
+  openAgentsDlg(AGSRC);  // re-render so the registry tags show the new alias/port
   pollStatus();
 });
 
