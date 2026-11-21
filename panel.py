@@ -45,6 +45,9 @@ DEFAULT_CONFIG = {
     "strata_ctx": 8192,
     "strata_api_key": "",
     "strata_last": {},           # address/model reported by the last successful launch
+    # Project Maya (~/project-maya). Empty means use MAYA_DIR / MAYA_ROCM_PATH defaults.
+    "maya_dir": "",
+    "maya_rocm_path": "",
 }
 
 # ---------------------------------------------------------------- config
@@ -1036,6 +1039,9 @@ class ServerManager:
               fa="auto", ctk="", ctv="", parallel=None, batch=None, ubatch=None,
               ncmoe=None, mlock=False, no_mmap=False, draft="", draft_max=16, draft_min=0,
               ot="", tensor_split="", tbatch=None, keep=None, jinja="on", save_profile=True):
+        if preset not in ("cpu-only",) and not str(preset).startswith("igpu"):
+            if MAYA.status().get("running"):
+                raise HTTPException(409, "Stop Maya first — this model needs its GPU VRAM.")
         if self.status()["running"]:
             self.stop()
         mp = Path(model)
@@ -1397,6 +1403,8 @@ class AvalonManager:
             raise HTTPException(503, "Avalon build not found — build ~/avalon first (cmake --build build --target llama-server).")
         if not tgt["model"] or not tgt["model"].exists():
             raise HTTPException(404, "no Flash-Next pack detected in the model dirs — finish a download first or set avalon_model in config.json.")
+        if p["exclusive"] and MAYA.status().get("running"):
+            raise HTTPException(409, "Stop Maya first — Avalon needs its GPU VRAM.")
         if p["exclusive"] and self._gpu_conflict():
             raise HTTPException(409, "Stop the llama.cpp server first — this profile needs its VRAM.")
         if self.status()["running"] or not self._port_free():
@@ -1511,6 +1519,664 @@ class AvalonManager:
         AVALON_STATE_PATH.write_text(json.dumps(self.info))
 
 SMGR = AvalonManager()
+
+# ---------------------------------------------------------------- maya (Project Maya)
+MAYA_DIR = HOME / "project-maya"
+MAYA_ROCM_PATH = HOME / "maya-rocm"
+MAYA_STATE_PATH = APP_DIR / "maya-state.json"
+MAYA_LOG_PATH = APP_DIR / "maya-runtime.log"
+_MAYA_STATUS_TTL = 2.0
+
+_MAYA_RE_LOAD = re.compile(r"\bloaded in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_WARMUP = re.compile(r"\bwarmed up in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_VRAM = re.compile(r"([\d.]+)\s*GB\s+of\s+VRAM", re.I)
+_MAYA_RE_CTX = re.compile(r"\bcontext\s+(\d+)\b", re.I)
+_MAYA_RE_EXPERTS = re.compile(r"(\d+)\s+of\s+(\d+)\s+routed experts in VRAM\s*\(([\d.]+)%\)", re.I)
+_MAYA_RE_READY = re.compile(r"\bready:\s*https?://", re.I)
+_MAYA_RE_HY4_SERVE = re.compile(
+    r"prompt\s+\d+\s+tokens[^()]*\(([\d.]+)\s*tok/s\)[^()]*?generated\s+in\s+[\d.]+\s*ms\s*\(([\d.]+)\s*tok/s\)",
+    re.I,
+)
+_MAYA_RE_ANSWERING = re.compile(r"\[maya\]\s+answering:\s*(\d+)\s+of\s+max\s+\d+\s+tokens,\s*([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_DONE = re.compile(r"\[maya\]\s+done:\s*(\d+)\s+tokens\s+in\s+[\d.]+\s*s\s*\(([\d.]+)\s*tok/s\)", re.I)
+_MAYA_RE_GLM_PREFILL = re.compile(r"glm\s+prefill:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_GLM_STAT = re.compile(r"glm\s+stat:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_QUANT = re.compile(r"(maya-xs|iq\d+_[a-z0-9]+|q\d+_[a-z0-9_]+|fp16|bf16|f16|mxfp4)", re.I)
+
+
+def _tail_file_lines(path: Path, max_lines: int = 250, max_bytes: int = 131072) -> list[str]:
+    """Read up to the last `max_lines` lines from `path` without loading huge logs."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        return lines[-max_lines:]
+    except OSError:
+        return []
+
+
+def _mask_secret(key: str) -> str:
+    if not key:
+        return ""
+    return (key[:4] + "…" + key[-4:]) if len(key) >= 8 else "(short key)"
+
+
+def parse_maya_log(lines: list[str]) -> dict:
+    """Extract live telemetry from Project Maya engine log lines (Hy4 and GLM)."""
+    out = {
+        "decode_tps": None,
+        "prefill_tps": None,
+        "vram_gb": None,
+        "experts_vram": None,
+        "experts_total": None,
+        "experts_vram_pct": None,
+        "context": None,
+        "load_s": None,
+        "warmup_s": None,
+        "ready_seen": False,
+        "active": False,
+        "last_tokens": None,
+    }
+    for ln in lines:
+        if not ln:
+            continue
+        m = _MAYA_RE_VRAM.search(ln)
+        if m:
+            out["vram_gb"] = float(m.group(1))
+        m = _MAYA_RE_CTX.search(ln)
+        if m:
+            out["context"] = int(m.group(1))
+        m = _MAYA_RE_LOAD.search(ln)
+        if m:
+            out["load_s"] = float(m.group(1))
+        m = _MAYA_RE_WARMUP.search(ln)
+        if m:
+            out["warmup_s"] = float(m.group(1))
+        m = _MAYA_RE_EXPERTS.search(ln)
+        if m:
+            out["experts_vram"] = int(m.group(1))
+            out["experts_total"] = int(m.group(2))
+            out["experts_vram_pct"] = float(m.group(3))
+        if _MAYA_RE_READY.search(ln):
+            out["ready_seen"] = True
+        m = _MAYA_RE_HY4_SERVE.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            continue
+        m = _MAYA_RE_ANSWERING.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = True
+            continue
+        m = _MAYA_RE_DONE.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = False
+            continue
+        m = _MAYA_RE_GLM_PREFILL.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            continue
+        m = _MAYA_RE_GLM_STAT.search(ln)
+        if m:
+            out["decode_tps"] = round(float(m.group(1)), 2)
+    return out
+
+
+class MayaMgr:
+    """Manages the local Project Maya server (Hy4-Flash, GLM-5.3-Flash, etc.)."""
+
+    def __init__(self):
+        self.proc = None
+        self.info = {}
+        self.logbuf = deque(maxlen=400)
+        self._cache = {"at": 0.0, "val": None}
+        self._load_state()
+
+    @staticmethod
+    def _maya_dir() -> Path:
+        raw = CFG.get("maya_dir") or ""
+        return Path(raw).expanduser() if raw else MAYA_DIR
+
+    @staticmethod
+    def _rocm_path() -> str:
+        raw = CFG.get("maya_rocm_path") or ""
+        return str(Path(raw).expanduser()) if raw else str(MAYA_ROCM_PATH)
+
+    def _invalidate(self):
+        self._cache["at"] = 0.0
+
+    def _load_state(self):
+        if not MAYA_STATE_PATH.exists():
+            return
+        try:
+            st = json.loads(MAYA_STATE_PATH.read_text())
+            pid = st.get("pid")
+            if pid and _pid_alive(pid):
+                self.proc = None
+                self.info = {**st, "adopted": True}
+                self.log(f"adopted running maya pid={pid} config={st.get('config_id')}")
+        except Exception:
+            pass
+
+    def log(self, line: str):
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
+
+    @staticmethod
+    def _read_config_raw(path: Path) -> dict | None:
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_ctx(raw: dict) -> int:
+        args = raw.get("args") or []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("--max-context", "--ctx-size", "-c") and i + 1 < len(args):
+                    try:
+                        return int(args[i + 1])
+                    except ValueError:
+                        pass
+                if s.startswith("--max-context="):
+                    try:
+                        return int(s.split("=", 1)[1])
+                    except ValueError:
+                        pass
+        for k in ("max_context", "ctx", "context"):
+            if raw.get(k):
+                try:
+                    return int(raw[k])
+                except (TypeError, ValueError):
+                    pass
+        return 131072
+
+    @staticmethod
+    def _extract_model_size(raw: dict, base_dir: Path) -> int:
+        """Compute total byte size of the model file or directory referenced in config args."""
+        args = raw.get("args") or []
+        candidates = []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("-m", "--model", "--model-dir") and i + 1 < len(args):
+                    candidates.append(str(args[i + 1]))
+                elif s.startswith("--model="):
+                    candidates.append(s.split("=", 1)[1])
+                elif not s.startswith("-") and ("/" in s or s.endswith((".gguf", ".safetensors", ".bin"))):
+                    candidates.append(s)
+        for cand in candidates:
+            p = Path(cand).expanduser()
+            if not p.is_absolute():
+                p = base_dir / p
+            if not p.exists():
+                continue
+            try:
+                if p.is_file():
+                    return p.stat().st_size
+                if p.is_dir():
+                    total = 0
+                    for f in p.rglob("*"):
+                        if f.is_file():
+                            try:
+                                total += f.stat().st_size
+                            except OSError:
+                                pass
+                    if total > 0:
+                        return total
+            except OSError:
+                continue
+        return 0
+
+    def _resolve_log_path(self, raw: dict, cfg_path: Path) -> Path:
+        base_dir = self._maya_dir()
+        lp = raw.get("log")
+        if lp:
+            p = Path(str(lp)).expanduser()
+            return p if p.is_absolute() else (base_dir / p)
+        return base_dir / f"{cfg_path.stem}.log"
+
+    def _public_config(self, cfg_path: Path, raw: dict) -> dict:
+        base_dir = self._maya_dir()
+        exe = str(raw.get("exe") or "")
+        exe_path = Path(exe).expanduser()
+        if exe and not exe_path.is_absolute():
+            exe_path = base_dir / exe_path
+        args = raw.get("args") or []
+        args_str = " ".join(str(a) for a in args) if isinstance(args, list) else str(args)
+        engine = "hy4" if "hy4" in exe.lower() or "hy4" in cfg_path.stem.lower() else "glm"
+        # Never default a Maya config to 8080 (latency-speedtest owns 8080).
+        port = int(raw.get("port") or 8098)
+        quant_m = _MAYA_RE_QUANT.search(cfg_path.stem) or _MAYA_RE_QUANT.search(args_str)
+        quant = quant_m.group(1) if quant_m else ""
+        size_b = self._extract_model_size(raw, base_dir)
+        key = str(raw.get("api_key") or "")
+        log_path = self._resolve_log_path(raw, cfg_path)
+        return {
+            "id": cfg_path.stem,
+            "filename": cfg_path.name,
+            "path": str(cfg_path),
+            "model_name": str(raw.get("model_name") or cfg_path.stem),
+            "engine": engine,
+            "exe": exe,
+            "quant": quant,
+            "ctx": self._extract_ctx(raw),
+            "mtp": "--mtp" in args if isinstance(args, list) else ("--mtp" in args_str),
+            "port": port,
+            "host": str(raw.get("host") or "127.0.0.1"),
+            "log": str(log_path),
+            "sampling": raw.get("sampling") if isinstance(raw.get("sampling"), dict) else {},
+            "reasoning_effort": raw.get("reasoning_effort"),
+            "key_set": bool(key),
+            "key_masked": _mask_secret(key),
+            "dir_size_bytes": size_b,
+            "dir_size_h": human_size(size_b) if size_b else "",
+            "available": bool(exe) and exe_path.exists(),
+            "concurrency_note": "1 request at a time" if engine == "hy4" else "",
+        }
+
+    def discover_configs(self) -> list[dict]:
+        """Discover Project Maya JSON configs in MAYA_DIR, excluding *.panel-orig.json backups."""
+        base_dir = self._maya_dir()
+        if not base_dir.is_dir():
+            return []
+        out = []
+        for p in sorted(base_dir.glob("*.json")):
+            name = p.name
+            if name.endswith(".panel-orig.json") or name.endswith(".orig.json") or name.endswith(".bak.json"):
+                continue
+            raw = self._read_config_raw(p)
+            if not raw:
+                continue
+            if not (raw.get("exe") or raw.get("model_name")):
+                continue
+            out.append(self._public_config(p, raw))
+        return out
+
+    def _find_config(self, ref: str) -> tuple[Path, dict, dict] | None:
+        """Resolve a config by full path, filename, or stem id. Returns (path, raw, public)."""
+        ref_s = str(ref or "").strip()
+        if not ref_s:
+            return None
+        base_dir = self._maya_dir()
+        for pub in self.discover_configs():
+            if ref_s in (pub["path"], pub["id"], pub["filename"]):
+                p = Path(pub["path"])
+                raw = self._read_config_raw(p)
+                if raw:
+                    return p, raw, pub
+        # Allow an explicit path inside base_dir if valid
+        cand = Path(ref_s).expanduser()
+        if not cand.is_absolute():
+            cand = base_dir / cand
+        if cand.is_file() and not cand.name.endswith(".panel-orig.json"):
+            raw = self._read_config_raw(cand)
+            if raw and (raw.get("exe") or raw.get("model_name")):
+                return cand, raw, self._public_config(cand, raw)
+        return None
+
+    @staticmethod
+    def _port_open(port: int, timeout: float = 0.15) -> bool:
+        try:
+            with socket.socket() as s:
+                s.settimeout(timeout)
+                return s.connect_ex(("127.0.0.1", int(port))) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _probe_models(port: int, api_key: str, timeout: float = 0.8) -> tuple[bool, str | None]:
+        """Key-authed GET /v1/models probe. Returns (ready, alias)."""
+        if not port or not MayaMgr._port_open(port):
+            return False, None
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            r = httpx.get(f"http://127.0.0.1:{port}/v1/models", headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                alias = None
+                try:
+                    data = r.json().get("data") or []
+                    if isinstance(data, list) and data and isinstance(data[0], dict):
+                        alias = data[0].get("id")
+                except Exception:
+                    pass
+                return True, alias
+            return False, None
+        except Exception:
+            return False, None
+
+    @staticmethod
+    def _find_proc_pid(port: int | None = None) -> int | None:
+        """Best-effort PID lookup on Linux /proc for adopted Maya processes."""
+        if not Path("/proc").is_dir():
+            return None
+        fallback = None
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                pid = int(d.name)
+                if port and str(port) in cmd:
+                    return pid
+                if fallback is None:
+                    fallback = pid
+        return fallback
+
+    def _status_now(self) -> dict:
+        st = self.info
+        if st:
+            pid = st.get("pid")
+            alive = (self.proc is not None and self.proc.poll() is None) or _pid_alive(pid)
+            port = int(st.get("port") or 0)
+            cfg_path = Path(st["config_path"]) if st.get("config_path") else None
+            raw = self._read_config_raw(cfg_path) if cfg_path and cfg_path.exists() else {}
+            raw = raw or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(port, key)
+            if alive or ready:
+                log_path = Path(st.get("log") or "") if st.get("log") else None
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if (log_path and log_path.exists()) else parse_maya_log([])
+                return {
+                    "running": True,
+                    "state": "ready" if ready else "loading",
+                    "pid": pid if alive else self._find_proc_pid(port),
+                    "config_id": st.get("config_id"),
+                    "config_path": st.get("config_path"),
+                    "model_name": st.get("model_name"),
+                    "alias": alias or st.get("model_name") or "maya",
+                    "engine": st.get("engine") or "hy4",
+                    "port": port,
+                    "ctx": int(st.get("ctx") or self._extract_ctx(raw)),
+                    "log": st.get("log") or "",
+                    "key_set": bool(key),
+                    "key_masked": _mask_secret(key),
+                    "uptime": int(time.time() - st.get("started_at", time.time())),
+                    "cmd": st.get("cmd", ""),
+                    "adopted": bool(st.get("adopted", False)),
+                    "telemetry": tel,
+                }
+            # Tracked process died and port is closed
+            self.proc = None
+            self.info = {}
+            MAYA_STATE_PATH.unlink(missing_ok=True)
+
+        # Port-probe adoption: check discovered configs for an already-running Maya server.
+        for pub in self.discover_configs():
+            cfg_path = Path(pub["path"])
+            raw = self._read_config_raw(cfg_path) or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(pub["port"], key)
+            if ready:
+                pid = self._find_proc_pid(pub["port"])
+                log_path = Path(pub["log"])
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if log_path.exists() else parse_maya_log([])
+                self.info = {
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "started_at": time.time(),
+                    "adopted": True,
+                    "cmd": "",
+                }
+                return {
+                    "running": True,
+                    "state": "ready",
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "alias": alias or pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "key_set": pub["key_set"],
+                    "key_masked": pub["key_masked"],
+                    "uptime": 0,
+                    "cmd": "",
+                    "adopted": True,
+                    "telemetry": tel,
+                }
+        return {"running": False, "state": "stopped", "telemetry": parse_maya_log([])}
+
+    def status(self, refresh: bool = False) -> dict:
+        now = time.time()
+        if not refresh and self._cache["val"] is not None and (now - self._cache["at"]) < _MAYA_STATUS_TTL:
+            return self._cache["val"]
+        val = self._status_now()
+        self._cache["val"] = val
+        self._cache["at"] = now
+        return val
+
+    def active_api_key(self, config_ref: str | None = None) -> str:
+        """Server-side only: return raw api_key for the active or specified Maya config."""
+        ref = config_ref or self.info.get("config_path")
+        if not ref:
+            st = self.status()
+            ref = st.get("config_path")
+        if not ref:
+            return ""
+        found = self._find_config(ref)
+        if not found:
+            return ""
+        return str(found[1].get("api_key") or "")
+
+    @staticmethod
+    def _gpu_conflict() -> bool:
+        return AvalonManager._gpu_conflict()
+
+    def build_start_spec(self, cfg_path: Path, pub: dict) -> tuple[list[str], dict, Path]:
+        base_dir = self._maya_dir()
+        venv_py = base_dir / ".venv/bin/python"
+        launcher = base_dir / "maya.py"
+        argv = [str(venv_py), str(launcher), "--config", str(cfg_path), "--port", str(pub["port"])]
+        env = dict(os.environ)
+        env["ROCM_PATH"] = self._rocm_path()
+        return argv, env, base_dir
+
+    def start(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        cfg_path, raw, pub = found
+        if pub["port"] == 8080:
+            raise HTTPException(400, "Refusing port 8080 — reserved by latency-speedtest. Edit the config port to 8098/8099.")
+
+        # Exclusivity: refuse a second Maya config while one serves.
+        cur = self.status(refresh=True)
+        if cur.get("running"):
+            raise HTTPException(
+                409,
+                f"Maya is already running ({cur.get('model_name')} on :{cur.get('port')}) — stop it or use Switch.",
+            )
+
+        # GPU-conflict guard against other engines & VRAM.
+        if MGR.status().get("running"):
+            raise HTTPException(409, "Stop the llama.cpp server first — Maya needs the GPU VRAM.")
+        if SMGR.status().get("running"):
+            raise HTTPException(409, "Stop Avalon first — Maya needs the GPU VRAM.")
+        if strata_status().get("running"):
+            raise HTTPException(409, "Stop Strata first — Maya needs the GPU VRAM.")
+        if self._gpu_conflict():
+            raise HTTPException(409, "Another engine is holding GPU VRAM — stop it first.")
+
+        argv, env, base_dir = self.build_start_spec(cfg_path, pub)
+        if not Path(argv[0]).exists():
+            raise HTTPException(503, f"Maya virtualenv python not found: {argv[0]}")
+        if not Path(argv[1]).exists():
+            raise HTTPException(503, f"Maya launcher not found: {argv[1]}")
+
+        cmd_str = _redact_cmd(" ".join(argv))
+        self.log(f"starting maya {pub['model_name']} ({pub['id']}) on :{pub['port']}: {cmd_str}")
+        MAYA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(MAYA_LOG_PATH, "a", encoding="utf-8", errors="replace")
+        try:
+            self.proc = subprocess.Popen(
+                argv,
+                cwd=str(base_dir),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+
+        self.info = {
+            "pid": self.proc.pid,
+            "config_id": pub["id"],
+            "config_path": str(cfg_path),
+            "model_name": pub["model_name"],
+            "engine": pub["engine"],
+            "port": pub["port"],
+            "ctx": pub["ctx"],
+            "log": pub["log"],
+            "started_at": time.time(),
+            "adopted": False,
+            "cmd": cmd_str,
+        }
+        self._save_state()
+        self._invalidate()
+        return self.status(refresh=True)
+
+    @staticmethod
+    def _kill_orphans(port: int | None = None) -> bool:
+        """Terminate any untracked Maya python/engine processes on Linux /proc."""
+        if not Path("/proc").is_dir():
+            return False
+        victims = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                victims.append(int(d.name))
+        for v in victims:
+            try:
+                os.killpg(os.getpgid(v), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(v, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(80):
+            port_free = (not port) or (not MayaMgr._port_open(port))
+            if port_free and not any(_pid_alive(v) for v in victims):
+                break
+            time.sleep(0.1)
+        for v in victims:
+            if _pid_alive(v):
+                try:
+                    os.kill(v, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(30):
+            if (not port) or (not MayaMgr._port_open(port)):
+                break
+            time.sleep(0.1)
+        return bool(victims)
+
+    def stop(self) -> dict:
+        cur = self.status(refresh=True)
+        st = self.info
+        pid = st.get("pid") or cur.get("pid")
+        port = st.get("port") or cur.get("port")
+        killed = False
+        if pid and _pid_alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for _ in range(100):
+                port_free = (not port) or (not self._port_open(port))
+                if not _pid_alive(pid) and port_free and not self._gpu_conflict():
+                    killed = True
+                    break
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            killed = True
+        if port and self._port_open(port):
+            if self._kill_orphans(port):
+                killed = True
+        self.proc = None
+        self.info = {}
+        MAYA_STATE_PATH.unlink(missing_ok=True)
+        self._invalidate()
+        stopped = (not port) or (not self._port_open(port))
+        self.log(f"stopped maya (pid {pid})" if killed else ("maya not running" if stopped else f"stop failed: port {port} still busy"))
+        return {"stopped": stopped}
+
+    def switch(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        if self.status(refresh=True).get("running"):
+            res = self.stop()
+            if not res.get("stopped"):
+                raise HTTPException(503, "Failed to stop running Maya server before switching.")
+        return self.start(str(found[0]))
+
+    def tail_log(self, max_lines: int = 250) -> dict:
+        st = self.status()
+        log_path_s = st.get("log") or self.info.get("log") or ""
+        lines: list[str] = []
+        source_path = ""
+        if log_path_s:
+            lp = Path(log_path_s)
+            if lp.exists():
+                lines = _tail_file_lines(lp, max_lines=max_lines)
+                source_path = str(lp)
+        if not lines and MAYA_LOG_PATH.exists():
+            lines = _tail_file_lines(MAYA_LOG_PATH, max_lines=max_lines)
+            source_path = str(MAYA_LOG_PATH)
+        if not lines and self.logbuf:
+            lines = list(self.logbuf)[-max_lines:]
+        key = self.active_api_key()
+        text = "\n".join(lines)
+        if key and len(key) >= 6:
+            text = text.replace(key, _mask_secret(key))
+        return {"log": _redact_cmd(text), "path": source_path}
+
+    def _save_state(self):
+        MAYA_STATE_PATH.write_text(json.dumps(self.info))
+
+
+MAYA = MayaMgr()
 
 # ---------------------------------------------------------------- vitals
 _prev_cpu = None
@@ -3144,6 +3810,8 @@ def api_strata_update():
 def api_strata_launch(b: StrataLaunchBody):
     if not strata_bin():
         raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    if not b.plan and MAYA.status().get("running"):
+        raise HTTPException(409, "Stop Maya first — Strata needs its GPU VRAM.")
     args = strata_build_args(b, plan=b.plan)
     # A plan is read-only, so it is worth the long timeout; a real launch downloads and
     # loads a model and must not be cut off mid-download by a short client-side wait.
@@ -3224,6 +3892,43 @@ def api_strata_telemetry():
 def api_strata_log():
     return {"log": "\n".join(list(STRATA_LOG)[-120:])}
 
+# ---------------------------------------------------------------- maya api
+@app.get("/api/maya/status")
+def api_maya_status():
+    return MAYA.status()
+
+@app.get("/api/maya/configs")
+def api_maya_configs():
+    return {"configs": MAYA.discover_configs()}
+
+class MayaStartBody(BaseModel):
+    config: str
+    switch: bool = False
+
+@app.post("/api/maya/start")
+def api_maya_start(b: MayaStartBody):
+    return MAYA.switch(b.config) if b.switch else MAYA.start(b.config)
+
+@app.post("/api/maya/switch")
+def api_maya_switch(b: MayaStartBody):
+    return MAYA.switch(b.config)
+
+@app.post("/api/maya/stop")
+def api_maya_stop():
+    return MAYA.stop()
+
+@app.get("/api/maya/log")
+def api_maya_log():
+    return MAYA.tail_log(max_lines=250)
+
+@app.get("/api/maya/key")
+def api_maya_key(reveal: bool = False, config: str | None = None):
+    """Masked API key for the active (or specified) Maya config; reveal=1 returns the raw key."""
+    key = MAYA.active_api_key(config)
+    if not key:
+        return {"key_set": False, "masked": "", "key": ""}
+    return {"key_set": True, "masked": _mask_secret(key), "key": key if reveal else ""}
+
 def _strata_alias() -> str:
     last = CFG.get("strata_last") or {}
     return str(last.get("model") or CFG.get("strata_alias") or "strata")
@@ -3256,6 +3961,10 @@ def _current_llm(prefer: str | None = None):
         # secret into every synced agent config and into panel state without being asked.
         return from_server(_strata_alias(), s["port"], None, int(CFG.get("strata_ctx") or 8192),
                            CFG.get("strata_api_key", ""), "strata")
+    my = MAYA.status()
+    if want("maya") and my.get("running") and my.get("port"):
+        return (my.get("alias") or my.get("model_name") or "maya"), my["port"], \
+            int(my.get("ctx") or 131072), MAYA.active_api_key(), "maya"
     return None
 
 def _chat_target():
@@ -3271,6 +3980,9 @@ def _chat_target():
     s = strata_status()
     if s.get("running") and s.get("port") and s.get("health") == "ready":
         return s["port"], CFG.get("strata_api_key", "")
+    my = MAYA.status()
+    if my.get("running") and my.get("state") == "ready" and my.get("port"):
+        return my["port"], MAYA.active_api_key()
     return None
 
 def _yaml_merge(path, apply):
@@ -3536,6 +4248,7 @@ def api_agents():
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
+    my = MAYA.status()
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
             "running": _current_llm(),
@@ -3543,11 +4256,12 @@ def api_agents():
                 "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
                 "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
                 "strata": bool(s.get("running") and s.get("port")),
+                "maya": bool(my.get("running") and my.get("port")),
             }}
 
 class AgentSyncBody(BaseModel):
     agents: list[str]
-    source: str | None = None  # auto | panel | avalon | strata
+    source: str | None = None  # auto | panel | avalon | strata | maya
 
 @app.post("/api/agents/sync")
 def api_agents_sync(b: AgentSyncBody):
@@ -3984,7 +4698,7 @@ def api_setup_install(b: SetupInstallBody):
 async def api_chat(req: Request):
     tgt = _chat_target()
     if not tgt:
-        raise HTTPException(409, "no model ready — load one in the Models, Strata, or Avalon tab")
+        raise HTTPException(409, "no model ready — load one in the Models, Strata, Avalon, or Maya tab")
     MGR.touch()
     port, key = tgt
     body = await req.json()
@@ -4382,6 +5096,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="nl">llama.cpp</span><span class="ndot" id="nd-server" title="llama.cpp status"></span></button>
       <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg><span class="nl">Strata</span><span class="ndot" id="nd-strata" title="Strata status"></span></button>
       <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="nl">Avalon</span><span class="ndot" id="nd-avalon" title="Avalon status"></span></button>
+      <button data-t="maya"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2L4 7v10l8 5 8-5V7l-8-5z"/><circle cx="12" cy="12" r="3"/></svg><span class="nl">Maya</span><span class="ndot" id="nd-maya" title="Maya status"></span></button>
     </div>
     <div class="nav-grp">
       <div class="nav-lbl">System</div>
@@ -4733,6 +5448,59 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn sm" id="avlogcopy">Copy</button>
     </div>
     <pre class="log" id="avalonlog" style="max-height:280px"></pre>
+  </div>
+</section>
+
+<!-- ==================== MAYA ==================== -->
+<section id="t-maya" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Project Maya</h2><span class="tag mut" id="mayachip">checking…</span></div>
+    <div id="mayadetail" class="kvs" style="margin-bottom:10px"></div>
+
+    <div class="grid g4" style="margin-bottom:12px">
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Decode speed</h2><span class="tag mut" id="m-state-tag">idle</span></div>
+        <div class="stat"><span id="m-dec-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-dec-sub">Waiting for log telemetry</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Prefill speed</h2></div>
+        <div class="stat"><span id="m-pre-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0">Prompt processing rate</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>VRAM &amp; Experts</h2></div>
+        <div class="stat"><span id="m-vram">—</span> <small>GB</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-exp-sub">Experts in VRAM: —</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Context &amp; Load</h2></div>
+        <div class="stat"><span id="m-ctx">—</span> <small>ctx</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-load-sub">Load / warmup: —</p>
+      </div>
+    </div>
+
+    <div id="mayaconfigs"></div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="mayastart">Start selected</button>
+      <button class="btn acc2" id="mayaswitch" title="Stop the running Maya config and start the selected one">Switch to selected</button>
+      <button class="btn danger" id="mayastop">Stop</button>
+      <button class="btn" id="mayaagentsbtn" title="Point coding agents at this Maya server">Register in coding agents…</button>
+      <button class="btn sm" id="mayakeybtn" title="Reveal masked API key for the active Maya config">Reveal API key</button>
+      <span class="hint">OpenAI &amp; Anthropic API · exclusive GPU · <code>ROCM_PATH</code> managed automatically</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2>Maya engine log</h2>
+      <div class="meta">
+        <span class="hint mono" id="mayalogpath"></span>
+        <button class="btn sm" id="mayalogref">Refresh</button>
+      </div>
+    </div>
+    <pre class="log" id="mayalog" style="max-height:300px"></pre>
   </div>
 </section>
 
@@ -5258,9 +6026,9 @@ $('#logout').addEventListener('click',async()=>{
 });
 
 /* ============================== tabs & workbench rail ============================== */
-const TABS=['models','server','strata','avalon','vitals','chat','hf','settings'];
+const TABS=['models','server','strata','avalon','maya','vitals','chat','hf','settings'];
 const TAB_TITLES={models:'Model Library',server:'llama.cpp Server & Bench',strata:'Strata Engine',
-  avalon:'Avalon 125B MoE',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
+  avalon:'Avalon 125B MoE',maya:'Project Maya',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
 let tab='models';
 function closeNav(){document.body.classList.remove('nav-open')}
 $('#mobmenu').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
@@ -5276,21 +6044,23 @@ function setTab(t){
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
   if(t==='strata'){loadStrata();loadStrataPresets();loadStrataKey();pollStrataTelemetry();refreshStrataLog();}
   if(t==='avalon'){loadAvalon(true);loadAvalonAccess();}
+  if(t==='maya'){loadMaya();refreshMayaLog();}
   if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
 $('#hdrstatus').addEventListener('click',()=>{
   const ct=chatTarget();
-  if(ct)setTab(ct.src==='avalon'?'avalon':ct.src==='strata'?'strata':'server');
+  if(ct)setTab(ct.src==='avalon'?'avalon':ct.src==='strata'?'strata':ct.src==='maya'?'maya':'server');
   else if(ACTIVE)setTab('server');
   else if(AV&&AV.running)setTab('avalon');
   else if(STRATA&&STRATA.running)setTab('strata');
+  else if(MAYA&&MAYA.running)setTab('maya');
   else setTab('models');
 });
 
 /* ============================== models & launch modal ============================== */
-let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
+let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,MAYA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
 const SHX=new Set(); // expanded multi-shard groups
 const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
@@ -5587,6 +6357,7 @@ function chatTarget(){
   if(AV&&AV.running&&AV.state==='ready')return{alias:AV.model||'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.port===ap)return{alias:'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(STRATA&&STRATA.running&&STRATA.health==='ready'&&STRATA.port)return{alias:STRATA.model||'strata',port:STRATA.port,src:'strata'};
+  if(MAYA&&MAYA.running&&MAYA.state==='ready'&&MAYA.port)return{alias:MAYA.alias||MAYA.model_name||'maya',port:MAYA.port,src:'maya'};
   return null;
 }
 function drawHeader(){
@@ -5594,7 +6365,7 @@ function drawHeader(){
   const ct=chatTarget();
   if(ct){
     p.className='pill ok';
-    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':'');
+    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':ct.src==='maya'?' · maya':'');
     document.title='● '+ct.alias+' — Inference Console';
   }else if(ACTIVE){
     p.className='pill warn';
@@ -5608,6 +6379,10 @@ function drawHeader(){
     p.className='pill warn';
     t.textContent='strata · loading…';
     document.title='◌ Loading Strata — Inference Console';
+  }else if(MAYA&&MAYA.running){
+    p.className='pill warn';
+    t.textContent=(MAYA.model_name||'maya')+' · loading…';
+    document.title='◌ Loading Maya — Inference Console';
   }else{
     p.className='pill';
     t.textContent='no server running';
@@ -5618,6 +6393,7 @@ function drawHeader(){
   setDot('#nd-server',(ACTIVE&&ACTIVE.port!==ap)?(ACTIVE.ready?'ok':'warn'):'');
   setDot('#nd-avalon',(AV&&AV.running)?(AV.state==='ready'?'ok':'warn'):(ACTIVE&&ACTIVE.port===ap?(ACTIVE.ready?'ok':'warn'):''));
   setDot('#nd-strata',(STRATA&&STRATA.running)?(STRATA.health==='ready'?'ok':'warn'):'');
+  setDot('#nd-maya',(MAYA&&MAYA.running)?(MAYA.state==='ready'?'ok':'warn'):'');
   const idleChip=$('#hdridle'),srvIdle=$('#srvidlechip');
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.idle_unload_min>0&&ACTIVE.idle_remaining_s!=null){
     const txt='idle unload '+fmtUp(ACTIVE.idle_remaining_s);
@@ -5871,7 +6647,7 @@ function drawChatTarget(){
   if(ct){t.className='tag ok';t.textContent=ct.alias+' · :'+ct.port}
   else{t.className='tag warn';t.textContent='no model loaded'}
   $('#sendbtn').disabled=BUSY||!ct;
-  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, or Avalon tab to chat.';
+  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, Avalon, or Maya tab to chat.';
 }
 function md(src){
   const blocks=[];
@@ -6105,15 +6881,20 @@ async function send(){
 }
 
 /* ============================== agents registry ============================== */
-let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
+let AGSRC=null; // null = auto (panel first); 'panel' | 'avalon' | 'strata' | 'maya' pins the source
 let AGRES='';  // last Apply's per-agent result rows, kept across re-renders
 async function openAgentsDlg(source){
   AGSRC=source||null;
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
   const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
-  const srcOk=!AGSRC||(d.sources&&d.sources[AGSRC]);
-  const srcLbl=AGSRC?('this tab’s server ('+AGSRC+')'):'any running server';
+  const srcs=d.sources||{};
+  const selSrc=AGSRC||'auto';
+  const srcOpts=['auto','panel','avalon','strata','maya'].map(s=>{
+    const up=s==='auto'?Boolean(d.running):Boolean(srcs[s]);
+    return '<option value="'+s+'"'+(s===selSrc?' selected':'')+'>'+s+(s==='auto'?' (first running)':(up?' · running':' · stopped'))+'</option>';
+  }).join('');
+  const srcOk=!AGSRC||Boolean(srcs[AGSRC]);
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
     return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'"'+(r?' checked':'')+'>'
@@ -6122,16 +6903,25 @@ async function openAgentsDlg(source){
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
   const dlg=$('#agentsdlg');
-  $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>'
-    +(AGSRC?' <span class="tag">'+esc(srcLbl)+'</span>':'')+'.</p>'
-    +(!srcOk?'<p class="hint" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'')
+  $('#ag-body').innerHTML='<p style="margin:0 0 8px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>.</p>'
+    +'<div style="display:flex;gap:8px;align-items:center;margin:0 0 10px"><label class="hint" for="ag-src">Source</label>'
+    +'<select id="ag-src" style="flex:1">'+srcOpts+'</select></div>'
+    +(!srcOk?'<p class="hint" id="ag-src-warn" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'<p class="hint hide" id="ag-src-warn" style="margin:0 0 10px;color:var(--warn,#c80)"></p>')
     +'<div style="max-height:46vh;overflow:auto">'+rows+'</div>'
     +'<div id="agres" style="margin-top:10px">'+AGRES+'</div>';
+  $('#ag-src').addEventListener('change',e=>{
+    const v=e.target.value;
+    AGSRC=v==='auto'?null:v;
+    const w=$('#ag-src-warn');
+    if(AGSRC&&!srcs[AGSRC]){w.textContent='The '+AGSRC+' server isn’t running — start it on its tab, or apply anyway to get a clear error.';w.classList.remove('hide');}
+    else w.classList.add('hide');
+  });
   if(!dlg.open)dlg.showModal();
 }
 $('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
 $('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
 $('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata'));
+$('#mayaagentsbtn').addEventListener('click',()=>openAgentsDlg('maya'));
 $('#ag-apply').addEventListener('click',async()=>{
   const apply=$('#ag-apply');
   const picks=$$('.agchk',$('#agentsdlg')).filter(x=>x.checked).map(x=>x.value);
@@ -6561,6 +7351,137 @@ $('#avalonlan').addEventListener('change',async e=>{
   e.target.disabled=false;loadAvalonAccess();loadAvalon();
 });
 
+/* ============================== maya ============================== */
+let MLIST=[],MSEL='';
+function drawMaya(s,list){
+  const chip=$('#mayachip');
+  chip.textContent=s.running?(s.state==='ready'?'maya · ready':'maya · loading'):'maya · stopped';
+  chip.className='tag '+(s.running?(s.state==='ready'?'ok':'warn'):'mut');
+  const tel=s.telemetry||{};
+  $('#m-state-tag').textContent=tel.active?'answering':(s.running?(s.state==='ready'?'ready':'loading'):'idle');
+  $('#m-state-tag').className='tag '+(tel.active?'ok':(s.running&&s.state==='ready'?'acc':'mut'));
+  $('#m-dec-tps').textContent=tel.decode_tps!=null?tel.decode_tps:'—';
+  $('#m-dec-sub').textContent=tel.last_tokens?n0(tel.last_tokens)+' tokens last turn':'Waiting for log telemetry';
+  $('#m-pre-tps').textContent=tel.prefill_tps!=null?tel.prefill_tps:'—';
+  $('#m-vram').textContent=tel.vram_gb!=null?tel.vram_gb:'—';
+  $('#m-exp-sub').textContent=tel.experts_vram!=null&&tel.experts_total
+    ?'Experts in VRAM: '+n0(tel.experts_vram)+' / '+n0(tel.experts_total)+' ('+tel.experts_vram_pct+'%)'
+    :'Experts in VRAM: —';
+  const ctxVal=tel.context||s.ctx;
+  $('#m-ctx').textContent=ctxVal?n0(ctxVal):'—';
+  const loadParts=[];
+  if(tel.load_s!=null)loadParts.push('loaded '+tel.load_s+'s');
+  if(tel.warmup_s!=null)loadParts.push('warmup '+tel.warmup_s+'s');
+  $('#m-load-sub').textContent=loadParts.length?loadParts.join(' · '):'Load / warmup: —';
+
+  if(s.running){
+    const kvs=[
+      ['alias',s.alias||s.model_name],
+      ['engine',s.engine||'maya'],
+      ['port',':'+s.port],
+      s.pid?['pid',s.pid]:null,
+      s.ctx?['ctx',n0(s.ctx)]:null,
+      s.adopted?['source','adopted']:['up',fmtUp(s.uptime||0)],
+      s.key_set?['key',s.key_masked]:null,
+    ].filter(Boolean);
+    $('#mayadetail').innerHTML=kvs.map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+      +(s.engine==='hy4'?'<span class="tag warn" title="Hy4 serves one request at a time">1 req/time</span>':'')
+      +'<button class="btn xs" data-copy="http://127.0.0.1:'+s.port+'/v1">Copy base URL</button>';
+  }else{
+    $('#mayadetail').innerHTML='<span class="hint">Maya is stopped. Choose a config below to start serving.</span>';
+  }
+
+  if(list){
+    if(!MSEL||!list.some(c=>c.path===MSEL))MSEL=(s.running&&s.config_path)||'';
+    if(!MSEL&&list.length)MSEL=(list.find(c=>c.available)||list[0]).path;
+    if(!list.length){
+      $('#mayaconfigs').innerHTML='<div class="empty"><b>No Project Maya configs found</b>Expected JSON configs in <code>~/project-maya/</code> (e.g. <code>maya-hy4-flash-maya-xs.json</code>).</div>';
+    }else{
+      $('#mayaconfigs').innerHTML=list.map(c=>{
+        const isRun=s.running&&(s.config_path===c.path||s.config_id===c.id);
+        const tags=[
+          '<span class="tag">'+esc(c.engine.toUpperCase())+'</span>',
+          c.quant?'<span class="tag acc">'+esc(c.quant)+'</span>':'',
+          '<span class="tag mut">'+n0(c.ctx)+' ctx</span>',
+          '<span class="tag mut">:'+esc(c.port)+'</span>',
+          c.dir_size_h?'<span class="tag mut">'+esc(c.dir_size_h)+'</span>':'',
+          c.mtp?'<span class="tag ok">MTP</span>':'',
+          c.reasoning_effort?'<span class="tag mut">think:'+esc(c.reasoning_effort)+'</span>':'',
+          c.key_set?'<span class="tag mut mono" title="API key set (server-side)">key '+esc(c.key_masked)+'</span>':'',
+          c.concurrency_note?'<span class="tag warn">'+esc(c.concurrency_note)+'</span>':'',
+          isRun?'<span class="tag ok">running</span>':'',
+          !c.available?'<span class="tag err">binary missing</span>':'',
+        ].filter(Boolean).join(' ');
+        return '<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+          +'<input type="radio" name="mcfg" value="'+esc(c.path)+'"'+(c.path===MSEL?' checked':'')+'>'
+          +'<span style="flex:1;min-width:0"><b>'+esc(c.model_name)+'</b> <span class="hint mono">'+esc(c.filename)+'</span>'
+          +'<div class="kvs" style="margin-top:4px">'+tags+'</div></span></label>';
+      }).join('');
+      $$('#mayaconfigs input[name=mcfg]').forEach(r=>r.addEventListener('change',()=>{MSEL=r.value;drawMaya(MAYA||s,MLIST)}));
+    }
+  }
+  const selObj=(MLIST||[]).find(c=>c.path===MSEL);
+  const selRunning=!!(s.running&&selObj&&(s.config_path===selObj.path||s.config_id===selObj.id));
+  $('#mayastart').disabled=!MSEL||!!s.running;
+  $('#mayaswitch').disabled=!MSEL||!s.running||selRunning;
+  $('#mayastop').disabled=!s.running;
+  $('#mayakeybtn').disabled=!s.key_set&&!(selObj&&selObj.key_set);
+}
+async function loadMaya(){
+  try{
+    const [cfgs,st]=await Promise.all([api('/api/maya/configs'),api('/api/maya/status')]);
+    MLIST=(cfgs&&cfgs.configs)||[];
+    MAYA=st;
+    drawMaya(st,MLIST);
+    drawHeader();drawChatTarget();
+  }catch(e){}
+}
+async function refreshMayaLog(){
+  try{
+    const d=await api('/api/maya/log');
+    if(d.path)$('#mayalogpath').textContent=d.path;
+    paintInto($('#mayalog'),d.log||'');
+  }catch(e){}
+}
+$('#mayadetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Base URL')});
+$('#mayalogref').addEventListener('click',refreshMayaLog);
+$('#mayastart').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  $('#mayastart').disabled=true;
+  try{
+    await post('/api/maya/start',{config:MSEL,switch:false});
+    toast('Maya starting — cold start takes 30–60 s','ok');
+  }catch(e){toast('Start failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayaswitch').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  if(!await confirmDlg('Switch Maya config','Stop the running Maya server and start the selected config?','Switch',true))return;
+  $('#mayaswitch').disabled=true;
+  try{
+    await post('/api/maya/switch',{config:MSEL,switch:true});
+    toast('Switching Maya config — cold start takes 30–60 s','ok');
+  }catch(e){toast('Switch failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayastop').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop Maya','Stop the running Project Maya server and release VRAM?','Stop',true))return;
+  $('#mayastop').disabled=true;
+  try{
+    const r=await post('/api/maya/stop');
+    toast(r.stopped?'Maya stopped & VRAM released':'Stop requested — check log',r.stopped?'ok':'warn');
+  }catch(e){toast('Stop failed: '+e.message,'err')}
+  loadMaya();refreshMayaLog();
+});
+$('#mayakeybtn').addEventListener('click',async()=>{
+  try{
+    const q=MSEL?('&config='+encodeURIComponent(MSEL)):'';
+    const d=await api('/api/maya/key?reveal=1'+q);
+    if(!d.key_set||!d.key)return toast('No API key configured','warn');
+    await copy(d.key,'Maya API key');
+  }catch(e){toast('Failed: '+e.message,'err')}
+});
+
 /* ============================== HF pull (resumable) ============================== */
 let HFREPO='',DLPREV={},DLTIMER=null;
 async function hfSearch(){
@@ -6815,6 +7736,9 @@ function buildPaletteItems(){
   if(STRATA&&STRATA.running){
     items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
   }
+  if(MAYA&&MAYA.running){
+    items.push({label:'Stop Maya ('+(MAYA.alias||MAYA.model_name||'maya')+')',sub:':'+(MAYA.port||''),run:()=>$('#mayastop').click()});
+  }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
   items.push({label:'Restart the panel process',sub:'Panel',run:()=>{setTab('settings');loadPanelProc();$('#panelrestart').click()}});
@@ -6878,6 +7802,7 @@ function tick(){
   pollTelemetry();
   if(tab==='strata'){loadStrata();pollStrataTelemetry();}
   if(tab==='avalon')loadAvalon();
+  if(tab==='maya')loadMaya();
 }
 setInterval(tick,2500);
 setInterval(()=>{if(!document.hidden)refreshVitals()},5000);
@@ -6885,6 +7810,7 @@ setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
 setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='strata')refreshStrataLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
+setInterval(()=>{if(!document.hidden&&tab==='maya')refreshMayaLog()},1500);
 async function refreshAvalonLog(){
   try{const d=await api('/api/avalon/log');AVLOGTEXT=d.log||'';paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn')}catch(e){}
 }
@@ -6913,7 +7839,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
