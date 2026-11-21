@@ -4032,30 +4032,31 @@ HTML = r"""<!doctype html>
 :root:has(> head > meta[name="color-scheme"][content="dark"]) { color-scheme: dark; }
 :root:has(> head > meta[name="color-scheme"][content="light"]) { color-scheme: light; }
 :root {
-  --bg:#090b10; --bg-2:#0d1118; --panel:#11161f; --panel-2:#151c27; --raise:#1a2230;
-  --bd:#1f2837; --bd-2:#2a3548;
-  --fg:#edf2f8; --fg-2:#c0cad8; --mut:#8493a8; --faint:#59667a;
+  --bg:#080a0f; --bg-2:#0d1118; --panel:#111620; --panel-2:#161c28; --raise:#1c2434;
+  --bd:#1f2838; --bd-2:#2c384e;
+  --fg:#edf2f8; --fg-2:#c4cedd; --mut:#8595ab; --faint:#5a687e;
   --acc:#22d3ee; --acc-2:#f59e0b; --acc-ink:#04131a;
   --ok:#34d399; --warn:#f59e0b; --err:#f87171;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(34,211,238,.09) 0%,rgba(245,158,11,.04) 44%,rgba(0,0,0,0) 70%);
+  --glow:radial-gradient(960px 440px at 88% -8%,rgba(34,211,238,.08) 0%,rgba(245,158,11,.03) 42%,rgba(0,0,0,0) 70%);
   --grad:linear-gradient(135deg,#22d3ee,#06b6d4);
-  --sh:0 2px 6px rgba(0,0,0,.28);
+  --sh:0 1px 3px rgba(0,0,0,.32);
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-  --r:12px;
+  --r:11px;
+  --rail:224px;
 }
 [data-theme=light] {
-  --bg:#f4f6fa; --bg-2:#eaeff5; --panel:#ffffff; --panel-2:#f9fbfd; --raise:#edf2f8;
-  --bd:#d9e1ec; --bd-2:#c2cedd;
+  --bg:#f4f6fa; --bg-2:#eaf0f6; --panel:#ffffff; --panel-2:#f9fbfd; --raise:#edf2f8;
+  --bd:#d9e1ec; --bd-2:#c0cddc;
   --fg:#0f1724; --fg-2:#334155; --mut:#5b6b82; --faint:#8594a8;
   --acc:#0284c7; --acc-2:#d97706; --acc-ink:#ffffff;
   --ok:#059669; --warn:#b45309; --err:#dc2626;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(2,132,199,.08) 0%,rgba(0,0,0,0) 68%);
-  --sh:0 2px 6px rgba(15,23,36,.07);
+  --glow:radial-gradient(960px 440px at 88% -8%,rgba(2,132,199,.07) 0%,rgba(0,0,0,0) 68%);
+  --sh:0 1px 3px rgba(15,23,36,.07);
 }
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;min-height:100vh;background-color:var(--bg);
-  background-image:var(--glow),radial-gradient(color-mix(in srgb,var(--bd-2) 45%,transparent) 1px,transparent 1px);
+  background-image:var(--glow),radial-gradient(color-mix(in srgb,var(--bd-2) 38%,transparent) 1px,transparent 1px);
   background-size:100% 100%,24px 24px;background-repeat:no-repeat,repeat;color:var(--fg);
   font:13.5px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
@@ -4069,35 +4070,56 @@ code,pre,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .skip{position:absolute;left:-1px;top:-44px;background:var(--acc);color:var(--acc-ink);padding:8px 12px;border-radius:8px;z-index:99;font-weight:600}
 .skip:focus{top:8px;left:8px}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
-::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--bd-2);border-radius:99px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
 
-/* ---------- header ---------- */
-header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px;padding:8px 16px;
-  background:color-mix(in srgb,var(--bg) 86%,transparent);
-  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
-  border-bottom:1px solid var(--bd)}
-.brand{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);display:grid;place-items:center;
-  color:var(--acc-ink);box-shadow:0 1px 3px rgba(0,0,0,.35)}
-.mark svg{width:16px;height:16px}
-.brand .nm{font-size:14.5px;font-weight:700;line-height:1.15;letter-spacing:-.02em}
-.brand .sub{display:block;font-size:11px;font-weight:500;color:var(--mut);font-family:var(--mono)}
-.nav{display:flex;gap:2px;padding:3px;background:var(--panel);border:1px solid var(--bd);border-radius:10px;
-  overflow-x:auto;scrollbar-width:none;min-width:0}
-.nav::-webkit-scrollbar{display:none}
-.nav button{display:flex;align-items:center;gap:6px;padding:6px 10px;border:0;border-radius:7px;background:transparent;
-  color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .14s,color .14s}
-.nav button svg{width:14px;height:14px;opacity:.82;flex-shrink:0}
+/* ---------- workbench shell (left rail + top command bar) ---------- */
+.shell{display:grid;grid-template-columns:var(--rail) minmax(0,1fr);min-height:100vh}
+.rail{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:var(--panel);
+  border-right:1px solid var(--bd);padding:12px 10px;gap:10px;overflow-y:auto;z-index:45}
+.rail-top{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:2px 4px 10px;border-bottom:1px solid var(--bd)}
+.brand{display:flex;align-items:center;gap:9px;min-width:0}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--grad);display:grid;place-items:center;
+  color:var(--acc-ink);box-shadow:0 1px 3px rgba(0,0,0,.35);flex-shrink:0}
+.mark svg{width:15px;height:15px}
+.brand .nm{font-size:14px;font-weight:700;line-height:1.15;letter-spacing:-.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand .sub{display:block;font-size:12px;font-weight:500;color:var(--mut);font-family:var(--mono)}
+.nav{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+.nav-grp{display:flex;flex-direction:column;gap:2px}
+.nav-lbl{font-size:12px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;padding:4px 9px 2px}
+.nav button{display:flex;align-items:center;gap:9px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:transparent;
+  color:var(--mut);font:inherit;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;text-align:left;width:100%;
+  transition:background .12s,color .12s,border-color .12s}
+.nav button svg{width:15px;height:15px;opacity:.8;flex-shrink:0}
+.nav button .nl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.nav button .nb{font-size:11px;font-family:var(--mono);color:var(--fg-2);background:var(--bg-2);border:1px solid var(--bd);
+  border-radius:999px;padding:0 6px;line-height:1.5;font-variant-numeric:tabular-nums}
+.nav button .ndot{width:7px;height:7px;border-radius:99px;background:var(--faint);flex-shrink:0}
+.nav button .ndot.ok{background:var(--ok)}
+.nav button .ndot.warn{background:var(--warn)}
 .nav button:hover{color:var(--fg);background:var(--raise)}
-.nav button.on{color:var(--fg);background:var(--raise);box-shadow:inset 0 0 0 1px var(--bd-2)}
+.nav button.on{color:var(--fg);background:var(--raise);border-color:var(--bd-2)}
 .nav button.on svg{color:var(--acc);opacity:1}
+.rail-foot{border-top:1px solid var(--bd);padding-top:10px;display:flex;flex-direction:column;gap:8px}
+.rail-vitals{padding:8px 9px;border-radius:8px;background:var(--bg-2);border:1px solid var(--bd);cursor:pointer;transition:border-color .14s}
+.rail-vitals:hover{border-color:var(--bd-2)}
+.rv-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-family:var(--mono);color:var(--fg-2);font-variant-numeric:tabular-nums}
+.rv-row span:last-child{color:var(--mut)}
+
+.work{display:flex;flex-direction:column;min-width:0;min-height:100vh}
+header.topbar{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px;padding:9px 18px;
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(12px) saturate(140%);-webkit-backdrop-filter:blur(12px) saturate(140%);
+  border-bottom:1px solid var(--bd)}
+.mob-menu{display:none}
+.view-title{font-size:14.5px;font-weight:700;letter-spacing:-.015em;white-space:nowrap}
 .hgap{flex:1;min-width:4px}
-.tele-strip{display:flex;align-items:center;gap:6px;flex-wrap: nowrap;overflow:hidden}
+.tele-strip{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow:hidden}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;border:1px solid var(--bd-2);
-  background:var(--panel);color:var(--fg-2);font-size:12px;font-weight:600;white-space:nowrap;max-width:34vw;overflow:hidden;
-  font-variant-numeric:tabular-nums}
+  background:var(--panel);color:var(--fg-2);font-size:12px;font-weight:600;white-space:nowrap;max-width:32vw;overflow:hidden;
+  font-variant-numeric:tabular-nums;cursor:pointer;transition:border-color .14s,background .14s}
+.pill:hover{border-color:var(--mut);background:var(--raise)}
 .pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 36%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
 .pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 36%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
 .pill .dot{width:7px;height:7px;border-radius:99px;background:currentColor;flex-shrink:0}
@@ -4111,8 +4133,8 @@ header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px
 .cmdbtn svg{width:13px;height:13px}
 
 /* ---------- layout ---------- */
-main{padding:16px 16px 44px;max-width:1320px;margin:0 auto}
-section{animation:fade .18s ease-out}
+main{padding:18px 20px 36px;max-width:1360px;width:100%;margin:0 auto;flex:1}
+section{animation:fade .16s ease-out}
 @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .hide{display:none !important}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
@@ -4313,15 +4335,21 @@ dialog::backdrop{background:rgba(4,7,12,.68);backdrop-filter:blur(4px);-webkit-b
 @keyframes tout{to{opacity:0;transform:translateY(5px)}}
 
 /* ---------- footer ---------- */
-footer{max-width:1320px;margin:0 auto;padding:0 16px 26px;color:var(--faint);font-size:11.5px;
+footer{max-width:1360px;width:100%;margin:0 auto;padding:0 20px 22px;color:var(--faint);font-size:11.5px;
   display:flex;gap:14px;flex-wrap:wrap;align-items:center}
 kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border-radius:5px;
   padding:1px 5px;background:var(--bg-2);color:var(--fg-2)}
 
+/* ---------- responsive mobile rail ---------- */
+.rail-backdrop{display:none;position:fixed;inset:0;background:rgba(4,7,12,.6);z-index:44}
 @media (max-width:960px){
-  header{flex-wrap:wrap;gap:8px}
-  .brand .sub{display:none}
-  .nav{order:3;width:100%}
+  .shell{grid-template-columns:1fr}
+  .rail{position:fixed;left:0;top:0;bottom:0;width:250px;transform:translateX(-105%);transition:transform .2s ease;box-shadow:0 4px 12px rgba(0,0,0,.5)}
+  body.nav-open .rail{transform:translateX(0)}
+  body.nav-open .rail-backdrop{display:block}
+  .mob-menu{display:grid}
+  header.topbar{padding:8px 12px}
+  main{padding:14px 12px 32px}
   .two>.side{width:100%;flex:1 1 100%}
   .mrow{grid-template-columns:auto 1fr}
   .mrow .fitbox{grid-column:1 / -1}
@@ -4334,24 +4362,50 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 </style></head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header>
-  <div class="brand">
-    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
-    <span class="nm">Inference Console<span class="sub">local inference console</span></span>
+<div class="rail-backdrop" id="railbackdrop"></div>
+<div class="shell">
+<aside class="rail" id="rail" aria-label="Primary navigation">
+  <div class="rail-top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+      <span class="nm">Inference Console<span class="sub">local model workbench</span></span>
+    </div>
   </div>
   <nav class="nav" id="nav" aria-label="Sections">
-    <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
-    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>llama.cpp</button>
-    <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg>Strata</button>
-    <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Avalon</button>
-    <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>Vitals</button>
-    <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg>Chat</button>
-    <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>HF Pull</button>
-    <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>Settings</button>
+    <div class="nav-grp">
+      <div class="nav-lbl">Workspace</div>
+      <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nl">Models</span><span class="nb" id="nb-models">0</span></button>
+      <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg><span class="nl">Chat</span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">Engines</div>
+      <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="nl">llama.cpp</span><span class="ndot" id="nd-server" title="llama.cpp status"></span></button>
+      <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg><span class="nl">Strata</span><span class="ndot" id="nd-strata" title="Strata status"></span></button>
+      <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="nl">Avalon</span><span class="ndot" id="nd-avalon" title="Avalon status"></span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">System</div>
+      <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg><span class="nl">Vitals</span></button>
+      <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="nl">HF Pull</span><span class="nb hide" id="nb-dl">0</span></button>
+      <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg><span class="nl">Settings</span></button>
+    </div>
   </nav>
+  <div class="rail-foot">
+    <div class="rail-vitals" id="railvitals" title="Click to open System Vitals">
+      <div class="rv-row"><span id="rv-mem-lbl">Memory</span><span id="rv-mem-val">…</span></div>
+      <div class="meter" id="rv-mem-bar" style="margin:4px 0 6px"><i style="width:0%"></i></div>
+      <div class="rv-row"><span>CPU</span><span id="rv-cpu-val">…</span></div>
+    </div>
+  </div>
+</aside>
+
+<div class="work">
+<header class="topbar">
+  <button class="icon mob-menu" id="mobmenu" aria-label="Toggle navigation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <span class="view-title" id="viewtitle">Models</span>
   <span class="hgap"></span>
   <div class="tele-strip">
-    <span class="pill" id="hdrstatus" title="Active inference server"><span class="dot"></span><span id="hdrtext">checking…</span></span>
+    <button type="button" class="pill" id="hdrstatus" title="Active inference server (click to inspect)"><span class="dot"></span><span id="hdrtext">checking…</span></button>
     <span class="tag acc hide" id="hdrtps" title="Live generation throughput"></span>
     <span class="tag mut hide" id="hdrkv" title="KV cache fill"></span>
     <span class="tag mut hide" id="hdridle" title="Idle auto-unload timer"></span>
@@ -4512,9 +4566,9 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 
   <div class="card hide" id="strataformcard" style="margin-top:14px">
-    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed — Strata defaults stay in charge</span></div>
+    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed, Strata defaults stay in charge</span></div>
     <div class="form-grid">
-      <div class="field"><label>Preset</label><select id="st-preset"><option value="">— none —</option></select></div>
+      <div class="field"><label>Preset</label><select id="st-preset"><option value="">(none)</option></select></div>
       <div class="field"><label>Family</label><select id="st-family"><option value="">auto</option><option value="qwen">qwen (Flash-Next)</option><option value="coder">coder</option><option value="unsloth">unsloth</option><option value="gyro">gyro</option><option value="swift">swift</option><option value="nvfp4">nvfp4</option><option value="qwen36">qwen36 (35B)</option></select></div>
       <div class="field"><label>Model / quant</label><input id="st-model" type="text" placeholder="e.g. iq3_xxs, q2_0, UD-Q4_K_XL"></div>
       <div class="field"><label>Model path (files I already have)</label><input id="st-modelpath" type="text" placeholder="/path/to/model folder or .gguf"></div>
@@ -4558,8 +4612,19 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div id="st-presets" class="kvs"></div>
   </div>
 
+  <div class="card hide" id="stratametricscard" style="margin-top:14px">
+    <div class="hd"><h2>Strata live metrics</h2><span class="tag acc" id="st-metrics-chip">polling</span></div>
+    <div id="st-metrics" class="kvs"></div>
+  </div>
+
   <div class="card" style="margin-top:14px">
-    <div class="hd"><h2>Strata log</h2></div>
+    <div class="hd"><h2>Strata log</h2><span class="tag mut" id="stlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="stlogfilter" type="search" placeholder="Filter Strata log…" aria-label="Filter Strata log"></div>
+      <label class="switch"><input type="checkbox" id="stlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="stlogcopy">Copy</button>
+    </div>
     <pre class="log" id="stratalog" style="max-height:280px"></pre>
   </div>
 </section>
@@ -4609,25 +4674,25 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <select id="av-np"><option value="0">Profile default (1)</option><option value="1">1 slot</option><option value="2">2 slots</option><option value="4">4 slots</option></select></div>
         <div class="field"><label>GPU device (--device)</label>
           <select id="av-device">
-            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB) — recommended</option>
+            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB, recommended)</option>
             <option value="ROCm1">ROCm1 · 780M iGPU (32 GB GTT, shares system RAM)</option>
             <option value="ROCm0,ROCm1">ROCm0 + ROCm1 split</option>
           </select>
-          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build — any launch that touches it dies with “invalid device function”.</div></div>
+          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build, so any launch that touches it dies with “invalid device function”.</div></div>
         <div class="field"><label>GPU layers (-ngl) · empty = auto-fit</label>
           <input id="av-ngl" type="number" placeholder="auto-fit (-fit on)" min="0" max="999">
-          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM — this 88 GiB pack (40 dense + 48 expert + ~10 KV at 262k) never does.</div></div>
+          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM.</div></div>
         <div class="field"><label>MoE experts in CPU RAM (--n-cpu-moe)</label>
           <input id="av-cmoe" type="number" placeholder="fork default (none forced)" min="0" max="999">
-          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM — forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
+          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM; forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
         <div class="field"><label>Flash Attention (-fa)</label>
-          <select id="av-fa"><option value="">default (on)</option><option value="on">on — recommended on ROCm0</option><option value="off">off</option></select>
+          <select id="av-fa"><option value="">default (on)</option><option value="on">on (recommended on ROCm0)</option><option value="off">off</option></select>
           <div class="hint">On cuts KV memory and speeds prefill on NAVI31. Only relevant if you force the iGPU, which lacks the kernels anyway.</div></div>
         <div class="field"><label>CPU threads (-t)</label>
           <input id="av-threads" type="number" placeholder="fork default (all cores)" min="1" max="256">
-          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box) — SMT threads add contention, not throughput.</div></div>
+          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box), since SMT threads add contention.</div></div>
         <div class="field"><label>Lock weights in RAM (--mlock)</label>
-          <select id="av-mlock"><option value="">off — recommended</option><option value="on">on</option></select>
+          <select id="av-mlock"><option value="">off (recommended)</option><option value="on">on</option></select>
           <div class="hint">With 48 GiB of experts, mlock would pin them resident and OOM this 61 GB machine. Leave off; the page cache does the job.</div></div>
       </div>
       <div style="margin-top:10px">
@@ -4650,7 +4715,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <input id="avsnapname" type="text" placeholder="name this launch…" style="width:220px">
         <button class="btn sm" id="avsnapsave">Save current</button>
       </div></div>
-    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile + every tuning field exactly as resolved right now, and relaunches with one click — same command line, no re-tuning.</div>
+    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile and every tuning field exactly as resolved right now, and relaunches with one click using the same command line.</div>
     <div id="avsnaps"></div>
   </div>
 
@@ -4659,7 +4724,16 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN</span></label></div>
     <div id="avalonaccess" class="kvs"></div>
   </div>
-  <div class="card"><div class="hd"><h2>Avalon log</h2></div><pre class="log" id="avalonlog" style="max-height:280px"></pre></div>
+  <div class="card">
+    <div class="hd"><h2>Avalon log</h2><span class="tag mut" id="avlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="avlogfilter" type="search" placeholder="Filter Avalon log…" aria-label="Filter Avalon log"></div>
+      <label class="switch"><input type="checkbox" id="avlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="avlogcopy">Copy</button>
+    </div>
+    <pre class="log" id="avalonlog" style="max-height:280px"></pre>
+  </div>
 </section>
 
 <!-- ==================== VITALS ==================== -->
@@ -4692,7 +4766,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       </div>
       <div id="sysbox" class="card sub hide">
         <div class="field" style="margin-bottom:10px">
-          <label>System Prompt</label>
+          <label>System Prompt <button type="button" class="btn xs" id="sp-reset">Reset defaults</button></label>
           <textarea id="sysprompt" rows="2" style="width:100%"></textarea>
         </div>
         <div class="form-grid">
@@ -4714,7 +4788,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <button class="btn danger" id="stopbtn" style="display:none">Stop</button>
         <button class="btn primary" id="sendbtn">Send</button>
       </div>
-      <p class="hint" style="margin:8px 2px 0" id="chatnote"></p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:7px 2px 0">
+        <span class="hint" id="chatnote"></span>
+        <span class="hint mono" id="chatcount"></span>
+      </div>
     </div>
   </div>
 </section>
@@ -5031,13 +5108,33 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 </dialog>
 
+<dialog id="renamedlg" closedby="any" style="max-width:min(440px,94vw)">
+  <div class="dlg-hd">
+    <h2>Rename conversation</h2>
+    <button class="icon" data-close="renamedlg" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+  </div>
+  <form id="ren-form">
+    <div class="dlg-bd">
+      <div class="field">
+        <label for="ren-input">Conversation title</label>
+        <input id="ren-input" type="text" maxlength="120" required style="width:100%">
+      </div>
+    </div>
+    <div class="dlg-ft">
+      <button type="button" class="btn" data-close="renamedlg">Cancel</button>
+      <button type="submit" class="btn primary">Save title</button>
+    </div>
+  </form>
+</dialog>
+
 <footer>
   <span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd> command palette</span>
-  <span><kbd>1</kbd>–<kbd>7</kbd> switch tabs</span>
+  <span><kbd>1</kbd>–<kbd>8</kbd> switch tabs</span>
   <span><kbd>/</kbd> filter</span>
   <span><kbd>Esc</kbd> close</span>
   <span id="footnote"></span>
 </footer>
+</div></div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
@@ -5160,21 +5257,37 @@ $('#logout').addEventListener('click',async()=>{
   location.href='/login';
 });
 
-/* ============================== tabs ============================== */
+/* ============================== tabs & workbench rail ============================== */
 const TABS=['models','server','strata','avalon','vitals','chat','hf','settings'];
+const TAB_TITLES={models:'Model Library',server:'llama.cpp Server & Bench',strata:'Strata Engine',
+  avalon:'Avalon 125B MoE',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
 let tab='models';
+function closeNav(){document.body.classList.remove('nav-open')}
+$('#mobmenu').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
+$('#railbackdrop').addEventListener('click',closeNav);
+$('#railvitals').addEventListener('click',()=>setTab('vitals'));
 function setTab(t){
   if(TABS.indexOf(t)<0)t='models';
   tab=t;localStorage.setItem('ic.tab',t);
+  closeNav();
+  $('#viewtitle').textContent=TAB_TITLES[t]||t;
   $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
   $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
-  if(t==='strata'){loadStrata();loadStrataPresets();}
-  if(t==='avalon'){loadAvalon();loadAvalonAccess();}
+  if(t==='strata'){loadStrata();loadStrataPresets();loadStrataKey();pollStrataTelemetry();refreshStrataLog();}
+  if(t==='avalon'){loadAvalon(true);loadAvalonAccess();}
   if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
+$('#hdrstatus').addEventListener('click',()=>{
+  const ct=chatTarget();
+  if(ct)setTab(ct.src==='avalon'?'avalon':ct.src==='strata'?'strata':'server');
+  else if(ACTIVE)setTab('server');
+  else if(AV&&AV.running)setTab('avalon');
+  else if(STRATA&&STRATA.running)setTab('strata');
+  else setTab('models');
+});
 
 /* ============================== models & launch modal ============================== */
 let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
@@ -5215,7 +5328,10 @@ function modelRow(m,i){
   if(m.saved_profile)tags.push('<span class="tag mut" title="Custom launch profile saved">tuned</span>');
   if(running)tags.push('<span class="tag ok">loaded</span>');
   const sh=m.shards&&m.shards.length>1;
-  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+(SHX.has(m.path)?'▾':'▸')+' '+m.shards.length+' shards</button>');
+  const chev=SHX.has(m.path)
+    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M6 9l6 6 6-6"/></svg>'
+    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 6l6 6-6 6"/></svg>';
+  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+chev+' '+m.shards.length+' shards</button>');
   return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'"'+(sh?' data-shards="'+m.shards.length+'"':'')+'">'
     +'<button class="pinbtn'+(m.pinned?' on':'')+'" data-act="pin" title="'+(m.pinned?'Unpin model':'Pin model to top')+'" aria-label="Pin '+esc(m.name)+'">'+(m.pinned?STAR_ON:STAR_OFF)+'</button>'
     +'<div style="min-width:0"><div class="nm" title="'+esc(m.path)+'"><span>'+esc(m.name)+'</span></div>'
@@ -5261,6 +5377,7 @@ function renderModels(){
   list=list.slice().sort(by);
   const bytes=MODELS.reduce((s,m)=>s+m.size,0);
   $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
+  if($('#nb-models'))$('#nb-models').textContent=String(MODELS.length);
   if(MODELS[0]&&MODELS[0].fit){
     const f=MODELS[0].fit;
     $('#vramchip').textContent=f.budget_source+': '+((f.usable_mb||f.budget_mb)/1024).toFixed(1)+' GB usable';
@@ -5381,13 +5498,6 @@ function applyLaunchForm(p){
   $('#ld-draft-wrap').classList.toggle('hide',!CAPS.draft);
   $('#ld-draftmax-wrap').classList.toggle('hide',!CAPS.draft);
 }
-function siblingDraft(m){
-  if(!m)return '';
-  const dir=m.path.replace(/\/[^/]+$/,'/');
-  const hit=MODELS.find(x=>x.path.startsWith(dir)&&x.path!==m.path
-            &&/mtp|draft/i.test(x.name)&&!/mmproj/i.test(x.name));
-  return hit?hit.path:'';
-}
 async function updateLaunchPreview(){
   if(!LD_MODEL)return;
   const f=getLaunchForm();
@@ -5503,6 +5613,11 @@ function drawHeader(){
     t.textContent='no server running';
     document.title='Inference Console — Local Inference Manager';
   }
+  const setDot=(id,st)=>{const d=$(id);if(d)d.className='ndot'+(st==='ok'?' ok':st==='warn'?' warn':'');};
+  const ap=(AV&&AV.port)||8086;
+  setDot('#nd-server',(ACTIVE&&ACTIVE.port!==ap)?(ACTIVE.ready?'ok':'warn'):'');
+  setDot('#nd-avalon',(AV&&AV.running)?(AV.state==='ready'?'ok':'warn'):(ACTIVE&&ACTIVE.port===ap?(ACTIVE.ready?'ok':'warn'):''));
+  setDot('#nd-strata',(STRATA&&STRATA.running)?(STRATA.health==='ready'?'ok':'warn'):'');
   const idleChip=$('#hdridle'),srvIdle=$('#srvidlechip');
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.idle_unload_min>0&&ACTIVE.idle_remaining_s!=null){
     const txt='idle unload '+fmtUp(ACTIVE.idle_remaining_s);
@@ -5700,6 +5815,20 @@ function drawVitals(){
   if(!out)out='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';
   $('#vitals').innerHTML=out;
   $('#vupdatetime').textContent='updated '+Math.max(0,Math.round((Date.now()-VT)/1000))+'s ago';
+  if(v.gpu&&v.gpu.total_mb){
+    const gp=Math.round(100*(v.gpu.used_mb||0)/v.gpu.total_mb);
+    $('#rv-mem-lbl').textContent='VRAM';
+    $('#rv-mem-val').textContent=(v.gpu.used_mb/1024).toFixed(1)+'/'+(v.gpu.total_mb/1024).toFixed(0)+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(gp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,gp)+'%"></i>';
+  }else if(v.mem&&v.mem.total_gb){
+    const mp=Math.round(100*v.mem.used_gb/v.mem.total_gb);
+    $('#rv-mem-lbl').textContent='RAM';
+    $('#rv-mem-val').textContent=v.mem.used_gb+'/'+v.mem.total_gb+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(mp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,mp)+'%"></i>';
+  }
+  if(v.cpu)$('#rv-cpu-val').textContent=v.cpu.percent+'%';
 }
 async function refreshVitals(){
   try{VIT=await api('/api/vitals');VT=Date.now();pushHist();drawVitals()}catch(e){drawVitals()}
@@ -5724,6 +5853,12 @@ function syncSamplingLabels(){
   $('#'+id).addEventListener('input',()=>{syncSamplingLabels();localStorage.setItem('ic.'+id,$('#'+id).value)});
 });
 syncSamplingLabels();
+$('#sp-reset').addEventListener('click',()=>{
+  $('#sysprompt').value=DEF_SYS;localStorage.setItem('ic.sys',DEF_SYS);
+  const defs={'sp-temp':'0.7','sp-topp':'0.95','sp-minp':'0.05','sp-rep':'1.05','sp-max':'0'};
+  Object.keys(defs).forEach(k=>{$('#'+k).value=defs[k];localStorage.removeItem('ic.'+k);});
+  syncSamplingLabels();toast('Sampling defaults restored','ok',1800);
+});
 $('#sysbtn').addEventListener('click',()=>{
   const box=$('#sysbox');box.classList.toggle('hide');
   if(box.classList.contains('hide'))localStorage.setItem('ic.sys',$('#sysprompt').value||DEF_SYS);
@@ -5825,15 +5960,25 @@ async function loadChatList(){
   try{CHATS_CACHE=await api('/api/chats');renderChatList();}catch(e){}
 }
 $('#csearch').addEventListener('input',renderChatList);
+let REN_CID=null;
+$('#ren-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const next=$('#ren-input').value.trim();
+  if(!next||!REN_CID)return;
+  try{
+    await post('/api/chats/'+REN_CID+'/rename',{title:next});
+    if(CID===REN_CID)$('#chattitle').textContent=next;
+    $('#renamedlg').close();loadChatList();toast('Conversation renamed','ok',2000);
+  }catch(err){toast('Rename failed: '+err.message,'err')}
+});
 $('#chatlist').addEventListener('click',async e=>{
   const ren=e.target.closest('[data-ren]');
   if(ren){
     e.stopPropagation();
-    const next=prompt('Rename conversation:',ren.dataset.title||'');
-    if(next&&next.trim()){
-      try{await post('/api/chats/'+ren.dataset.ren+'/rename',{title:next.trim()});loadChatList();}
-      catch(err){toast('Rename failed: '+err.message,'err')}
-    }
+    REN_CID=ren.dataset.ren;
+    $('#ren-input').value=ren.dataset.title||'';
+    $('#renamedlg').showModal();
+    $('#ren-input').focus();$('#ren-input').select();
     return;
   }
   const del=e.target.closest('[data-del]');
@@ -5864,17 +6009,23 @@ $('#newchat').addEventListener('click',newChat);
 $('#chatexportmd').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
   const mdOut=HIST.map(m=>'### '+(m.role==='user'?'User':'Assistant')+'\n\n'+(m.reasoning?'<think>\n'+m.reasoning+'\n</think>\n\n':'')+m.content).join('\n\n---\n\n');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
-  a.download='chat-'+(CID||'export')+'.md';a.click();
+  const url=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.md';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 $('#chatexportjson').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
-  a.download='chat-'+(CID||'export')+'.json';a.click();
+  const url=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.json';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 
 const ta=$('#prompt');
-function autosize(){ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px'}
+function autosize(){
+  ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px';
+  const len=ta.value.length;
+  $('#chatcount').textContent=len?(n0(len)+' chars · ~'+n0(Math.ceil(len/4))+' tok'):'';
+}
 ta.addEventListener('input',autosize);
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
 $('#sendbtn').addEventListener('click',send);
@@ -5884,18 +6035,20 @@ async function send(){
   const q=ta.value.trim();
   if(!q||BUSY)return;
   const ct=chatTarget();
-  if(!ct)return toast('Start a model first (Models or Avalon tab)','warn');
+  if(!ct)return toast('Start a model first (Models, Strata, or Avalon tab)','warn');
   ta.value='';autosize();
   const th=$('#chat');if(th.querySelector('.empty'))th.innerHTML='';
   const um={role:'user',content:q};HIST.push(um);addMsg(um,HIST.length-1);
-  post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q})
-    .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
+  try{
+    const r0=await post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q});
+    if(r0&&r0.id){CID=r0.id;localStorage.setItem('ic.cid',CID);loadChatList();}
+  }catch(e){}
   const asstIdx=HIST.length;
   const box=addMsg({role:'assistant',content:''},asstIdx);
   const ans=box.querySelector('.ans'),who=box.querySelector('.who');
-  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
   AC=new AbortController();
-  let buff='',bufa='',t0=0,toks=0,stopped=false;
+  let buff='',bufa='',t0=0,toks=0,stopped=false,hadErr=false;
   const payload={
     messages:[{role:'system',content:$('#sysprompt').value||DEF_SYS}].concat(HIST.map(m=>({role:m.role,content:m.content}))),
     temperature:Number($('#sp-temp').value),
@@ -5908,7 +6061,7 @@ async function send(){
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AC.signal,
       body:JSON.stringify(payload)});
-    if(!r.ok){const d=await r.text();ans.innerHTML=esc(d.indexOf('no model')>=0?'No model running — load one first.':'error: '+d)}
+    if(!r.ok){hadErr=true;const d=await r.text();ans.innerHTML='<span style="color:var(--err)">'+esc(d.indexOf('no model')>=0?'No model running. Load one first.':'error: '+d)+'</span>'}
     else{
       const rd=r.body.getReader(),dec=new TextDecoder();let sbuf='';
       for(;;){
@@ -5936,17 +6089,17 @@ async function send(){
     }
   }catch(e){
     if(e.name==='AbortError'){stopped=true;ans.innerHTML=md(bufa||buff||'(stopped)')}
-    else ans.textContent='error: '+e.message;
+    else{hadErr=true;ans.innerHTML='<span style="color:var(--err)">'+esc('error: '+e.message)+'</span>'}
   }
   const finalText=bufa||buff||'';
   const secs=Math.max(.001,(performance.now()-(t0||performance.now()))/1000);
   const tps=toks?(toks/secs).toFixed(1):Math.round((finalText.length/4)/secs);
-  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
-  if(finalText){
+  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':hadErr?'error · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
+  if(finalText&&!hadErr){
     box.insertAdjacentHTML('beforeend','<div class="bar"><button class="btn xs" data-regen="'+asstIdx+'">Regenerate</button><button class="btn xs" data-copy="'+esc(finalText)+'">Copy</button></div>');
     HIST.push({role:'assistant',content:finalText,reasoning:buff});
     post('/api/chats/append',{id:CID,model:ct.alias,role:'assistant',content:finalText,reasoning:buff})
-      .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+      .then(r=>{if(r&&r.id){CID=r.id;loadChatList()}}).catch(()=>{});
   }
   BUSY=false;AC=null;$('#stopbtn').style.display='none';drawChatTarget();ta.focus();
 }
@@ -5998,8 +6151,13 @@ $('#ag-apply').addEventListener('click',async()=>{
 });
 
 /* ============================== strata ============================== */
+let STLOGTEXT='';
 async function loadStrata(){
-  try{const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget()}catch(e){}
+  try{
+    const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget();
+    if(s.running)loadStrataKey();
+    else $('#stratakeychip').classList.add('hide');
+  }catch(e){}
 }
 function drawStrata(s){
   const chip=$('#stratchip');
@@ -6014,7 +6172,22 @@ function drawStrata(s){
     +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>':'')
     :'<span class="hint">'+esc(s.note||'')+'</span>';
   $('#stratastopbtn').disabled=!(s.running);
-  $('#stratakeychip').classList.add('hide');
+}
+async function pollStrataTelemetry(){
+  const card=$('#stratametricscard');
+  if(!(STRATA&&STRATA.running)){card.classList.add('hide');return;}
+  try{
+    const d=await api('/api/strata/telemetry');
+    if(!d.ready||!d.metric_keys||!d.metric_keys.length){card.classList.add('hide');return;}
+    card.classList.remove('hide');
+    $('#st-metrics-chip').textContent=':'+d.port+' · '+d.metric_keys.length+' metrics';
+    const keys=d.metric_keys.slice(0,18);
+    $('#st-metrics').innerHTML=keys.map(k=>{
+      const v=d.metrics[k];
+      const fmt=Number.isInteger(v)?n0(v):Number(v).toFixed(2);
+      return '<span class="tag">'+esc(k)+' <b>'+esc(fmt)+'</b></span>';
+    }).join('');
+  }catch(e){card.classList.add('hide')}
 }
 function stForm(){
   const sets=$('#st-set').value.trim().split(/\s+/).filter(x=>x.includes('='));
@@ -6049,20 +6222,21 @@ function stPreview(){
 }
 $$('#strataformcard input,#strataformcard select').forEach(el=>el.addEventListener('input',stPreview));
 $('#st-toggleform').addEventListener('click',()=>{$('#strataformcard').classList.toggle('hide');stPreview()});
-$('#st-copycmd').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#st-cmd').textContent);toast('Command copied','ok')});
-$('#stratacopyinst').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#stratainstcmd').textContent);toast('Install command copied — run it in your own terminal','ok',6000)});
+$('#st-copycmd').addEventListener('click',()=>copy($('#st-cmd').textContent,'Strata command'));
+$('#stratacopyinst').addEventListener('click',()=>copy($('#stratainstcmd').textContent,'Install command'));
 async function loadStrataPresets(){
   if(!$('#st-presets'))return;
   try{
     const d=await api('/api/strata/presets');
     const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?{name:p.name,context:p.context,model:p.model}:null)).filter(Boolean);
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     $('#st-presets').innerHTML=ps.length?ps.map(p=>'<span class="tag">'+esc(p.name)
       +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
       +' <button class="btn xs" data-stp="'+esc(p.name)+'" data-act="use">Use</button>'
-      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset">×</button></span>').join('')
-      :'<span class="hint">No saved presets yet — name one in the launch form to save this exact configuration.</span>';
+      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset" aria-label="Delete preset">'+xSvg+'</button></span>').join('')
+      :'<span class="hint">No saved presets yet. Name one in the launch form to save this exact configuration.</span>';
     const sel=$('#st-preset'),cur=sel.value;
-    sel.innerHTML='<option value="">— none —</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
+    sel.innerHTML='<option value="">(none)</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     sel.value=cur;
   }catch(e){}
 }
@@ -6124,26 +6298,54 @@ $('#stratakeychip').addEventListener('click',async()=>{
   catch(e){toast('Could not read key: '+e.message,'err')}
 });
 async function loadStrataKey(){
-  try{const k=await api('/api/strata/key');
-    if(k.key_set){const c=$('#stratakeychip');c.dataset.masked=k.masked;c.textContent='key '+k.masked+' (click to reveal)';c.classList.remove('hide')}
+  try{
+    const k=await api('/api/strata/key');
+    const c=$('#stratakeychip');
+    if(k.key_set){
+      c.dataset.masked=k.masked;
+      if(c.dataset.revealed!=='1')c.textContent='key '+k.masked+' (click to reveal)';
+      c.classList.remove('hide');
+    }else c.classList.add('hide');
   }catch(e){}
 }
-async function refreshStrataLog(){try{const d=await api('/api/strata/log');paintInto($('#stratalog'),d.log)}catch(e){}}
+function paintFilteredLog(el,text,filterId,autoId,countId){
+  const f=($(filterId)&&$(filterId).value||'').trim().toLowerCase();
+  const lines=(text||'').split('\n');
+  const shown=lines.filter(l=>!f||l.toLowerCase().includes(f));
+  const html=shown.map(l=>{
+    const e=esc(l);
+    if(/error|failed|exception|abort|refused/i.test(l))return '<span class="e">'+e+'</span>';
+    if(/warn/i.test(l))return '<span class="w">'+e+'</span>';
+    return e;
+  }).join('\n');
+  if(el.innerHTML!==html){el.innerHTML=html;if(!autoId||$(autoId).checked)el.scrollTop=1e9;}
+  if(countId&&$(countId))$(countId).textContent=shown.length+' / '+lines.length+' lines';
+}
+async function refreshStrataLog(){
+  try{const d=await api('/api/strata/log');STLOGTEXT=d.log||'';paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn')}catch(e){}
+}
+$('#stlogfilter').addEventListener('input',()=>paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn'));
+$('#stlogauto').addEventListener('change',()=>{if($('#stlogauto').checked)$('#stratalog').scrollTop=1e9});
+$('#stlogcopy').addEventListener('click',()=>copy(STLOGTEXT,'Strata log'));
 
 /* ============================== avalon & optimizer ============================== */
-let ASEL=null,ALIST=[];
-async function loadAvalon(){
+let ASEL=null,ALIST=[],AVSNAPS=[],AVLOGTEXT='',AV_PROF_SIG='',AV_TGT_SIG='',AV_SNAP_SIG='';
+async function loadAvalon(forceAux){
   try{
     ALIST=await api('/api/avalon/profiles');AV=await api('/api/avalon/status');
     if(!ASEL||!ALIST.some(p=>p.key===ASEL))ASEL=(AV&&AV.running&&AV.profile)||'';
     if(!ASEL&&ALIST.length)ASEL=(ALIST.find(p=>p.available)||ALIST[0]).key;
-    $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
-      +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
-      +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
-      +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
-      +(p.available?'':' <span class="tag err">config missing</span>')
-      +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
-    $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    const pSig=JSON.stringify({s:ASEL,r:AV.running,p:AV.profile,a:ALIST.map(x=>[x.key,x.available,x.label])});
+    if(pSig!==AV_PROF_SIG){
+      AV_PROF_SIG=pSig;
+      $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+        +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
+        +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
+        +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
+        +(p.available?'':' <span class="tag err">config missing</span>')
+        +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
+      $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    }
     const c=$('#avalonchip');
     c.textContent=AV.running?(AV.state==='ready'?'avalon · ready':'avalon · loading'):'avalon · stopped';
     c.className='tag '+(AV.running?(AV.state==='ready'?'ok':'warn'):'mut');
@@ -6162,14 +6364,16 @@ async function loadAvalon(){
     }
     const selProf=ALIST.find(p=>p.key===ASEL);
     if(selProf&&selProf.cmd_preview&&!$('#avcmdpreview').textContent)$('#avcmdpreview').textContent=selProf.cmd_preview;
-    const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log);
     drawHeader();drawChatTarget();
-    loadAvalonSnaps();
-    loadAvalonTargets();
+    if(forceAux||!AV_SNAP_SIG)loadAvalonSnaps();
+    if(forceAux||!AV_TGT_SIG)loadAvalonTargets();
   }catch(e){}
 }
+function syncAvCtxLabel(){
+  const v=Number($('#av-ctx').value)||0;
+  $('#av-ctx-lbl').textContent=v?n0(v)+' tok':'default';
+}
 function getAvalonTuneForm(){
-  // Empty number box = unset (null); the two selects use 0 = "profile default".
   const num=v=>{const s=String(v).trim();if(s==='')return null;const n=Number(s);return isNaN(n)?null:n};
   return {
     profile:ASEL||'flagship',
@@ -6190,10 +6394,9 @@ function getAvalonTuneForm(){
   };
 }
 function setAvalonTuneForm(t){
-  // Number boxes: null/undefined = unset (blank), but a saved 0 must render as "0"
-  // (draft_n 0 means drafting off — blank would silently mean "profile default").
   const v=x=>(x==null||x==='')?'':String(x);
   $('#av-ctx').value=String(t.ctx||0);
+  syncAvCtxLabel();
   $('#av-batch').value=v(t.batch);
   $('#av-ubatch').value=v(t.ubatch);
   $('#av-ctk').value=t.ctk||'';
@@ -6209,6 +6412,7 @@ function setAvalonTuneForm(t){
   $('#av-mlock').value=t.mlock?'on':'';
 }
 async function previewAvalonTune(){
+  syncAvCtxLabel();
   try{
     const r=await post('/api/avalon/tune',Object.assign(getAvalonTuneForm(),{preview:true}));
     $('#avcmdpreview').textContent=r.cmd_preview||'';
@@ -6240,6 +6444,9 @@ $('#avapplystart').addEventListener('click',async()=>{
 async function loadAvalonTargets(){
   try{
     const d=await api('/api/avalon/targets');
+    const sig=JSON.stringify(d);
+    if(sig===AV_TGT_SIG||document.activeElement===$('#avtargetsel'))return;
+    AV_TGT_SIG=sig;
     const sel=$('#avtargetsel');
     sel.innerHTML=(d.targets||[]).map(t=>'<option value="'+esc(t.path)+'"'+(t.current?' selected':'')+'>'
       +esc(t.base)+(t.size_h?' · '+esc(t.size_h):'')+(t.shards>1?' · '+t.shards+' shards':'')+(t.draft?' · MTP':'')+'</option>').join('');
@@ -6251,27 +6458,32 @@ $('#avtargetsel').addEventListener('change',async()=>{
   try{
     const r=await post('/api/avalon/target',{model:v});
     toast('Avalon target: '+(r.base||'auto'),'ok');
-    loadAvalon();
-  }catch(e){toast('Target change failed: '+e.message,'err');loadAvalonTargets();}
+    AV_TGT_SIG='';loadAvalon(true);
+  }catch(e){toast('Target change failed: '+e.message,'err');AV_TGT_SIG='';loadAvalonTargets();}
 });
 /* ---- one-click snapshots ---- */
 async function loadAvalonSnaps(){
   try{
     const d=await api('/api/avalon/snapshots');
+    AVSNAPS=d.snapshots||[];
+    const sig=JSON.stringify(AVSNAPS);
+    if(sig===AV_SNAP_SIG)return;
+    AV_SNAP_SIG=sig;
     const el=$('#avsnaps');
-    if(!(d.snapshots||[]).length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
-    el.innerHTML=d.snapshots.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
+    if(!AVSNAPS.length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+    el.innerHTML=AVSNAPS.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
       +'<span style="flex:1;min-width:0"><b>'+esc(s.name)+'</b> <span class="tag mut">'+esc(s.profile)+'</span><br>'
-      +'<span class="hint">'+esc(s.cmd||'')+'</span></span>'
+      +'<span class="hint mono">'+esc(s.cmd||'')+'</span></span>'
       +'<button class="btn sm primary" data-snaplaunch="'+esc(s.id)+'">Launch</button>'
-      +'<button class="btn xs" data-snapdel="'+esc(s.id)+'">✕</button></div>').join('');
+      +'<button class="btn xs danger" data-snapdel="'+esc(s.id)+'" title="Delete snapshot" aria-label="Delete snapshot">'+xSvg+'</button></div>').join('');
     $$('[data-snaplaunch]').forEach(b=>b.addEventListener('click',async()=>{
       b.disabled=true;
-      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting — a 125B load takes a while','ok');loadAvalon();}
+      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting (125B load takes a while)','ok');loadAvalon();}
       catch(e){toast('Launch failed: '+e.message,'err',12000);b.disabled=false;}
     }));
     $$('[data-snapdel]').forEach(b=>b.addEventListener('click',async()=>{
-      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});loadAvalonSnaps();}
+      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});AV_SNAP_SIG='';loadAvalonSnaps();}
       catch(e){toast('Delete failed: '+e.message,'err')}
     }));
   }catch(e){}
@@ -6285,7 +6497,7 @@ $('#avsnapsave').addEventListener('click',async()=>{
     const r=await post('/api/avalon/snapshots',{name:name,profile:prof,tune:f});
     $('#avsnapname').value='';
     toast('Saved launch “'+(r.name||name)+'”','ok');
-    loadAvalonSnaps();
+    AV_SNAP_SIG='';loadAvalonSnaps();
   }catch(e){toast('Save failed: '+e.message,'err')}
 });
 function paintInto(el,text){
@@ -6297,6 +6509,9 @@ function paintInto(el,text){
     return e}).join('\n');
   el.scrollTop=1e9;
 }
+$('#avlogfilter').addEventListener('input',()=>paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn'));
+$('#avlogauto').addEventListener('change',()=>{if($('#avlogauto').checked)$('#avalonlog').scrollTop=1e9});
+$('#avlogcopy').addEventListener('click',()=>copy(AVLOGTEXT,'Avalon log'));
 $('#avalonstart').addEventListener('click',async()=>{
   $('#avalonstart').disabled=true;
   try{await post('/api/avalon/start',{profile:ASEL,tune:getAvalonTuneForm()});toast('Avalon starting — a 125B load takes a while','ok')}
@@ -6386,9 +6601,11 @@ function totsize(){
 $('#hffiles').addEventListener('change',totsize);
 $('#hfnone').addEventListener('click',()=>{$$('#hffiles input').forEach(i=>i.checked=false);totsize()});
 $('#hfpull').addEventListener('click',async()=>{
-  const sel=$$('#hffiles input:checked').map(i=>i.value);
+  const checked=$$('#hffiles input:checked');
+  const sel=checked.map(i=>i.value);
+  const sizes={};checked.forEach(i=>{sizes[i.value]=Number(i.dataset.size)||0;});
   if(!sel.length)return toast('Select at least one file','warn');
-  try{await post('/api/hf/pull',{repo:HFREPO,files:sel});
+  try{await post('/api/hf/pull',{repo:HFREPO,files:sel,sizes});
     toast('Queued '+sel.length+' file'+(sel.length>1?'s':''),'ok');ensureDl(true);pollDownloads()}
   catch(e){toast('Pull failed: '+e.message,'err',10000)}
 });
@@ -6396,10 +6613,17 @@ function ensureDl(on){
   if(on&&!DLTIMER)DLTIMER=setInterval(pollDownloads,1200);
   if(!on&&DLTIMER){clearInterval(DLTIMER);DLTIMER=null}
 }
+let DL_DONE_IDS=new Set();
 async function pollDownloads(){
   let ds;try{ds=await api('/api/downloads')}catch(e){return}
+  const activeCount=ds.filter(d=>d.status==='downloading'||d.status==='queued').length;
+  const nb=$('#nb-dl');
+  if(nb){nb.textContent=String(activeCount);nb.classList.toggle('hide',activeCount===0);}
+  let newlyDone=false;
+  ds.forEach(d=>{if(d.status==='done'&&!DL_DONE_IDS.has(d.id)){DL_DONE_IDS.add(d.id);newlyDone=true;}});
+  if(newlyDone){loadModels();toast('Download finished · model library updated','ok',3200);}
   if(!ds.length){$('#downloads').innerHTML='<span class="hint">No downloads queued.</span>';$('#dlinfo').textContent='';ensureDl(false);return}
-  const live=ds.some(d=>d.status==='downloading'||d.status==='queued');
+  const live=activeCount>0;
   $('#dlinfo').textContent=ds.length+' job'+(ds.length>1?'s':'')+(live?' · active':'');
   $('#downloads').innerHTML=ds.map(d=>{
     const pct=d.total?Math.round(100*d.done/d.total):0;
@@ -6460,6 +6684,7 @@ function drawSetup(){
   if(J.log&&J.log.length){box.classList.remove('hide');paintInto(box,J.log.join('\n'))}
   const running=J.state==='running';
   $$('#t-settings button[id^="setup-"][id$="-btn"]').forEach(b=>b.disabled=running);
+  if(!A.source_exists)$('#setup-avalon-btn').disabled=true;
   if(running&&!SETUPTIMER)SETUPTIMER=setInterval(()=>{loadSetup();if(tab!=='settings'){clearInterval(SETUPTIMER);SETUPTIMER=null}},1500);
   if(!running&&SETUPTIMER){clearInterval(SETUPTIMER);SETUPTIMER=null}
   if(J.state==='done'&&!SETUP._told){SETUP._told=true;toast('Engine setup finished','ok');loadSettings();loadModels();pollStatus(true)}
@@ -6576,6 +6801,17 @@ function buildPaletteItems(){
   if(ACTIVE&&ACTIVE.running){
     items.push({label:'Stop active llama-server ('+ACTIVE.alias+')',sub:':'+ACTIVE.port,run:()=>$('#srvstop').click()});
   }
+  if(AV&&AV.running){
+    items.push({label:'Stop Avalon ('+(AV.profile||'running')+')',sub:':'+(AV.port||8086),run:()=>$('#avalonstop').click()});
+  }else if(ALIST&&ALIST.some(p=>p.available)){
+    items.push({label:'Start Avalon ('+(ASEL||'flagship')+')',sub:'Avalon',run:()=>{setTab('avalon');$('#avalonstart').click()}});
+  }
+  (AVSNAPS||[]).forEach(s=>{
+    items.push({label:'Launch Avalon snapshot: '+s.name,sub:s.profile||'snapshot',run:async()=>{
+      try{await post('/api/avalon/snapshots/launch',{id:s.id});toast('Avalon starting: '+s.name,'ok');setTab('avalon');loadAvalon();}
+      catch(e){toast('Launch failed: '+e.message,'err',10000)}
+    }});
+  });
   if(STRATA&&STRATA.running){
     items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
   }
@@ -6611,6 +6847,8 @@ function renderPalette(){
     +'<span class="pi-main">'+esc(it.label)+'</span><span class="pi-sub">'+esc(it.sub)+'</span></button>'
   ).join(''):'<div class="empty">No matching commands or models</div>';
   $('#pal-list')._matched=matched;
+  const selEl=$('#pal-list .pal-item.sel');
+  if(selEl)selEl.scrollIntoView({block:'nearest'});
 }
 function openPalette(){
   PAL_ITEMS=buildPaletteItems();PAL_IDX=0;
@@ -6638,15 +6876,18 @@ function tick(){
   if(document.hidden)return;
   pollStatus();
   pollTelemetry();
-  if(tab==='strata')loadStrata();
+  if(tab==='strata'){loadStrata();pollStrataTelemetry();}
   if(tab==='avalon')loadAvalon();
 }
 setInterval(tick,2500);
+setInterval(()=>{if(!document.hidden)refreshVitals()},5000);
 setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
 setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='strata')refreshStrataLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
-async function refreshAvalonLog(){try{const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log)}catch(e){}}
+async function refreshAvalonLog(){
+  try{const d=await api('/api/avalon/log');AVLOGTEXT=d.log||'';paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn')}catch(e){}
+}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollStatus();pollTelemetry();refreshVitals()}});
 document.addEventListener('keydown',e=>{
   if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){
@@ -6656,10 +6897,11 @@ document.addEventListener('keydown',e=>{
   }
   if(e.metaKey||e.ctrlKey||e.altKey)return;
   if($$('dialog[open]').length)return;
-  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.TagName==='SELECT'||t.isContentEditable);
+  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable);
+  if(e.key==='Escape'&&document.body.classList.contains('nav-open')){closeNav();return;}
   if(e.key==='/'&&!typing){
     e.preventDefault();
-    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
+    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='strata')$('#stlogfilter').focus();else if(tab==='avalon')$('#avlogfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
     return;
   }
   if(!typing&&TABS[Number(e.key)-1])setTab(TABS[Number(e.key)-1]);
