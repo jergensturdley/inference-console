@@ -1700,6 +1700,35 @@ SESSION_TTL = 7 * 24 * 3600
 _sessions: dict = {}   # token -> expiry (unix time)
 _fails: dict = {}      # ip -> deque(failure unix times)
 
+SESSIONS_PATH = APP_DIR / "sessions.json"
+
+def _load_sessions():
+    """Sessions are memory-only, so an in-place restart would sign the operator out.
+    Mirror them to a 0600 file and reload on boot; expired tokens are dropped."""
+    now = time.time()
+    raw = _read_json(SESSIONS_PATH, {})
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for tok, exp in raw.items():
+        try:
+            if float(exp) > now:
+                out[str(tok)] = float(exp)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+def _save_sessions():
+    try:
+        tmp = SESSIONS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({k: v for k, v in _sessions.items() if v > time.time()}))
+        os.chmod(tmp, 0o600)
+        tmp.replace(SESSIONS_PATH)
+    except OSError:
+        pass  # a session mirror that cannot be written must not break sign-in
+
+_sessions.update(_load_sessions())
+
 LOGIN_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>Inference Console — Sign in</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1840,6 +1869,7 @@ def api_login(b: LoginBody, request: Request):
     q.clear()
     tok = secrets.token_urlsafe(32)
     _sessions[tok] = now + SESSION_TTL
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
                     samesite="lax", path="/")
@@ -1848,6 +1878,7 @@ def api_login(b: LoginBody, request: Request):
 @app.post("/api/logout")
 def api_logout(request: Request):
     _sessions.pop(request.cookies.get(SESSION_COOKIE, ""), None)
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
@@ -3684,6 +3715,59 @@ def api_settings_set(b: SettingsBody):
     _save_config_secure()
     return api_settings_get()
 
+# ---------------------------------------------------------------- panel process (restart)
+PANEL_STARTED_AT = time.time()
+
+def _self_argv() -> list:
+    """argv that re-launches this panel exactly as it was invoked, with a resolved
+    interpreter and script/shim path so execv works after a cd or a PATH change."""
+    argv = list(sys.argv) or [str(Path(__file__).resolve())]
+    first = Path(argv[0])
+    if first.exists():
+        argv[0] = str(first.resolve())
+    else:
+        found = shutil.which(argv[0])
+        if found:
+            argv[0] = found
+    return [sys.executable] + argv
+
+def _restart_self(argv: list, delay: float):
+    """Replace this process image in place. Nothing else is forked, so the PID stays the
+    same (systemd keeps tracking it) and the llama-server/Avalon/Strata children, which run
+    in their own sessions, keep serving; the panel re-adopts them from its state files."""
+    time.sleep(delay)
+    print(f"panel: restarting in place: {' '.join(argv)}", flush=True)
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.flush()
+        except Exception:
+            pass
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as e:
+        # Do not exit: a failed restart must leave the running panel serving.
+        print(f"panel: restart failed, still serving: {e}", flush=True)
+
+class RestartBody(BaseModel):
+    delay_ms: int = 600
+
+@app.get("/api/panel/ping")
+def api_panel_ping():
+    argv = _self_argv()
+    return {"ok": True, "pid": os.getpid(), "port": PORT,
+            "started_at": PANEL_STARTED_AT, "uptime_s": round(time.time() - PANEL_STARTED_AT, 1),
+            "argv": argv, "restartable": Path(argv[0]).exists()}
+
+@app.post("/api/panel/restart")
+def api_panel_restart(b: RestartBody | None = None):
+    argv = _self_argv()
+    if not Path(argv[0]).exists():
+        raise HTTPException(400, f"cannot restart: interpreter not found: {argv[0]}")
+    delay = max(0.0, min(5.0, (b.delay_ms if b else 600) / 1000))
+    _save_sessions()  # keep the tab signed in across the re-exec
+    threading.Thread(target=_restart_self, args=(argv, delay), daemon=True).start()
+    return {"ok": True, "pid": os.getpid(), "argv": argv, "delay_s": delay}
+
 # ---------------------------------------------------------------- engine setup (one-click installs)
 # One background job at a time: download/build runs stream log lines the UI polls.
 # The panel admin API can already launch arbitrary binaries, so installing official
@@ -4736,6 +4820,14 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn" id="set-reload">Reload</button>
       <button class="btn primary" id="set-save">Save settings</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="hd"><h2>Panel process</h2><span class="tag mut" id="panel-proc-chip">—</span></div>
+    <div class="hint" style="margin-bottom:10px">Restart re-execs the panel in place. Running llama-server, Avalon, and Strata processes keep serving, and this tab reconnects on its own.</div>
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+      <span class="hint mono" id="panel-proc-detail"></span>
+      <button class="btn danger" id="panelrestart">Restart panel</button>
     </div>
   </div>
 </section>
@@ -6412,6 +6504,7 @@ async function loadSettings(){
     $('#set-bin-flags').innerHTML=['fa_value','ncmoe','metrics','fit','ctk','mlock','no_mmap','parallel','draft','draft_max','ot','tensor_split','tbatch','keep','jinja']
       .map(k=>'<span class="tag '+(c[k]?'ok':'mut')+'">'+k+(c[k]?' ✓':' –')+'</span>').join('');
     $('#set-disks').innerHTML=(s.disks||[]).map(d=>d.exists?d.path+': '+d.free_gb+' GB free':d.path+': missing').join(' · ');
+    loadPanelProc();
   }catch(e){toast('Failed to load settings: '+e.message,'err')}
 }
 $('#set-reload').addEventListener('click',loadSettings);
@@ -6437,6 +6530,43 @@ $('#set-save').addEventListener('click',async()=>{
   btn.disabled=false;
 });
 
+/* ============================== panel process ============================== */
+const panelPing=()=>api('/api/panel/ping');
+async function loadPanelProc(){
+  try{
+    const p=await panelPing();
+    $('#panel-proc-chip').textContent='pid '+p.pid;
+    $('#panel-proc-chip').className='tag ok';
+    $('#panel-proc-detail').textContent='up '+fmtUp(p.uptime_s)+' · port '+p.port+(p.restartable?'':' · restart unavailable');
+    $('#panelrestart').disabled=!p.restartable;
+  }catch(e){
+    $('#panel-proc-chip').textContent='unreachable';
+    $('#panel-proc-chip').className='tag err';
+  }
+}
+async function waitForPanelRestart(before){
+  // execv keeps the PID, so watch started_at instead; every poll during the swap fails.
+  for(let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,500));
+    try{
+      const p=await panelPing();
+      if(p.ok&&p.started_at!==before){location.reload();return}
+    }catch(e){}
+  }
+  toast('Panel never answered after restart. Check the service log.','err',15000);
+}
+$('#panelrestart').addEventListener('click',async()=>{
+  if(!await confirmDlg('Restart panel','Re-exec the panel process now? Running models are not stopped, and this tab reconnects automatically.','Restart',true))return;
+  const btn=$('#panelrestart');
+  let before=null;
+  try{before=(await panelPing()).started_at}catch(e){}
+  btn.disabled=true;btn.textContent='Restarting…';
+  try{await post('/api/panel/restart',{delay_ms:600})}
+  catch(e){btn.disabled=false;btn.textContent='Restart panel';return toast('Restart failed: '+e.message,'err')}
+  toast('Panel restarting…','warn',4000);
+  waitForPanelRestart(before);
+});
+
 /* ============================== command palette (Ctrl/Cmd+K) ============================== */
 let PAL_ITEMS=[],PAL_IDX=0;
 function buildPaletteItems(){
@@ -6451,6 +6581,7 @@ function buildPaletteItems(){
   }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
+  items.push({label:'Restart the panel process',sub:'Panel',run:()=>{setTab('settings');loadPanelProc();$('#panelrestart').click()}});
   items.push({label:'Toggle light / dark theme',sub:'Appearance',run:()=>$('#theme').click()});
   items.push({label:'Rescan model directories',sub:'Models',run:()=>$('#rescan').click()});
   MODELS.forEach(m=>{
