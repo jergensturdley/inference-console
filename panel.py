@@ -4113,35 +4113,43 @@ def _yaml_upsert(path, parent, key, value):
 def _toml_strip_section(text, headers):
     out, skip = [], False
     for ln in text.splitlines():
-        if ln.startswith("[") and ln.endswith("]"):
-            skip = ln.strip() in headers
+        head = ln.split("#", 1)[0].strip()
+        if head.startswith("[") and head.endswith("]"):
+            skip = head in headers
         if not skip:
             out.append(ln)
     return "\n".join(out).rstrip() + "\n"
 
-def _w_omp(alias, base, ctx):
-    prov = {"baseUrl": base + "/v1", "api": "openai-completions", "auth": "none",
+def _w_omp(alias, base, ctx, key=""):
+    prov = {"baseUrl": base + "/v1", "api": "openai-completions",
+            "auth": "apiKey" if key else "none",
             "models": [{"id": alias, "name": alias, "api": "openai-completions",
                         "reasoning": False, "input": ["text"],
                         "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
                         "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
+    if key:
+        prov["apiKey"] = key
     return _yaml_upsert(HOME / ".omp/agent/models.yml", "providers", PANEL_PROVIDER_ID, prov) \
         + " — omp: omp --model inference-console/" + alias
 
-def _w_opencode(alias, base, ctx):
+def _w_opencode(alias, base, ctx, key=""):
     def apply(cfg):
+        opts = {"baseURL": base + "/v1"}
+        if key:
+            opts["apiKey"] = key
         cfg.setdefault("provider", {})[PANEL_PROVIDER_ID] = {
             "npm": "@ai-sdk/openai-compatible",
-            "options": {"baseURL": base + "/v1"},
+            "options": opts,
             "models": {alias: {"name": alias}}}
     return _json_merge(HOME / ".config/opencode/opencode.json", apply) + " — opencode: provider inference-console"
 
-def _w_codex(alias, base, ctx):
+def _w_codex(alias, base, ctx, key=""):
     path = Path(HOME / ".codex/config.toml")
     old = path.read_text() if path.exists() else ""
     old = _toml_strip_section(old, {"[model_providers." + PANEL_PROVIDER_ID + "]", "[profiles." + PANEL_PROVIDER_ID + "]"})
+    key_ln = f"experimental_bearer_token = \"{key}\"\n" if key else ""
     block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"Inference Console\"\n"
-             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n"
+             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n{key_ln}"
              f"\n[profiles.{PANEL_PROVIDER_ID}]\nmodel_provider = \"{PANEL_PROVIDER_ID}\"\nmodel = \"{alias}\"\n")
     import tomllib
     merged = old + block
@@ -4150,10 +4158,10 @@ def _w_codex(alias, base, ctx):
     path.write_text(merged)
     return str(path) + " — codex: codex --profile inference-console"
 
-def _w_aider(alias, base, ctx):
+def _w_aider(alias, base, ctx, key=""):
     def apply(cfg):
         cfg["openai-api-base"] = base + "/v1"
-        cfg["openai-api-key"] = "panel"
+        cfg["openai-api-key"] = key or "panel"
         cfg["model"] = "openai/" + alias
     return _yaml_merge(HOME / ".aider.conf.yml", apply) + " — aider: aider (model openai/" + alias + ")"
 
@@ -4167,24 +4175,26 @@ def _w_zed(alias, base, ctx):
         lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}] + keep
     return _json_merge(HOME / ".config/zed/settings.json", apply) + " — zed: openai provider model " + alias
 
-def _w_continue(alias, base, ctx):
+def _w_continue(alias, base, ctx, key=""):
     def apply(cfg):
         models = [m for m in cfg.get("models", []) if m.get("name") != alias]
         models.append({"name": alias, "provider": "openai", "model": alias,
-                       "apiBase": base + "/v1", "apiKey": "panel", "capabilities": ["tool_use"]})
+                       "apiBase": base + "/v1", "apiKey": key or "panel", "capabilities": ["tool_use"]})
         cfg["models"] = models
     return _yaml_merge(HOME / ".continue/config.yaml", apply) + " — continue: model " + alias
 
 def _w_claude(alias, base, ctx, key):
+    tok = key or "panel"
     try:
         r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]},
                        headers={"anthropic-version": "2023-06-01",
-                                "x-api-key": key or "panel"}, timeout=20)
+                                "x-api-key": tok,
+                                "Authorization": f"Bearer {tok}"}, timeout=20)
     except httpx.HTTPError:
         raise HTTPException(400, "server unreachable for /v1/messages probe")
     if r.status_code == 404:
-        raise HTTPException(400, "this llama-server has no Anthropic-compat /v1/messages endpoint")
+        raise HTTPException(400, "this server has no Anthropic-compat /v1/messages endpoint")
     if r.status_code >= 400:
         # 401/403 here almost always means a mismatched key; writing the env block anyway
         # leaves Claude Code pointing at a server that will refuse every request.
@@ -4192,7 +4202,7 @@ def _w_claude(alias, base, ctx, key):
     def apply(cfg):
         cfg.setdefault("env", {}).update({
             "ANTHROPIC_BASE_URL": base,
-            "ANTHROPIC_AUTH_TOKEN": key or "panel",
+            "ANTHROPIC_AUTH_TOKEN": tok,
             "ANTHROPIC_MODEL": alias})
     return _json_merge(HOME / ".claude/settings.json", apply) + " — claude-code: env points at " + base
 
@@ -4213,6 +4223,8 @@ def _w_hermes(alias, base, ctx, key):
     prov = {"name": "Inference Console", "base_url": base + "/v1",
             "default_model": alias, "model": alias,
             "models": {alias: {}}, "models_discovered": True}
+    if key:
+        prov["api_key"] = key
     return _yaml_upsert(HOME / ".hermes/config.yaml", "providers", PANEL_PROVIDER_ID, prov) \
         + " — hermes: pick /model custom:inference-console"
 
@@ -4231,16 +4243,16 @@ def _w_kimi(alias, base, ctx, key):
     return str(path) + " — kimi: model inference-console/" + alias
 
 AGENTS = {
-    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c),        "selector inference-console/<alias>"),
-    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),      "selector inference-console/<alias>"),
-    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c),   "provider inference-console"),
-    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c),      "codex --profile inference-console"),
-    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c),      "openai/<alias>"),
-    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),        "replaces Zed openai available_models"),
-    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c),   "adds model row"),
-    "claude-code": ("Claude Code",        _w_claude,                                 "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
-    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),  "then pick /model custom:inference-console"),
-    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),    "model inference-console/<alias>"),
+    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c, k),      "selector inference-console/<alias>"),
+    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),       "selector inference-console/<alias>"),
+    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c, k), "provider inference-console"),
+    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c, k),    "codex --profile inference-console"),
+    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c, k),    "openai/<alias>"),
+    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),         "merges into Zed openai available_models"),
+    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c, k), "adds model row"),
+    "claude-code": ("Claude Code",        _w_claude,                                  "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
+    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),   "then pick /model custom:inference-console"),
+    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),     "model inference-console/<alias>"),
 }
 
 @app.get("/api/agents")
@@ -4249,15 +4261,25 @@ def api_agents():
     a = SMGR.status()
     s = strata_status()
     my = MAYA.status()
+    sources = {
+        "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
+        "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
+        "strata": bool(s.get("running") and s.get("port")),
+        "maya": bool(my.get("running") and my.get("port")),
+    }
+    targets = {}
+    for src_name, up in sources.items():
+        if not up:
+            targets[src_name] = None
+            continue
+        cur = _current_llm(src_name)
+        targets[src_name] = {"alias": cur[0], "port": cur[1], "ctx": cur[2], "source": cur[4]} if cur else None
+    running = _current_llm()
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
-            "running": _current_llm(),
-            "sources": {
-                "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
-                "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
-                "strata": bool(s.get("running") and s.get("port")),
-                "maya": bool(my.get("running") and my.get("port")),
-            }}
+            "running": [running[0], running[1], running[2], running[4]] if running else None,
+            "sources": sources,
+            "targets": targets}
 
 class AgentSyncBody(BaseModel):
     agents: list[str]
@@ -4287,9 +4309,10 @@ def api_agents_sync(b: AgentSyncBody):
             out[aid] = {"ok": False, "detail": str(e.detail)}
         except Exception as e:
             out[aid] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
-    st.update(alias=alias, port=port, source=source, synced_at=time.time())
-    _save_agents_state(st)
-    return {"results": out, "alias": alias, "port": port}
+    if any(v["ok"] for v in out.values()):
+        st.update(alias=alias, port=port, source=source, synced_at=time.time())
+        _save_agents_state(st)
+    return {"results": out, "alias": alias, "port": port, "source": source}
 
 
 class StartBody(BaseModel):
@@ -6882,19 +6905,28 @@ async function send(){
 
 /* ============================== agents registry ============================== */
 let AGSRC=null; // null = auto (panel first); 'panel' | 'avalon' | 'strata' | 'maya' pins the source
-let AGRES='';  // last Apply's per-agent result rows, kept across re-renders
-async function openAgentsDlg(source){
+let AGRES='';  // last Apply's per-agent result rows, kept across post-Apply re-render
+async function openAgentsDlg(source,keepResults){
   AGSRC=source||null;
+  if(!keepResults)AGRES='';
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
-  const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
   const srcs=d.sources||{};
+  const tgts=d.targets||{};
   const selSrc=AGSRC||'auto';
+  const targetFor=s=>{
+    if(s==='auto')return d.running?{alias:d.running[0],port:d.running[1],source:d.running[3]||''}:null;
+    return tgts[s]||null;
+  };
+  const fmtTarget=t=>t?(esc(t.alias)+' @ :'+t.port+(t.source?' ('+esc(t.source)+')':'')):'nothing running';
   const srcOpts=['auto','panel','avalon','strata','maya'].map(s=>{
-    const up=s==='auto'?Boolean(d.running):Boolean(srcs[s]);
-    return '<option value="'+s+'"'+(s===selSrc?' selected':'')+'>'+s+(s==='auto'?' (first running)':(up?' · running':' · stopped'))+'</option>';
+    const t=targetFor(s);
+    const up=Boolean(t||(s!=='auto'&&srcs[s]));
+    return '<option value="'+s+'"'+(s===selSrc?' selected':'')+'>'+s
+      +(s==='auto'?' (first running)':(up?(t?' · '+t.alias+' @ :'+t.port:' · running'):' · stopped'))+'</option>';
   }).join('');
-  const srcOk=!AGSRC||Boolean(srcs[AGSRC]);
+  const curT=targetFor(selSrc);
+  const srcOk=selSrc==='auto'?Boolean(d.running):Boolean(srcs[selSrc]);
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
     return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'"'+(r?' checked':'')+'>'
@@ -6903,40 +6935,61 @@ async function openAgentsDlg(source){
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
   const dlg=$('#agentsdlg');
-  $('#ag-body').innerHTML='<p style="margin:0 0 8px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>.</p>'
-    +'<div style="display:flex;gap:8px;align-items:center;margin:0 0 10px"><label class="hint" for="ag-src">Source</label>'
-    +'<select id="ag-src" style="flex:1">'+srcOpts+'</select></div>'
-    +(!srcOk?'<p class="hint" id="ag-src-warn" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'<p class="hint hide" id="ag-src-warn" style="margin:0 0 10px;color:var(--warn,#c80)"></p>')
-    +'<div style="max-height:46vh;overflow:auto">'+rows+'</div>'
+  $('#ag-body').innerHTML='<p style="margin:0 0 8px;color:var(--fg-2)">Writes each selected agent config to point at <b id="ag-target">'+fmtTarget(curT)+'</b>.</p>'
+    +'<div style="display:flex;gap:8px;align-items:center;margin:0 0 8px"><label class="hint" for="ag-src">Source</label>'
+    +'<select id="ag-src" style="flex:1">'+srcOpts+'</select>'
+    +'<button type="button" class="btn xs" id="ag-all">All</button>'
+    +'<button type="button" class="btn xs" id="ag-none">None</button></div>'
+    +'<p class="hint'+(srcOk?' hide':'')+'" id="ag-src-warn" style="margin:0 0 8px;color:var(--warn,#c80)">'
+    +(srcOk?'':(selSrc==='auto'?'No server is running — start an engine first.':'The '+esc(selSrc)+' server isn’t running — start it on its tab, or pick another source.'))+'</p>'
+    +'<div style="max-height:42vh;overflow:auto">'+rows+'</div>'
     +'<div id="agres" style="margin-top:10px">'+AGRES+'</div>';
   $('#ag-src').addEventListener('change',e=>{
     const v=e.target.value;
     AGSRC=v==='auto'?null:v;
+    const t=targetFor(v);
+    $('#ag-target').innerHTML=fmtTarget(t);
     const w=$('#ag-src-warn');
-    if(AGSRC&&!srcs[AGSRC]){w.textContent='The '+AGSRC+' server isn’t running — start it on its tab, or apply anyway to get a clear error.';w.classList.remove('hide');}
-    else w.classList.add('hide');
+    const ok=v==='auto'?Boolean(d.running):Boolean(srcs[v]);
+    if(!ok){
+      w.textContent=v==='auto'?'No server is running — start an engine first.':'The '+v+' server isn’t running — start it on its tab, or pick another source.';
+      w.classList.remove('hide');
+    }else w.classList.add('hide');
   });
+  $('#ag-all').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=true));
+  $('#ag-none').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=false));
   if(!dlg.open)dlg.showModal();
+  if(keepResults&&AGRES){const ar=$('#agres');if(ar)ar.scrollIntoView({block:'nearest'});}
 }
-$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
-$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
-$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata'));
-$('#mayaagentsbtn').addEventListener('click',()=>openAgentsDlg('maya'));
+$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null,false));
+$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon',false));
+$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata',false));
+$('#mayaagentsbtn').addEventListener('click',()=>openAgentsDlg('maya',false));
 $('#ag-apply').addEventListener('click',async()=>{
   const apply=$('#ag-apply');
   const picks=$$('.agchk',$('#agentsdlg')).filter(x=>x.checked).map(x=>x.value);
-  if(!picks.length)return toast('Pick at least one agent','warn');
+  if(!picks.length){
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag warn">select</span><span class="p">Pick at least one agent checkbox above, then click Apply.</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Pick at least one agent','warn');
+  }
   apply.disabled=true;apply.textContent='Applying…';
   let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
-  catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
+  catch(e){
+    apply.disabled=false;apply.textContent='Apply';
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag err">error</span><span class="p">'+esc(e.message)+'</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Sync failed: '+e.message,'err',12000);
+  }
   const rs=Object.keys(r.results).map(k=>r.results[k]);
   const okN=rs.filter(v=>v.ok).length;
-  AGRES=Object.keys(r.results).map(k=>{const v=r.results[k];
+  AGRES='<div class="hint" style="margin-bottom:4px">Registered <b>'+okN+' of '+picks.length+'</b> for <b>'+esc(r.alias)+' @ :'+r.port+'</b></div>'
+    +Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
   toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':'warn', 8000);
-  openAgentsDlg(AGSRC);  // re-render so the registry tags show the new alias/port
+  openAgentsDlg(AGSRC,true);  // re-render so the registry tags show the new alias/port
   pollStatus();
 });
 

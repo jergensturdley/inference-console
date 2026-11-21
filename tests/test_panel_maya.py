@@ -354,3 +354,43 @@ def test_ui_contains_maya_tab_markers():
     assert "/api/maya/start" in panel.HTML
     assert "/api/maya/stop" in panel.HTML
     assert "/api/maya/log" in panel.HTML
+
+
+def test_agent_sync_forwards_maya_api_key_and_hides_key_in_api_agents(maya_env, monkeypatch):
+    monkeypatch.setattr(
+        panel.MayaMgr, "_probe_models",
+        staticmethod(lambda p, k, timeout=0.8: (True, "hy4-flash") if p == 8098 else (False, None)),
+    )
+    panel.MAYA._invalidate()
+
+    info = panel.api_agents()
+    assert info["sources"]["maya"] is True
+    assert info["targets"]["maya"] == {"alias": "hy4-flash", "port": 8098, "ctx": 131072, "source": "maya"}
+    assert "super-secret" not in json.dumps(info)
+
+    # Pre-seed codex config with an inline comment on the section header to verify _toml_strip_section
+    home = panel.HOME
+    codex_path = home / ".codex/config.toml"
+    codex_path.parent.mkdir(parents=True, exist_ok=True)
+    codex_path.write_text('[model_providers.inference-console] # old comment\nname = "Old"\n')
+
+    agents_to_test = ["omp", "opencode", "codex", "aider", "continue", "hermes", "pi", "kimi"]
+    res = panel.api_agents_sync(panel.AgentSyncBody(agents=agents_to_test, source="maya"))
+    for aid in agents_to_test:
+        assert res["results"][aid]["ok"] is True, f"{aid} failed: {res['results'][aid]}"
+
+    key = "sk-maya-super-secret-hy4-key"
+    assert key in (home / ".omp/agent/models.yml").read_text()
+    assert key in (home / ".config/opencode/opencode.json").read_text()
+    assert key in codex_path.read_text()
+    assert key in (home / ".aider.conf.yml").read_text()
+    assert key in (home / ".continue/config.yaml").read_text()
+    assert key in (home / ".hermes/config.yaml").read_text()
+    assert key in (home / ".pi/agent/models.json").read_text()
+    assert key in (home / ".kimi-code/config.toml").read_text()
+
+    # When all agents fail, top-level registry state must not be overwritten
+    before = panel._load_agents_state()
+    res_fail = panel.api_agents_sync(panel.AgentSyncBody(agents=["nonexistent-agent"], source="maya"))
+    assert res_fail["results"]["nonexistent-agent"]["ok"] is False
+    assert panel._load_agents_state() == before
