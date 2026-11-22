@@ -840,6 +840,79 @@ def test_panel_agent_actions_endpoint_and_chat_template_api():
     assert "Hardware & Engine Status" in body["reply"]
 
 
+def test_agent_chat_preserves_context_on_action_menu_followups(tmp_path, monkeypatch):
+    """Follow-ups to action menu items must preserve multi-turn history and structured action context."""
+    import optimizer_agent as oa
+
+    agent, _, mgr_calls, host = _make_stub_agent(tmp_path)
+    host.cfg["agent_llm_provider"] = "openai"
+    host.cfg["agent_llm_url"] = "https://api.openai.com/v1"
+    host.cfg["agent_llm_model"] = "gpt-4o-mini"
+    host.cfg["agent_llm_key"] = "sk-test-1234"
+
+    pulled = []
+    host.hf_search_fn = lambda q: [{"id": "bartowski/Qwen3-32B-GGUF", "downloads": 90000}]
+    host.hf_files_fn = lambda repo: [
+        {"path": "Qwen3-32B-Q4_K_M.gguf", "size": 17 * 1024**3},
+        {"path": "Qwen3-32B-IQ3_XS.gguf", "size": 12 * 1024**3},
+    ]
+    host.hf_pull_fn = lambda repo, files, sizes: (pulled.append((repo, files, sizes)) or {"started": [f"{repo}:{files[0]}"]})
+
+    captured_payloads = []
+
+    class FakeResp:
+        status_code = 200
+        text = ""
+        reason_phrase = "OK"
+
+        def json(self):
+            return {"choices": [{"message": {"content": "Q4_K_M (#1) has higher quality while still fitting in 20 GB VRAM."}}]}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured_payloads.append(json)
+        return FakeResp()
+
+    monkeypatch.setattr(oa.httpx, "post", fake_post)
+
+    # 1. User runs clickable action menu template: Calculate & Pull Best Quant (Empty GPU)
+    r1 = agent.chat(
+        message="Calculate best quant for Qwen3-32B (balanced, empty GPU=True)",
+        action_id="hf_quant_empty_gpu",
+        params={"query": "Qwen3-32B", "goal": "balanced", "assume_empty_gpu": True, "auto_pull": False},
+    )
+    assert "Q4_K_M" in r1["reply"] and "IQ3_XS" in r1["reply"]
+
+    # 2. Analytical follow-up ("why did you pick #1 over #2?") must send full multi-turn history to LLM
+    r2 = agent.chat("Why did you pick #1 over #2 for max context?")
+    assert "Q4_K_M (#1)" in r2["reply"]
+    assert captured_payloads, "Expected LLM to be called with multi-turn history"
+    sent_msgs = captured_payloads[-1]["messages"]
+    assert sent_msgs[0]["role"] == "system"
+    assert "Qwen3-32B" in sent_msgs[0]["content"]  # structured last_action_context in system prompt
+    assert any(m["role"] == "assistant" and "Q4_K_M" in m["content"] for m in sent_msgs)  # prior action output in history
+    assert sent_msgs[-1] == {"role": "user", "content": "Why did you pick #1 over #2 for max context?"}
+
+    # 3. Direct selection follow-up ("pull #2") must resolve #2 from previous action without searching HF for "2"
+    r3 = agent.chat("pull #2")
+    assert len(pulled) == 1
+    assert pulled[0][0] == "bartowski/Qwen3-32B-GGUF"
+    assert "Qwen3-32B-IQ3_XS.gguf" in pulled[0][1]
+    assert "IQ3_XS" in r3["reply"]
+
+    # 4. Action menu Optimize Engine -> follow-up "apply it" applies the exact config
+    r4 = agent.chat(action_id="optimize_engine", params={"engine": "llama", "goal": "fastest"})
+    assert "LLAMA recommendation" in r4["reply"]
+    r5 = agent.chat("apply it")
+    assert "Applied & launched" in r5["reply"]
+    assert any(c[0] == "llama" for c in mgr_calls)
+
+    # 5. Clear chat history resets both history and structured context
+    agent.clear_chat_history()
+    assert agent._chat_history == []
+    assert agent._last_context == {}
+
+
+
 
 
 
