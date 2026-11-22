@@ -487,6 +487,7 @@ class OptimizerAgent:
         self._tune_session: dict[str, Any] | None = None
         self._tune_cancel = threading.Event()
         self._chat_history: list[dict[str, Any]] = []
+        self._last_llm_error: str = ""
 
     # ------------------------------------------------------------ hardware & model helpers
     def _hardware_sig(self, vit: dict[str, Any]) -> str:
@@ -1992,9 +1993,11 @@ class OptimizerAgent:
         ms = round((time.perf_counter() - t0) * 1000)
         if reply:
             return {"ok": True, "latency_ms": ms, "reply": reply[:120], "status": st}
-        return {"ok": False, "latency_ms": ms, "error": "Provider request failed — check Base URL, API key, and model ID", "status": st}
+        err = self._last_llm_error or "Provider request failed — check Base URL, API key, and model ID"
+        return {"ok": False, "latency_ms": ms, "error": err, "status": st}
 
     def _llm_complete(self, system_prompt: str, user_message: str, max_tokens: int = 500) -> str | None:
+        self._last_llm_error = ""
         st = self.llm_status()
         if not st["available"]:
             return None
@@ -2045,15 +2048,41 @@ class OptimizerAgent:
             }
         try:
             r = httpx.post(endpoint, headers=headers, json=payload, timeout=httpx.Timeout(10.0, read=45.0))
-            r.raise_for_status()
+            if r.status_code == 400 and api_style == "openai":
+                body_low = (r.text or "").lower()
+                if "max_completion_tokens" in body_low or "temperature" in body_low:
+                    retry_payload = dict(payload)
+                    if "max_completion_tokens" in body_low and "max_tokens" in retry_payload:
+                        retry_payload["max_completion_tokens"] = retry_payload.pop("max_tokens")
+                    if "temperature" in body_low:
+                        retry_payload.pop("temperature", None)
+                    r = httpx.post(endpoint, headers=headers, json=retry_payload, timeout=httpx.Timeout(10.0, read=45.0))
+            if r.status_code >= 400:
+                snippet = (r.text or "").strip().replace("\n", " ")[:220]
+                self._last_llm_error = f"HTTP {r.status_code} from {endpoint}: {snippet or r.reason_phrase}"
+                return None
             data = r.json()
             if api_style == "anthropic":
                 blocks = data.get("content") or []
                 txt = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text").strip()
+                if not txt:
+                    self._last_llm_error = "Provider returned an empty Anthropic content response"
                 return txt or None
             msg = ((data.get("choices") or [{}])[0].get("message") or {})
-            return (msg.get("content") or "").strip() or None
-        except Exception:
+            raw_content = msg.get("content")
+            if isinstance(raw_content, list):
+                txt = "".join(
+                    (b.get("text", "") if isinstance(b, dict) else str(b)) for b in raw_content
+                ).strip()
+            else:
+                txt = (raw_content or "").strip()
+            if not txt:
+                txt = (msg.get("reasoning_content") or msg.get("reasoning") or "").strip()
+            if not txt:
+                self._last_llm_error = "Provider returned an empty message content"
+            return txt or None
+        except Exception as e:
+            self._last_llm_error = f"{type(e).__name__}: {e}"
             return None
 
     def _llm_refine_advice(self, rec: dict[str, Any], user_prompt: str, vit: dict[str, Any]) -> str | None:
@@ -2162,18 +2191,29 @@ class OptimizerAgent:
                 "You are the Inference Console Optimization Agent sidebar assistant. Be concise, technical, "
                 "and grounded in the live hardware, engine docs, and persistent memory provided.",
                 f"Hardware: {json.dumps(vit)}\nMemory summary: {json.dumps(mem['best'][:3])}\nUser: {msg}",
+                max_tokens=1024,
             )
             if llm_reply:
                 reply_parts.append(llm_reply)
             else:
-                reply_parts.append(
-                    "Deterministic mode active (configure an OpenAI-compatible LLM in **Settings → Optimization Agent** "
-                    "or load a local model for free-form chat). Try asking:\n"
-                    "- *\"Optimize llama.cpp for fastest speed\"*\n"
-                    "- *\"Longest context config for Avalon\"*\n"
-                    "- *\"Diagnose last crash\"*\n"
-                    "- *\"Show checkpoints\"*"
-                )
+                st = self.llm_status()
+                if st.get("available"):
+                    lbl = st.get("provider_label") or st.get("provider") or "provider"
+                    mod = st.get("model") or ""
+                    err = self._last_llm_error or "empty response"
+                    reply_parts.append(
+                        f"Configured LLM ({lbl}{f' · `{mod}`' if mod else ''}) failed: {err}\n"
+                        "Check **Agent → LLM Provider** (Base URL, API key, Model ID) and click **Test**."
+                    )
+                else:
+                    reply_parts.append(
+                        "Deterministic mode active (configure an OpenAI-compatible LLM in **Agent → LLM Provider** "
+                        "or **Settings → Optimization Agent**, or load a local model for free-form chat). Try asking:\n"
+                        "- *\"Optimize llama.cpp for fastest speed\"*\n"
+                        "- *\"Longest context config for Avalon\"*\n"
+                        "- *\"Diagnose last crash\"*\n"
+                        "- *\"Show checkpoints\"*"
+                    )
 
         reply = "\n\n".join(p for p in reply_parts if p)
         entry = {"ts": time.time(), "user": msg, "reply": reply, "actions": actions}

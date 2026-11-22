@@ -8502,7 +8502,7 @@ $('#set-save').addEventListener('click',async()=>{
       agent_llm_fallback_local:$('#set-agentfallback')?$('#set-agentfallback').checked:undefined
     });
     toast('Settings saved','ok');
-    await loadSettings();await loadModels();
+    await Promise.all([loadSettings(),loadModels(),loadAgentProvider(),loadAgentStatus()]);
   }catch(e){toast('Save failed: '+e.message,'err')}
   btn.disabled=false;
 });
@@ -8703,15 +8703,27 @@ $('#ag-prov-poll')?.addEventListener('click',()=>pollAgentProviderModels(false))
 $('#ag-prov-save')?.addEventListener('click',async()=>{
   const btn=$('#ag-prov-save');btn.disabled=true;
   try{
-    await post('/api/agent/provider',{
-      provider:$('#ag-prov-select').value,
-      url:$('#ag-prov-url').value.trim(),
-      model:$('#ag-prov-model').value.trim(),
+    const prov=$('#ag-prov-select').value;
+    const url=$('#ag-prov-url').value.trim();
+    const model=$('#ag-prov-model').value.trim();
+    const fallback=$('#ag-prov-fallback').checked;
+    const res=await post('/api/agent/provider',{
+      provider:prov,
+      url:url,
+      model:model,
       api_key:$('#ag-prov-key').value.trim(),
       headers:$('#ag-prov-headers').value.trim(),
-      fallback_local:$('#ag-prov-fallback').checked
+      fallback_local:fallback
     });
-    toast('Agent LLM provider saved','ok');
+    if($('#set-agenturl'))$('#set-agenturl').value=res.url||'';
+    if($('#set-agentmodel'))$('#set-agentmodel').value=res.model||'';
+    if($('#set-agentfallback'))$('#set-agentfallback').checked=res.fallback_local!==false;
+    if(res.status)renderAgentLlmChip(res.status);
+    if(prov!=='local_fallback'&&!model){
+      toast('Saved, but Model ID is empty — pick or enter a model to enable LLM mode','warn',8000);
+    }else{
+      toast('Agent LLM provider saved','ok');
+    }
     await Promise.all([loadAgentProvider(),loadAgentStatus()]);
   }catch(e){toast('Save provider failed: '+e.message,'err')}
   btn.disabled=false;
@@ -8763,13 +8775,17 @@ function renderAgentResult(title,data){
   $('#ag-save-preset-btn').classList.toggle('hide',!cfg);
 }
 
+function renderAgentLlmChip(lm){
+  lm=lm||{};
+  const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
+  if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
+  if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+}
+
 async function loadAgentStatus(){
   try{
     const d=await api('/api/agent/status');
-    const lm=d.llm||{};
-    const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
-    if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
-    if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+    renderAgentLlmChip(d.llm);
     renderTuneStatus(d.tune);
   }catch(e){}
 }
@@ -9095,6 +9111,7 @@ async function sendAgentChat(text){
   try{
     const eng=(tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
     const r=await post('/api/agent/chat',{message:msg,engine:eng});
+    if(r.llm)renderAgentLlmChip(r.llm);
     appendAgentBubble('bot',r.reply,r.actions||[]);
   }catch(e){appendAgentBubble('bot','Error: '+e.message);}
 }
@@ -9147,7 +9164,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();loadAgentStatus();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
