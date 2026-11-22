@@ -5058,6 +5058,10 @@ def api_agent_chat(b: AgentChatBody):
         params=b.params,
     )
 
+@app.delete("/api/agent/chat")
+def api_agent_chat_clear():
+    return OPT_AGENT.clear_chat_history()
+
 class AgentThermalConfigBody(BaseModel):
     enabled: bool | None = None
     auto_act: bool | None = None
@@ -9336,8 +9340,9 @@ $('#agentdrawerbtn')?.addEventListener('click',()=>toggleAgentDrawer());
 $('#ag-open-sidebar')?.addEventListener('click',()=>toggleAgentDrawer(true));
 $('#ag-sb-close')?.addEventListener('click',()=>toggleAgentDrawer(false));
 $('#ag-menu-toggle')?.addEventListener('click',()=>toggleAgentMenu());
-$('#ag-sb-clear')?.addEventListener('click',()=>{
+$('#ag-sb-clear')?.addEventListener('click',async()=>{
   const box=$('#ag-sb-msgs');if(!box)return;
+  try{await fetch('/api/agent/chat',{method:'DELETE'});}catch(e){}
   box.innerHTML='<div class="agent-msg bot">Chat cleared. Pick any workflow from <b>Actions Menu</b> or type below.</div>';
 });
 $('#ag-menu-filter')?.addEventListener('input',e=>renderAgentActionMenu(e.target.value));

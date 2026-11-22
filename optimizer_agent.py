@@ -755,7 +755,13 @@ class OptimizerAgent:
         self._tune_session: dict[str, Any] | None = None
         self._tune_cancel = threading.Event()
         self._chat_history: list[dict[str, Any]] = []
+        self._last_context: dict[str, Any] = {}
         self._last_llm_error: str = ""
+
+    def clear_chat_history(self) -> dict[str, Any]:
+        self._chat_history = []
+        self._last_context = {}
+        return {"ok": True}
 
     # ------------------------------------------------------------ hardware & model helpers
     def _hardware_sig(self, vit: dict[str, Any]) -> str:
@@ -2295,11 +2301,33 @@ class OptimizerAgent:
         err = self._last_llm_error or "Provider request failed — check Base URL, API key, and model ID"
         return {"ok": False, "latency_ms": ms, "error": err, "status": st}
 
-    def _llm_complete(self, system_prompt: str, user_message: str, max_tokens: int = 500) -> str | None:
+    def _llm_complete(
+        self,
+        system_prompt: str,
+        user_message: str,
+        max_tokens: int = 500,
+        history: list[dict[str, str]] | None = None,
+    ) -> str | None:
         self._last_llm_error = ""
         st = self.llm_status()
         if not st["available"]:
             return None
+        hist_msgs: list[dict[str, str]] = []
+        for h in (history or []):
+            role = h.get("role")
+            content = (h.get("content") or "").strip()
+            if role in ("user", "assistant") and content:
+                # Merge consecutive same-role turns so Anthropic/strict OpenAI endpoints never 400
+                if hist_msgs and hist_msgs[-1]["role"] == role:
+                    hist_msgs[-1]["content"] += "\n\n" + content
+                else:
+                    hist_msgs.append({"role": role, "content": content})
+        if hist_msgs and hist_msgs[0]["role"] != "user":
+            hist_msgs = hist_msgs[1:]
+        if hist_msgs and hist_msgs[-1]["role"] == "user":
+            # Avoid trailing user turn right before the new user_message
+            hist_msgs.append({"role": "assistant", "content": "(acknowledged)"})
+
         if st["mode"] == "external":
             base = st["url"].rstrip("/")
             headers = {"Content-Type": "application/json", **self._custom_headers()}
@@ -2313,7 +2341,7 @@ class OptimizerAgent:
                 payload = {
                     "model": st["model"],
                     "system": system_prompt,
-                    "messages": [{"role": "user", "content": user_message}],
+                    "messages": [*hist_msgs, {"role": "user", "content": user_message}],
                     "temperature": 0.2,
                     "max_tokens": max_tokens,
                 }
@@ -2325,6 +2353,7 @@ class OptimizerAgent:
                     "model": st["model"],
                     "messages": [
                         {"role": "system", "content": system_prompt},
+                        *hist_msgs,
                         {"role": "user", "content": user_message},
                     ],
                     "temperature": 0.2,
@@ -2340,6 +2369,7 @@ class OptimizerAgent:
             payload = {
                 "messages": [
                     {"role": "system", "content": system_prompt},
+                    *hist_msgs,
                     {"role": "user", "content": user_message},
                 ],
                 "temperature": 0.2,
@@ -2566,6 +2596,16 @@ class OptimizerAgent:
 
         if empty_gpu and used_mb > 1024:
             actions.append({"label": "Stop All Engines (Free GPU)", "type": "killswitch"})
+        self._last_context = {
+            "kind": "hf_quant",
+            "query": rec_data.get("query") or "",
+            "goal": rec_data.get("goal") or "balanced",
+            "assume_empty_gpu": bool(empty_gpu),
+            "hardware_budget": hb,
+            "recommendations": recs[:10],
+            "last_actions": actions,
+            "last_reply": body,
+        }
         return body, actions
 
     def execute_action(
@@ -2877,7 +2917,230 @@ class OptimizerAgent:
         else:
             reply = f"Unknown action template `{action_id}`."
 
+        # Persist structured context for immediate follow-up messages (both deterministic & LLM)
+        if action_id not in ("hf_quant_empty_gpu", "hf_quant_free_vram") or not self._last_context.get("recommendations"):
+            ctx_update: dict[str, Any] = {
+                "kind": action_id,
+                "action_id": action_id,
+                "engine": eng,
+                "model": mod,
+                "params": p,
+                "last_actions": actions,
+                "last_reply": reply,
+            }
+            if action_id == "system_status":
+                ctx_update["engines"] = self._active_engines_summary()
+            self._last_context = ctx_update
+        else:
+            self._last_context["action_id"] = action_id
+            self._last_context["last_actions"] = actions
+            self._last_context["last_reply"] = reply
+
         return {"reply": reply, "actions": actions, "action_id": action_id, "llm": self.llm_status()}
+
+    def _build_llm_history(self, limit: int = 8) -> list[dict[str, str]]:
+        """Convert recent sidebar turns (including action menu executions) into multi-turn LLM messages."""
+        msgs: list[dict[str, str]] = []
+        for entry in self._chat_history[-limit:]:
+            u = (entry.get("user") or "").strip()
+            a = (entry.get("reply") or "").strip()
+            if u:
+                msgs.append({"role": "user", "content": u[:1200]})
+            if a:
+                msgs.append({"role": "assistant", "content": a[:2400]})
+        return msgs
+
+    def _llm_chat_with_context(self, msg: str) -> str | None:
+        """Call the configured LLM with full multi-turn conversation history + live hardware/app context."""
+        vit = self.host.vitals(refresh=False)
+        mem = self.store.memory_summary(limit=5)
+        engines_st = self._active_engines_summary()
+        local_models = [
+            {
+                "name": m.get("name"),
+                "quant": m.get("quant"),
+                "size_gb": round(float(m.get("size") or 0) / (1024**3), 2),
+                "moe": bool(m.get("moe")),
+            }
+            for m in ((self.host.scan_models() or {}).get("models") or [])[:10]
+        ]
+        caps_summary = [f"{a['id']}: {a['label']}" for a in AGENT_ACTION_TEMPLATES]
+        last_ctx_summary: dict[str, Any] = {}
+        if self._last_context:
+            last_ctx_summary = {
+                k: v for k, v in self._last_context.items()
+                if k not in ("last_reply", "last_actions")
+            }
+            if "recommendations" in last_ctx_summary:
+                last_ctx_summary["recommendations"] = [
+                    {
+                        "rank": i + 1,
+                        "repo": r.get("repo"),
+                        "quant": r.get("quant"),
+                        "size_gb": r.get("size_gb"),
+                        "fit_label": r.get("fit_label"),
+                        "gpu_est_mb": r.get("gpu_est_mb"),
+                        "ram_est_mb": r.get("ram_est_mb"),
+                        "pull_files": r.get("pull_files"),
+                    }
+                    for i, r in enumerate((last_ctx_summary.get("recommendations") or [])[:6])
+                ]
+        system_prompt = (
+            "You are the Inference Console Agent assistant in an ongoing multi-turn conversation. "
+            "ALWAYS use the prior conversation history and the structured last_action_context below to understand "
+            "follow-up references like '#1', '#2', 'that one', 'it', 'why', 'what about max context', etc. "
+            "You support every app workflow: calculating and pulling Hugging Face GGUF quants (empty GPU or free VRAM), "
+            "optimizing/auto-tuning llama.cpp, Avalon, Strata, and Maya, diagnosing crashes, benchmarking, "
+            "workload routing, speculative decoding, thermal guard, checkpoints, and coding-agent sync. "
+            "Be concise, technical, and grounded in the live state.\n\n"
+            f"Live Hardware: {json.dumps(vit)}\n"
+            f"Engines: {json.dumps(engines_st)}\n"
+            f"Local models: {json.dumps(local_models)}\n"
+            f"Last action context: {json.dumps(last_ctx_summary)}\n"
+            f"Available app actions: {json.dumps(caps_summary)}\n"
+            f"Memory summary: {json.dumps(mem['best'][:3])}"
+        )
+        return self._llm_complete(
+            system_prompt,
+            msg,
+            max_tokens=1024,
+            history=self._build_llm_history(limit=8),
+        )
+
+    def _try_contextual_followup(self, msg: str, engine: str, model: str) -> dict[str, Any] | None:
+        """Resolve follow-ups that refer directly to the immediately preceding action or reply."""
+        if not self._chat_history and not self._last_context:
+            return None
+        low = msg.lower().strip()
+        ctx = self._last_context or {}
+
+        # A. Follow-up on previous HF Quant recommendations
+        recs = ctx.get("recommendations") or []
+        if ctx.get("kind") == "hf_quant" and recs:
+            # A1. Direct pull/download selection ("pull #1", "download the second one", "pull Q4_K_M", "pull it", "yes")
+            pull_verb = bool(re.search(r"\b(pull|download|queue|grab|fetch|get|yes|do it|go ahead)\b", low))
+            idx_match = re.search(r"(?:#\s*(\d+)|\b(?:option|choice|number|no\.?)\s*(\d+)\b|\b(first|1st|second|2nd|third|3rd|fourth|4th|fifth|5th)\b)", low)
+            quant_match = re.search(r"\b(IQ\d_[A-Z]+|Q\d_K_[SML]|Q\d_K|Q\d_0|Q\d_1|F16|BF16)\b", msg, re.I)
+            pronoun_ref = bool(re.search(r"\b(it|that|that one|top one|best one|recommended one|yes|do it|go ahead)\b", low))
+            # Guard against analytical questions like "why did you pull #1" or "will #1 fit?"
+            is_question = low.endswith("?") or bool(re.match(r"^(why|how|what|which|will|would|could|should|is|are|can you explain|explain|compare)\b", low))
+
+            if pull_verb and not is_question and (idx_match or quant_match or pronoun_ref):
+                chosen = None
+                if idx_match:
+                    ord_map = {"first": 1, "1st": 1, "second": 2, "2nd": 2, "third": 3, "3rd": 3, "fourth": 4, "4th": 4, "fifth": 5, "5th": 5}
+                    raw_i = idx_match.group(1) or idx_match.group(2)
+                    i_val = int(raw_i) if raw_i else ord_map.get((idx_match.group(3) or "").lower(), 1)
+                    if 1 <= i_val <= len(recs):
+                        chosen = recs[i_val - 1]
+                elif quant_match:
+                    ql = quant_match.group(1).upper()
+                    chosen = next((r for r in recs if (r.get("quant") or "").upper() == ql), None)
+                else:
+                    chosen = recs[0]
+
+                if chosen:
+                    if self.host.hf_pull_fn:
+                        try:
+                            pulled = self.host.hf_pull_fn(chosen["repo"], chosen["pull_files"], chosen.get("pull_sizes") or {})
+                            started = (pulled or {}).get("started") or chosen["pull_files"]
+                            return {
+                                "reply": (
+                                    f"Queued download for **{chosen['repo']} · {chosen['quant']}** "
+                                    f"({chosen['size_gb']} GB, {len(started)} file(s))."
+                                ),
+                                "actions": [{"label": "View Downloads", "type": "open_tab", "tab": "models"}],
+                            }
+                        except Exception as e:
+                            return {
+                                "reply": f"Failed to queue pull for `{chosen['repo']}` ({chosen['quant']}): {e}",
+                                "actions": [{
+                                    "label": f"Retry Pull: {chosen['quant']} ({chosen['size_gb']} GB)",
+                                    "type": "hf_pull",
+                                    "repo": chosen["repo"],
+                                    "files": chosen["pull_files"],
+                                    "sizes": chosen.get("pull_sizes") or {},
+                                }],
+                            }
+                    return {
+                        "reply": f"Ready to pull **{chosen['repo']} · {chosen['quant']}** ({chosen['size_gb']} GB). Click below to queue the download.",
+                        "actions": [{
+                            "label": f"Queue Pull: {chosen['quant']} ({chosen['size_gb']} GB)",
+                            "type": "hf_pull",
+                            "repo": chosen["repo"],
+                            "files": chosen["pull_files"],
+                            "sizes": chosen.get("pull_sizes") or {},
+                        }],
+                    }
+
+            # A2. Recalculate previous HF query with updated goal or VRAM assumption
+            recalc_goal_kws = ("max context", "max ctx", "longest context", "fastest", "low vram", "balanced", "free vram", "currently free", "empty gpu", "unoccupied")
+            if ctx.get("query") and any(k in low for k in recalc_goal_kws) and not is_question:
+                new_goal, _ = self._parse_prompt_constraints(msg, ctx.get("goal") or "balanced", {})
+                new_empty = ctx.get("assume_empty_gpu", True)
+                if any(k in low for k in ("free vram", "currently free", "remaining vram", "alongside")):
+                    new_empty = False
+                elif any(k in low for k in ("empty gpu", "unoccupied", "nothing else")):
+                    new_empty = True
+                try:
+                    rec_data = self.recommend_hf(query=ctx["query"], goal=new_goal, assume_empty_gpu=new_empty)
+                    body, hf_acts = self._format_hf_recommendations(rec_data, auto_pull=False)
+                    return {"reply": body, "actions": hf_acts}
+                except Exception as e:
+                    return {"reply": f"Could not recalculate quants for `{ctx['query']}`: {e}", "actions": []}
+
+        # B. Follow-up to apply/launch/fix the last proposed config
+        last_apply = next((a for a in (ctx.get("last_actions") or []) if a.get("type") == "apply"), None)
+        if last_apply and re.search(r"\b(apply it|apply that|launch it|launch that|run it|fix it|apply the fix|yes|do it|go ahead)\b", low) and not low.endswith("?"):
+            try:
+                applied = self.apply_config(
+                    engine=last_apply["engine"],
+                    config=last_apply["config"],
+                    launch=True,
+                    goal=last_apply.get("goal") or "balanced",
+                )
+                return {
+                    "reply": f"Applied & launched **{last_apply['engine']}** (safety checkpoint `{applied.get('checkpoint_id', '')}`).",
+                    "actions": [{"label": f"Restore checkpoint ({applied.get('checkpoint_id', '')})", "type": "restore_checkpoint", "checkpoint_id": applied.get("checkpoint_id", "")}] if applied.get("checkpoint_id") else [],
+                }
+            except Exception as e:
+                return {"reply": f"Failed to apply config for {last_apply['engine']}: {e}", "actions": []}
+
+        # C. Follow-up to stop the active engine shown in previous turn
+        if re.search(r"\b(stop it|unload it|kill it|shut it down)\b", low) and not low.endswith("?"):
+            running = [e for e in self._active_engines_summary() if e.get("running")]
+            if len(running) == 1:
+                res = self.execute_action("stop_engine", {"engine": running[0]["engine"]}, engine=running[0]["engine"])
+                return {"reply": res["reply"], "actions": res["actions"]}
+            if len(running) > 1:
+                res = self.execute_action("stop_all_engines", {}, engine=engine)
+                return {"reply": res["reply"], "actions": res["actions"]}
+
+        # D. Analytical / conversational follow-up question -> route to multi-turn LLM with full history!
+        # Prevents broad keywords like "context", "recommend", "quant", "error" inside a follow-up question
+        # from hijacking the turn and running a fresh unrelated deterministic command.
+        followup_question = (
+            low.endswith("?")
+            or bool(re.match(r"^(why|how|what about|what if|would|could|will|is that|are those|tell me|explain|compare|elaborate|which one|can you explain)\b", low))
+            or bool(re.search(r"\b(that one|those|the first|the second|#1|#2|#3|instead|difference between|above|previous)\b", low))
+        )
+        if followup_question and self._chat_history:
+            llm_reply = self._llm_chat_with_context(msg)
+            if llm_reply:
+                # Keep previous turn's actionable buttons handy if relevant
+                carry_acts = [a for a in (ctx.get("last_actions") or []) if a.get("type") in ("hf_pull", "apply", "killswitch")][:2]
+                return {"reply": llm_reply, "actions": carry_acts}
+            # If an external LLM is configured but errored, surface the error clearly rather than misrouting
+            st = self.llm_status()
+            if st.get("available"):
+                lbl = st.get("provider_label") or st.get("provider") or "provider"
+                mod = st.get("model") or ""
+                err = self._last_llm_error or "empty response"
+                return {
+                    "reply": f"Configured LLM ({lbl}{f' · `{mod}`' if mod else ''}) failed on follow-up: {err}",
+                    "actions": [],
+                }
+        return None
 
     def chat(
         self,
@@ -2911,6 +3174,16 @@ class OptimizerAgent:
             if eng_kw in low:
                 engine = eng_id
                 break
+
+        # 0. Contextual follow-ups to the previous action menu item or chat turn
+        followup = self._try_contextual_followup(msg, engine, model)
+        if followup is not None:
+            reply = followup.get("reply") or ""
+            acts = followup.get("actions") or []
+            entry = {"ts": time.time(), "user": msg, "reply": reply, "actions": acts}
+            self._chat_history.append(entry)
+            self._chat_history = self._chat_history[-40:]
+            return {"reply": reply, "actions": acts, "llm": self.llm_status()}
 
         # 1. Hugging Face Quant Calculation & Pull intent (checked BEFORE generic 'recommend' -> advise!)
         hf_quant_kws = ("quant", "quantiz", "pull", "download", "hugging face", "huggingface", "hf ", "gguf")
@@ -3071,33 +3344,20 @@ class OptimizerAgent:
                     "goal": rec["goal"],
                     "model": rec.get("model_path") or model,
                 })
+                self._last_context = {
+                    "kind": "optimize_engine",
+                    "engine": engine,
+                    "goal": rec["goal"],
+                    "model": rec.get("model_path") or model,
+                    "last_actions": list(actions),
+                    "last_reply": reply_parts[-1],
+                }
             except Exception as e:
                 reply_parts.append(f"Could not compute advice for {engine}: {e}")
 
-        # 12. General LLM fallback with full live app context
+        # 12. General LLM fallback with full multi-turn history + live app context
         else:
-            vit = self.host.vitals(refresh=False)
-            mem = self.store.memory_summary(limit=5)
-            engines_st = self._active_engines_summary()
-            local_models = [
-                {"name": m.get("name"), "quant": m.get("quant"), "size_gb": round(float(m.get("size") or 0) / (1024**3), 2), "moe": bool(m.get("moe"))}
-                for m in ((self.host.scan_models() or {}).get("models") or [])[:10]
-            ]
-            caps_summary = [f"{a['id']}: {a['label']}" for a in AGENT_ACTION_TEMPLATES]
-            llm_reply = self._llm_complete(
-                "You are the Inference Console Agent assistant. You can help with ANY workflow in the app: "
-                "calculating and pulling Hugging Face GGUF quants (assuming empty GPU or free VRAM), "
-                "optimizing/auto-tuning llama.cpp, Avalon, Strata, and Maya, diagnosing crashes, benchmarking, "
-                "workload routing, speculative decoding, thermal guard, checkpoints, and coding-agent sync. "
-                "Be concise, technical, and grounded in the live hardware, models, and engine state provided.",
-                f"Hardware: {json.dumps(vit)}\n"
-                f"Engines: {json.dumps(engines_st)}\n"
-                f"Local models: {json.dumps(local_models)}\n"
-                f"Available app actions: {json.dumps(caps_summary)}\n"
-                f"Memory summary: {json.dumps(mem['best'][:3])}\n"
-                f"User: {msg}",
-                max_tokens=1024,
-            )
+            llm_reply = self._llm_chat_with_context(msg)
             if llm_reply:
                 reply_parts.append(llm_reply)
             else:
