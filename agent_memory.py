@@ -93,6 +93,24 @@ BUILTIN_PRESETS: list[dict[str, Any]] = [
         "notes": "k8v4 KV cache format to fit 128k+ context comfortably.",
         "config": {"context": "128k", "kv": "k8v4", "parallel": 1},
     },
+    {
+        "id": "builtin-maya-fastest",
+        "name": "Maya · Max Speed (MTP)",
+        "engine": "maya",
+        "goal": "fastest",
+        "builtin": True,
+        "notes": "Enables --mtp speculative drafting and low reasoning effort for peak decode tok/s.",
+        "config": {"mtp": True, "reasoning_effort": "low", "ctx": 32768},
+    },
+    {
+        "id": "builtin-maya-maxctx",
+        "name": "Maya · Longest Context",
+        "engine": "maya",
+        "goal": "max_context",
+        "builtin": True,
+        "notes": "Targets 131k context with MTP disabled to maximize KV cache headroom in VRAM.",
+        "config": {"mtp": False, "ctx": 131072},
+    },
 ]
 
 
