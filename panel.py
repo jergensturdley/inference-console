@@ -45,6 +45,12 @@ DEFAULT_CONFIG = {
     "strata_ctx": 8192,
     "strata_api_key": "",
     "strata_last": {},           # address/model reported by the last successful launch
+    # Optional OpenAI-compatible LLM for the Optimization Agent (empty = deterministic + local fallback)
+    "agent_llm_url": "",
+    "agent_llm_key": "",
+    "agent_llm_model": "",
+    "agent_llm_fallback_local": True,
+    "thermal_guard": {},         # graduated GPU thermal & VRAM pressure guard settings
     # Project Maya (~/project-maya). Empty means use MAYA_DIR / MAYA_ROCM_PATH defaults.
     "maya_dir": "",
     "maya_rocm_path": "",
@@ -4369,6 +4375,10 @@ class SettingsBody(BaseModel):
     strata_bin: str | None = None
     strata_alias: str | None = None
     strata_api_key: str | None = None
+    agent_llm_url: str | None = None
+    agent_llm_key: str | None = None
+    agent_llm_model: str | None = None
+    agent_llm_fallback_local: bool | None = None
 
 @app.get("/api/settings")
 def api_settings_get():
@@ -4390,6 +4400,8 @@ def api_settings_get():
     masked = (tok[:4] + "…" + tok[-4:]) if len(tok) >= 8 else ("(from $HF_TOKEN)" if env_tok else "")
     skey = CFG.get("strata_api_key", "")
     skey_masked = (skey[:4] + "…" + skey[-4:]) if len(skey) >= 8 else ""
+    akey = CFG.get("agent_llm_key", "")
+    akey_masked = (akey[:4] + "…" + akey[-4:]) if len(akey) >= 8 else ""
     sbin = strata_bin()
     return {
         "model_dirs": CFG.get("model_dirs", []),
@@ -4413,6 +4425,11 @@ def api_settings_get():
         "strata_api_key_set": bool(skey),
         "strata_api_key_masked": skey_masked,
         "strata_ctx": int(CFG.get("strata_ctx", 8192) or 8192),
+        "agent_llm_url": CFG.get("agent_llm_url", ""),
+        "agent_llm_model": CFG.get("agent_llm_model", ""),
+        "agent_llm_key_set": bool(akey),
+        "agent_llm_key_masked": akey_masked,
+        "agent_llm_fallback_local": bool(CFG.get("agent_llm_fallback_local", True)),
     }
 
 @app.post("/api/settings")
@@ -4449,6 +4466,18 @@ def api_settings_set(b: SettingsBody):
             CFG["strata_api_key"] = ""
         elif val and val != "__keep__":
             CFG["strata_api_key"] = val
+    if b.agent_llm_url is not None:
+        CFG["agent_llm_url"] = b.agent_llm_url.strip()
+    if b.agent_llm_model is not None:
+        CFG["agent_llm_model"] = b.agent_llm_model.strip()
+    if b.agent_llm_key is not None:
+        val = b.agent_llm_key.strip()
+        if val == "clear":
+            CFG["agent_llm_key"] = ""
+        elif val and val != "__keep__":
+            CFG["agent_llm_key"] = val
+    if b.agent_llm_fallback_local is not None:
+        CFG["agent_llm_fallback_local"] = bool(b.agent_llm_fallback_local)
     _save_config_secure()
     return api_settings_get()
 
@@ -4715,6 +4744,312 @@ def api_setup_install(b: SetupInstallBody):
     if b.engine == "avalon":
         return _setup_start("Avalon build", _build_avalon)
     raise HTTPException(400, f"unknown engine: {b.engine}")
+
+# ---------------------------------------------------------------- optimization agent api
+from agent_memory import AgentStore
+from optimizer_agent import HostContext, OptimizerAgent
+from thermal_guard import ThermalGuard
+
+AGENT_STORE = AgentStore(APP_DIR / "agent")
+OPT_AGENT = OptimizerAgent(
+    host=HostContext(
+        cfg=CFG,
+        default_bin=BIN,
+        avalon_bin=AVALON_BIN,
+        avalon_profiles=AVALON_PROFILES,
+        launch_profiles_path=LAUNCH_PROFILES_PATH,
+        vitals=vitals,
+        scan_models=scan_models,
+        estimate_vram=estimate_vram,
+        bin_caps=bin_caps,
+        find_draft=find_draft,
+        save_config=_save_config_secure,
+        mgr=MGR,
+        smgr=SMGR,
+        avalon_target=_avalon_target,
+        strata_bin=strata_bin,
+        strata_status=strata_status,
+        strata_build_args=strata_build_args,
+        strata_run=_strata_run,
+        strata_launch_body_cls=StrataLaunchBody,
+        strata_stop=api_strata_stop,
+        strata_log_path=STRATA_LOG,
+        chat_target=_chat_target,
+        benchmark_run=lambda pk, mt: api_benchmark_run(BenchRunBody(prompt_key=pk, max_tokens=mt)),
+        read_json=_read_json,
+        write_json=_write_json,
+        sync_agents_fn=lambda ags, src: api_agents_sync(AgentSyncBody(agents=ags, source=src)),
+        coding_agents_list=lambda: list(AGENTS.keys()),
+        hf_search_fn=api_hf_search,
+        hf_files_fn=api_hf_files,
+    ),
+    store=AGENT_STORE,
+)
+
+def _save_thermal_cfg(c: dict):
+    CFG["thermal_guard"] = c
+    _save_config_secure()
+
+THERMAL_GUARD = ThermalGuard(
+    get_config=lambda: CFG.get("thermal_guard") or {},
+    save_config=_save_thermal_cfg,
+    vitals_fn=vitals,
+    downshift_fn=OPT_AGENT.downshift_active_engine,
+    killswitch_fn=OPT_AGENT.emergency_killswitch,
+)
+if (CFG.get("thermal_guard") or {}).get("enabled"):
+    THERMAL_GUARD.start_loop()
+
+class AgentAdviseBody(BaseModel):
+    engine: str = "llama"
+    goal: str = "balanced"
+    model: str = ""
+    profile: str = "flagship"
+    constraints: dict | None = None
+    user_prompt: str = ""
+    use_llm: bool = True
+
+class AgentApplyBody(BaseModel):
+    engine: str = "llama"
+    config: dict
+    launch: bool = True
+    save_preset_name: str = ""
+    goal: str = "balanced"
+    checkpoint_label: str = ""
+
+class AgentTuneStartBody(BaseModel):
+    engine: str = "llama"
+    goal: str = "fastest"
+    model: str = ""
+    profile: str = "flagship"
+    constraints: dict | None = None
+    user_prompt: str = ""
+    max_trials: int = 5
+    max_seconds: int = 240
+    save_preset_name: str = ""
+
+class AgentTuneStopBody(BaseModel):
+    rollback: bool = False
+
+class AgentDiagnoseBody(BaseModel):
+    engine: str = "llama"
+    log_text: str | None = None
+    last_config: dict | None = None
+    use_llm: bool = True
+
+class AgentCheckpointCreateBody(BaseModel):
+    engine: str = "llama"
+    label: str = ""
+    reason: str = "manual"
+
+class AgentCheckpointRestoreBody(BaseModel):
+    relaunch: bool = False
+
+class AgentPresetSaveBody(BaseModel):
+    name: str
+    engine: str = "llama"
+    goal: str = "balanced"
+    config: dict
+    notes: str = ""
+    model_key: str = ""
+
+class AgentDocsBody(BaseModel):
+    engine: str = "llama"
+    query: str = ""
+
+class AgentChatBody(BaseModel):
+    message: str
+    engine: str = "llama"
+    model: str = ""
+
+@app.get("/api/agent/status")
+def api_agent_status():
+    return {
+        "llm": OPT_AGENT.llm_status(),
+        "tune": OPT_AGENT.tune_status(),
+        "checkpoints_count": len(AGENT_STORE.list_checkpoints(limit=50)),
+        "presets_count": len(AGENT_STORE.list_presets()),
+        "memory": AGENT_STORE.memory_summary(limit=10),
+    }
+
+@app.post("/api/agent/advise")
+def api_agent_advise(b: AgentAdviseBody):
+    try:
+        return OPT_AGENT.advise(
+            engine=b.engine, goal=b.goal, model=b.model, profile=b.profile,
+            constraints=b.constraints, user_prompt=b.user_prompt, use_llm=b.use_llm,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/apply")
+def api_agent_apply(b: AgentApplyBody):
+    try:
+        return OPT_AGENT.apply_config(
+            engine=b.engine, config=b.config, launch=b.launch,
+            save_preset_name=b.save_preset_name, goal=b.goal,
+            checkpoint_label=b.checkpoint_label,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/tune/start")
+def api_agent_tune_start(b: AgentTuneStartBody):
+    try:
+        return OPT_AGENT.start_tune(
+            engine=b.engine, goal=b.goal, model=b.model, profile=b.profile,
+            constraints=b.constraints, user_prompt=b.user_prompt,
+            max_trials=b.max_trials, max_seconds=b.max_seconds,
+            save_preset_name=b.save_preset_name,
+        )
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/agent/tune/status")
+def api_agent_tune_status():
+    return OPT_AGENT.tune_status()
+
+@app.post("/api/agent/tune/stop")
+def api_agent_tune_stop(b: AgentTuneStopBody):
+    return OPT_AGENT.stop_tune(rollback=b.rollback)
+
+@app.post("/api/agent/diagnose")
+def api_agent_diagnose(b: AgentDiagnoseBody):
+    return OPT_AGENT.diagnose_failure(
+        engine=b.engine, log_text=b.log_text, last_config=b.last_config, use_llm=b.use_llm,
+    )
+
+@app.post("/api/agent/heal")
+def api_agent_heal(b: AgentDiagnoseBody):
+    return OPT_AGENT.heal_failure(engine=b.engine, last_config=b.last_config)
+
+@app.get("/api/agent/checkpoints")
+def api_agent_checkpoints():
+    return {"checkpoints": AGENT_STORE.list_checkpoints(limit=30)}
+
+@app.post("/api/agent/checkpoints")
+def api_agent_checkpoint_create(b: AgentCheckpointCreateBody):
+    return OPT_AGENT.capture_checkpoint(engine=b.engine, label=b.label, reason=b.reason)
+
+@app.post("/api/agent/checkpoints/{cp_id}/restore")
+def api_agent_checkpoint_restore(cp_id: str, b: AgentCheckpointRestoreBody):
+    try:
+        return OPT_AGENT.restore_checkpoint(cp_id, relaunch=b.relaunch)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+@app.delete("/api/agent/checkpoints/{cp_id}")
+def api_agent_checkpoint_delete(cp_id: str):
+    if not AGENT_STORE.delete_checkpoint(cp_id):
+        raise HTTPException(404, "checkpoint not found")
+    return {"ok": True}
+
+@app.get("/api/agent/presets")
+def api_agent_presets(engine: str | None = None):
+    return {"presets": AGENT_STORE.list_presets(engine=engine)}
+
+@app.post("/api/agent/presets")
+def api_agent_preset_save(b: AgentPresetSaveBody):
+    return AGENT_STORE.save_preset(
+        name=b.name, engine=b.engine, goal=b.goal, config=b.config,
+        notes=b.notes, model_key=b.model_key,
+    )
+
+@app.delete("/api/agent/presets/{preset_id}")
+def api_agent_preset_delete(preset_id: str):
+    if not AGENT_STORE.delete_preset(preset_id):
+        raise HTTPException(404, "preset not found or builtin")
+    return {"ok": True}
+
+@app.get("/api/agent/memory")
+def api_agent_memory():
+    return AGENT_STORE.memory_summary(limit=30)
+
+@app.delete("/api/agent/memory")
+def api_agent_memory_clear():
+    AGENT_STORE.clear_memory()
+    return {"ok": True}
+
+@app.post("/api/agent/docs")
+def api_agent_docs(b: AgentDocsBody):
+    return OPT_AGENT.docs.lookup(b.engine, b.query)
+
+@app.post("/api/agent/chat")
+def api_agent_chat(b: AgentChatBody):
+    return OPT_AGENT.chat(message=b.message, engine=b.engine, model=b.model)
+
+class AgentThermalConfigBody(BaseModel):
+    enabled: bool | None = None
+    auto_act: bool | None = None
+    warn_temp_c: int | None = None
+    throttle_temp_c: int | None = None
+    kill_temp_c: int | None = None
+    cool_temp_c: int | None = None
+    power_throttle_pct: int | None = None
+    vram_pressure_pct: int | None = None
+
+class AgentThermalActionBody(BaseModel):
+    action: str
+
+class AgentRouteBody(BaseModel):
+    task: str = "coding"
+    apply: bool = False
+    sync_agents: bool = False
+    agents: list[str] | None = None
+
+class AgentSpeculateBody(BaseModel):
+    model: str = ""
+    draft_candidates: list[str] | None = None
+    apply_best: bool = True
+
+class AgentHFRecommendBody(BaseModel):
+    query: str
+    goal: str = "balanced"
+    max_repos: int = 4
+
+@app.get("/api/agent/thermal")
+def api_agent_thermal():
+    return THERMAL_GUARD.status()
+
+@app.post("/api/agent/thermal/config")
+def api_agent_thermal_config(b: AgentThermalConfigBody):
+    patch = {k: v for k, v in b.model_dump().items() if v is not None}
+    return {"ok": True, "config": THERMAL_GUARD.update_config(patch), "status": THERMAL_GUARD.status()}
+
+@app.post("/api/agent/thermal/evaluate")
+def api_agent_thermal_evaluate():
+    return THERMAL_GUARD.evaluate_once()
+
+@app.post("/api/agent/thermal/action")
+def api_agent_thermal_action(b: AgentThermalActionBody):
+    return THERMAL_GUARD.run_manual_action(b.action)
+
+@app.post("/api/agent/route")
+def api_agent_route(b: AgentRouteBody):
+    try:
+        return OPT_AGENT.route_workload(
+            task=b.task, apply=b.apply, sync_agents=b.sync_agents, agents=b.agents,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/speculate")
+def api_agent_speculate(b: AgentSpeculateBody):
+    try:
+        return OPT_AGENT.tune_speculation(
+            model=b.model, draft_candidates=b.draft_candidates, apply_best=b.apply_best,
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/hf/recommend")
+def api_agent_hf_recommend(b: AgentHFRecommendBody):
+    try:
+        return OPT_AGENT.recommend_hf(query=b.query, goal=b.goal, max_repos=b.max_repos)
+    except Exception as e:
+        raise HTTPException(502, f"HF recommendation failed: {e}")
 
 # ---------------------------------------------------------------- chat api
 @app.post("/api/chat")
@@ -5093,6 +5428,21 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   .mrow .acts{grid-column:1 / -1;justify-content:flex-start}
   .thread{max-height:none}
 }
+/* ---------- agent chat sidebar ---------- */
+.agent-drawer{position:fixed;top:0;right:0;bottom:0;width:min(410px,94vw);background:var(--panel);
+  border-left:1px solid var(--bd-2);box-shadow:-8px 0 28px rgba(0,0,0,.45);z-index:85;
+  display:flex;flex-direction:column;transform:translateX(100%);transition:transform .2s ease}
+.agent-drawer.open{transform:translateX(0)}
+.agent-drawer-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 14px;border-bottom:1px solid var(--bd)}
+.agent-drawer-hd h2{font-size:14px;font-weight:650;margin:0;display:flex;align-items:center;gap:6px}
+.agent-drawer-bd{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
+.agent-drawer-ft{padding:10px 12px;border-top:1px solid var(--bd);display:flex;flex-direction:column;gap:8px;background:var(--bg-2)}
+.agent-msg{padding:9px 11px;border-radius:10px;border:1px solid var(--bd);background:var(--bg-2);font-size:12.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.agent-msg.usr{background:color-mix(in srgb,var(--acc) 12%,var(--panel));border-color:color-mix(in srgb,var(--acc) 35%,var(--bd));align-self:flex-end;max-width:88%}
+.agent-msg.bot{align-self:flex-start;max-width:96%}
+.agent-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
+.agent-chips{display:flex;gap:5px;flex-wrap:wrap}
+
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
 }
@@ -5112,6 +5462,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div class="nav-grp">
       <div class="nav-lbl">Workspace</div>
       <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nl">Models</span><span class="nb" id="nb-models">0</span></button>
+      <button data-t="agent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></svg><span class="nl">Agent</span></button>
       <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg><span class="nl">Chat</span></button>
     </div>
     <div class="nav-grp">
@@ -5148,6 +5499,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <span class="tag mut hide" id="hdrkv" title="KV cache fill"></span>
     <span class="tag mut hide" id="hdridle" title="Idle auto-unload timer"></span>
   </div>
+  <button class="cmdbtn" id="agentdrawerbtn" title="Toggle Optimization Agent Chat Sidebar" aria-label="Toggle Agent Chat Sidebar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/></svg>
+    <span>Agent</span>
+  </button>
   <button class="cmdbtn" id="cmdbtn" title="Command palette (Ctrl+K or Cmd+K)" aria-label="Open command palette">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
     <kbd>⌘K</kbd>
@@ -5217,6 +5572,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
       <button class="btn danger" id="srvstop">Stop server</button>
       <button class="btn" id="srvtune">Tune active model…</button>
+      <button class="btn acc2" data-agent-quick="llama:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="llama:diagnose">Diagnose failure</button>
       <button class="btn" id="agentsbtn">Register in coding agents…</button>
       <span class="hint">Binds 127.0.0.1 · reachable on LAN through this panel</span>
     </div>
@@ -5298,6 +5655,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn danger" id="stratastopbtn" disabled>Stop</button>
       <button class="btn" id="stratadoctor">Run doctor</button>
       <button class="btn" id="strataupdate">Check update</button>
+      <button class="btn acc2" data-agent-quick="strata:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="strata:diagnose">Diagnose</button>
       <button class="btn" id="strataagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at the running Strata server">Register in coding agents…</button>
       <span class="tag hide" id="stratakeychip" title="API key of the running launch (strata launch --show-key)"></span>
     </div>
@@ -5382,6 +5741,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn primary" id="avalonstart">Start selected profile</button>
       <button class="btn danger" id="avalonstop">Stop</button>
       <button class="btn acc2" id="avalontunebtn">Config Optimizer &amp; Tuning…</button>
+      <button class="btn acc2" data-agent-quick="avalon:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="avalon:diagnose">Diagnose</button>
       <button class="btn" id="avalonagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at this Avalon server">Register in coding agents…</button>
       <span class="hint">OpenAI-compatible · streams <code>reasoning_content</code></span>
     </div>
@@ -5524,6 +5885,213 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       </div>
     </div>
     <pre class="log" id="mayalog" style="max-height:300px"></pre>
+  </div>
+</section>
+
+<!-- ==================== AGENT / OPTIMIZER ==================== -->
+<section id="t-agent" class="hide">
+  <div class="card">
+    <div class="hd">
+      <h2>Engine Optimization Agent</h2>
+      <div class="meta">
+        <span class="tag mut" id="ag-llm-chip">deterministic</span>
+        <span class="tag mut" id="ag-tune-chip">idle</span>
+        <button class="btn sm" id="ag-open-sidebar">Open Chat Sidebar</button>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 12px">MoE-aware, doc-grounded optimizer across llama.cpp, Avalon, and Strata. Every Apply or Auto-Tune run automatically creates a safety checkpoint first so you can revert at any time.</p>
+    <div class="form-grid">
+      <div class="field">
+        <label>Target engine</label>
+        <select id="ag-engine">
+          <option value="llama">llama.cpp</option>
+          <option value="avalon">Avalon</option>
+          <option value="strata">Strata</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Optimization goal</label>
+        <select id="ag-goal">
+          <option value="fastest">Fastest (max gen tok/s)</option>
+          <option value="low_latency">Lowest latency (min TTFT / prefill)</option>
+          <option value="max_context">Longest stable context</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="low_vram">Low VRAM / cool</option>
+          <option value="multi_user">Multi-user / parallel slots</option>
+        </select>
+      </div>
+      <div class="field" id="ag-model-wrap">
+        <label>Model / profile</label>
+        <select id="ag-model"><option value="">(auto-select active / pinned)</option></select>
+      </div>
+      <div class="field">
+        <label>Min context constraint (optional)</label>
+        <input id="ag-minctx" type="number" min="0" step="4096" placeholder="e.g. 32768">
+      </div>
+      <div class="field">
+        <label>Extra VRAM headroom MB (optional)</label>
+        <input id="ag-headroom" type="number" min="0" step="512" placeholder="e.g. 4096">
+      </div>
+      <div class="field">
+        <label>Max auto-tune trials</label>
+        <input id="ag-trials" type="number" min="1" max="12" value="5">
+      </div>
+      <div class="field" style="grid-column:1 / -1">
+        <label>Custom preference / constraint (natural language — works deterministically + with optional LLM)</label>
+        <input id="ag-prompt" type="text" placeholder="e.g. longest context with at least 64k tokens and leave 4 GB VRAM free">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="ag-advise">Dry-Run Advise</button>
+      <button class="btn acc2" id="ag-tune-start">Start Active Auto-Tune</button>
+      <button class="btn" id="ag-diagnose">Diagnose Engine Failure</button>
+      <button class="btn" id="ag-cp-now">Create Checkpoint</button>
+    </div>
+  </div>
+
+  <div class="card hide" id="ag-result-card">
+    <div class="hd">
+      <h2 id="ag-result-title">Recommendation</h2>
+      <div class="meta">
+        <button class="btn primary sm hide" id="ag-apply-btn">Checkpoint, Apply &amp; Launch</button>
+        <button class="btn sm hide" id="ag-save-preset-btn">Save as Preset</button>
+      </div>
+    </div>
+    <div id="ag-result-moe" class="kvs" style="margin-bottom:8px"></div>
+    <div id="ag-result-notes" style="margin-bottom:10px;font-size:12.5px;line-height:1.5"></div>
+    <pre class="cmdbox" id="ag-result-cfg" style="white-space:pre-wrap;max-height:240px;overflow:auto"></pre>
+  </div>
+
+  <div class="card hide" id="ag-tune-card">
+    <div class="hd">
+      <h2>Active Auto-Tune Session</h2>
+      <div class="meta">
+        <span class="tag acc" id="ag-tune-state">running</span>
+        <button class="btn danger sm" id="ag-tune-stop">Stop</button>
+        <button class="btn danger sm" id="ag-tune-rollback">Stop &amp; Rollback</button>
+      </div>
+    </div>
+    <div id="ag-tune-trials" style="margin-bottom:10px"></div>
+    <pre class="log" id="ag-tune-log" style="max-height:200px"></pre>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="hd">
+        <h2>Safety Checkpoints</h2>
+        <button class="btn xs" id="ag-cp-refresh">Refresh</button>
+      </div>
+      <div id="ag-checkpoints"><span class="hint">No checkpoints yet.</span></div>
+    </div>
+    <div class="card">
+      <div class="hd">
+        <h2>Reusable Presets</h2>
+        <button class="btn xs" id="ag-pre-refresh">Refresh</button>
+      </div>
+      <div id="ag-presets"><span class="hint">Loading presets…</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2>Persistent Memory &amp; VRAM Calibration</h2>
+      <div class="meta">
+        <button class="btn xs" id="ag-mem-refresh">Refresh</button>
+        <button class="btn xs danger" id="ag-mem-clear">Clear Memory</button>
+      </div>
+    </div>
+    <div id="ag-memory"><span class="hint">No empirical trials recorded yet.</span></div>
+  </div>
+
+  <!-- Phase 2: Workload Router & Speculative Decoding -->
+  <div class="grid">
+    <div class="card">
+      <div class="hd"><h2>Workload Router &amp; Coding-Agent Sync</h2></div>
+      <p class="hint" style="margin:0 0 10px">Pick a workload — the agent selects the best local model + engine + config (MoE-aware &amp; memory-backed) and can sync coding agents automatically.</p>
+      <div class="form-grid">
+        <div class="field">
+          <label>Workload / Task</label>
+          <select id="ag-route-task">
+            <option value="coding">Coding Agent (≥32k ctx, fast)</option>
+            <option value="long_doc">Long-Doc Analysis (max context)</option>
+            <option value="fast_chat">Fast Chat (low latency / TTFT)</option>
+            <option value="vision">Vision (mmproj)</option>
+            <option value="reasoning">Deep Reasoning / Large MoE</option>
+          </select>
+        </div>
+        <div class="field" style="justify-content:center">
+          <label class="switch"><input type="checkbox" id="ag-route-sync" checked><span class="track"></span><span class="hint">Auto-sync coding agents (omp, claude-code, codex, aider…)</span></label>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn" id="ag-route-preview">Preview Selection</button>
+        <button class="btn primary" id="ag-route-apply">Launch &amp; Sync</button>
+      </div>
+      <div id="ag-route-out" style="margin-top:10px;font-size:12.5px"></div>
+    </div>
+
+    <div class="card">
+      <div class="hd"><h2>Speculative Decoding Auto-Pairing</h2></div>
+      <p class="hint" style="margin:0 0 10px">Benchmarks baseline (no draft) vs candidate draft/MTP models in your library and disables speculation automatically if overhead hurts net tok/s.</p>
+      <div class="field">
+        <label>Target model (llama.cpp)</label>
+        <select id="ag-spec-model"><option value="">(auto-select active / pinned)</option></select>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn acc2" id="ag-spec-run">Auto-Pair &amp; Benchmark Drafts</button>
+      </div>
+      <div id="ag-spec-out" style="margin-top:10px;font-size:12.5px"></div>
+    </div>
+  </div>
+
+  <!-- Phase 2: Graduated Thermal & Shared-GPU Guard -->
+  <div class="card">
+    <div class="hd">
+      <h2>Graduated Thermal &amp; Shared-GPU Guard</h2>
+      <div class="meta">
+        <span class="tag mut" id="tg-state-chip">normal</span>
+        <button class="btn xs" id="tg-eval-now">Evaluate Now</button>
+      </div>
+    </div>
+    <p class="hint" id="tg-hw-hint" style="margin:0 0 10px">Ladder: (1) Ramp GPU fans to 100% &amp; throttle power cap → (2) Checkpoint &amp; downshift to low-VRAM profile → (3) Emergency killswitch. Auto-restores fans &amp; power once cool.</p>
+    <div class="form-grid">
+      <div class="field"><label>Warn / Fan+Power (°C)</label><input id="tg-warn" type="number" value="80"></div>
+      <div class="field"><label>Downshift (°C)</label><input id="tg-throttle" type="number" value="88"></div>
+      <div class="field"><label>Killswitch (°C)</label><input id="tg-kill" type="number" value="95"></div>
+      <div class="field"><label>Cool / Auto-Restore (°C)</label><input id="tg-cool" type="number" value="70"></div>
+      <div class="field"><label>Power Throttle (%)</label><input id="tg-pwrpct" type="number" value="15" min="5" max="40"></div>
+      <div class="field"><label>VRAM Pressure (%)</label><input id="tg-vrampct" type="number" value="92" min="60" max="99"></div>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:10px 0;align-items:center">
+      <label class="switch"><input type="checkbox" id="tg-enabled"><span class="track"></span><span class="hint">Enable background watchdog</span></label>
+      <label class="switch"><input type="checkbox" id="tg-autoact"><span class="track"></span><span class="hint">Auto-execute ladder actions</span></label>
+      <button class="btn primary sm" id="tg-save">Save Guard Policy</button>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+      <button class="btn xs" data-tg-act="max_fans">Max Fans</button>
+      <button class="btn xs" data-tg-act="throttle_power">Throttle Power</button>
+      <button class="btn xs" data-tg-act="restore_hw">Restore Auto Fan/Power</button>
+      <button class="btn xs" data-tg-act="downshift">Downshift Profile</button>
+      <button class="btn xs danger" data-tg-act="killswitch">Emergency Killswitch</button>
+    </div>
+    <div id="tg-events" class="hint"></div>
+  </div>
+
+  <!-- Phase 2: Hardware-Aware HF Model / Quant Recommender -->
+  <div class="card">
+    <div class="hd"><h2>Hardware-Aware Hugging Face Recommender</h2></div>
+    <p class="hint" style="margin:0 0 10px">Searches HF GGUF repos and scores quants against your real VRAM + RAM with MoE-aware hybrid placement (pairs matching mmproj/draft files automatically).</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="ag-hf-q" type="text" placeholder="e.g. Qwen3-Coder, DeepSeek, Llama-3.3, Gemma-3…" style="flex:1;min-width:220px">
+      <select id="ag-hf-goal">
+        <option value="balanced">Balanced</option>
+        <option value="fastest">Fastest (Full GPU)</option>
+        <option value="max_context">Max Context</option>
+        <option value="low_vram">Low VRAM</option>
+      </select>
+      <button class="btn primary" id="ag-hf-go">Recommend Quants</button>
+    </div>
+    <div id="ag-hf-out" style="margin-top:10px"></div>
   </div>
 </section>
 
@@ -5684,6 +6252,25 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <label>Strata API key override (only if you manage the key yourself) <span id="set-stratakey-status"></span></label>
         <input id="set-stratakey" type="password" placeholder="(leave blank to keep existing)">
       </div>
+      <div class="field" style="grid-column:1 / -1;border-top:1px solid var(--bd);padding-top:10px;margin-top:4px">
+        <label style="font-weight:650">Optimization Agent · Optional OpenAI-Compatible LLM</label>
+        <span class="hint">Leave blank to run purely deterministically (or fall back to the active local model for dry-run advice).</span>
+      </div>
+      <div class="field">
+        <label>Agent LLM Base URL</label>
+        <input id="set-agenturl" type="text" placeholder="e.g. https://api.openai.com/v1 or http://127.0.0.1:11434/v1">
+      </div>
+      <div class="field">
+        <label>Agent LLM Model</label>
+        <input id="set-agentmodel" type="text" placeholder="e.g. gpt-4o-mini, claude-3-5-sonnet, qwen3-14b">
+      </div>
+      <div class="field">
+        <label>Agent LLM API Key <span id="set-agentkey-status"></span></label>
+        <input id="set-agentkey" type="password" placeholder="(leave blank to keep existing; type 'clear' to remove)">
+      </div>
+      <div class="field" style="justify-content:center">
+        <label class="switch"><input type="checkbox" id="set-agentfallback" checked><span class="track"></span><span class="hint">Fall back to active local engine when external LLM is unset</span></label>
+      </div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn" id="set-reload">Reload</button>
@@ -5700,6 +6287,32 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 </section>
 </main>
+
+<!-- ==================== AGENT CHAT SIDEBAR ==================== -->
+<aside id="agentdrawer" class="agent-drawer" aria-label="Optimization Agent Chat">
+  <div class="agent-drawer-hd">
+    <h2>Optimization Agent</h2>
+    <div style="display:flex;gap:6px;align-items:center">
+      <span class="tag mut" id="ag-sb-llm">deterministic</span>
+      <button class="icon" id="ag-sb-close" aria-label="Close sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
+  </div>
+  <div class="agent-drawer-bd" id="ag-sb-msgs">
+    <div class="agent-msg bot">Ask me to optimize any engine (llama.cpp, Avalon, Strata), explain MoE fit, diagnose a crash, or restore a checkpoint.</div>
+  </div>
+  <div class="agent-drawer-ft">
+    <div class="agent-chips">
+      <button type="button" class="btn xs" data-ag-chip="Optimize llama.cpp for fastest speed">Fastest llama.cpp</button>
+      <button type="button" class="btn xs" data-ag-chip="Longest context config for Avalon">Max ctx Avalon</button>
+      <button type="button" class="btn xs" data-ag-chip="Diagnose last crash">Diagnose crash</button>
+      <button type="button" class="btn xs" data-ag-chip="Show checkpoints">Checkpoints</button>
+    </div>
+    <div style="display:flex;gap:6px">
+      <input id="ag-sb-in" type="text" placeholder="Ask the optimization agent…" style="flex:1">
+      <button class="btn primary sm" id="ag-sb-send">Send</button>
+    </div>
+  </div>
+</aside>
 
 <!-- ==================== MODALS (<dialog>) ==================== -->
 <dialog id="launchdlg" closedby="any">
@@ -6049,9 +6662,9 @@ $('#logout').addEventListener('click',async()=>{
 });
 
 /* ============================== tabs & workbench rail ============================== */
-const TABS=['models','server','strata','avalon','maya','vitals','chat','hf','settings'];
+const TABS=['models','server','strata','avalon','maya','agent','vitals','chat','hf','settings'];
 const TAB_TITLES={models:'Model Library',server:'llama.cpp Server & Bench',strata:'Strata Engine',
-  avalon:'Avalon 125B MoE',maya:'Project Maya',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
+  avalon:'Avalon 125B MoE',maya:'Project Maya',agent:'Optimization Agent',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
 let tab='models';
 function closeNav(){document.body.classList.remove('nav-open')}
 $('#mobmenu').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
@@ -6068,6 +6681,7 @@ function setTab(t){
   if(t==='strata'){loadStrata();loadStrataPresets();loadStrataKey();pollStrataTelemetry();refreshStrataLog();}
   if(t==='avalon'){loadAvalon(true);loadAvalonAccess();}
   if(t==='maya'){loadMaya();refreshMayaLog();}
+  if(t==='agent'){loadAgentAll();}
   if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
@@ -7696,6 +8310,11 @@ async function loadSettings(){
     $('#set-strataalias').value=s.strata_alias||'';
     $('#set-stratakey').value='';
     $('#set-stratakey-status').textContent=s.strata_api_key_set?'overridden ('+s.strata_api_key_masked+')':'not set (Strata owns its key)';
+    if($('#set-agenturl')){$('#set-agenturl').value=s.agent_llm_url||'';}
+    if($('#set-agentmodel')){$('#set-agentmodel').value=s.agent_llm_model||'';}
+    if($('#set-agentkey')){$('#set-agentkey').value='';}
+    if($('#set-agentkey-status')){$('#set-agentkey-status').textContent=s.agent_llm_key_set?'saved ('+s.agent_llm_key_masked+')':'not set';}
+    if($('#set-agentfallback')){$('#set-agentfallback').checked=s.agent_llm_fallback_local!==false;}
     const c=s.caps||{};
     $('#set-caps-badge').textContent=c.exists?'binary verified':'binary missing';
     $('#set-caps-badge').className='tag '+(c.exists?'ok':'err');
@@ -7721,7 +8340,11 @@ $('#set-save').addEventListener('click',async()=>{
       hf_token:$('#set-hftok').value.trim(),
       strata_bin:$('#set-stratabin').value.trim(),
       strata_alias:$('#set-strataalias').value.trim(),
-      strata_api_key:$('#set-stratakey').value.trim()
+      strata_api_key:$('#set-stratakey').value.trim(),
+      agent_llm_url:$('#set-agenturl')?$('#set-agenturl').value.trim():undefined,
+      agent_llm_model:$('#set-agentmodel')?$('#set-agentmodel').value.trim():undefined,
+      agent_llm_key:$('#set-agentkey')?$('#set-agentkey').value.trim():undefined,
+      agent_llm_fallback_local:$('#set-agentfallback')?$('#set-agentfallback').checked:undefined
     });
     toast('Settings saved','ok');
     await loadSettings();await loadModels();
@@ -7848,6 +8471,399 @@ $('#pal-list').addEventListener('click',e=>{
   if(m){$('#cmdpal').close();m.run();}
 });
 
+/* ============================== optimization agent & sidebar ============================== */
+let AG_LAST_RESULT=null;
+function syncAgentModelOptions(){
+  const sel=$('#ag-model');if(!sel)return;
+  const eng=$('#ag-engine').value;
+  if(eng==='llama'){
+    sel.innerHTML='<option value="">(auto-select active / pinned)</option>'
+      +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+' ('+esc(m.quant)+(m.moe?' · MoE':'')+')</option>').join('');
+  }else if(eng==='avalon'){
+    sel.innerHTML='<option value="flagship">flagship</option><option value="prefast">prefast</option><option value="compact">compact</option>';
+  }else{
+    sel.innerHTML='<option value="">(Strata default / active)</option>'
+      +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
+  }
+}
+$('#ag-engine')?.addEventListener('change',syncAgentModelOptions);
+
+function buildAgentPayload(){
+  const eng=$('#ag-engine').value;
+  const constraints={};
+  const mc=Number($('#ag-minctx').value)||0;if(mc>0)constraints.min_ctx=mc;
+  const hr=Number($('#ag-headroom').value)||0;if(hr>0)constraints.vram_headroom_mb=hr;
+  return {
+    engine:eng,
+    goal:$('#ag-goal').value,
+    model:eng==='avalon'?'':$('#ag-model').value,
+    profile:eng==='avalon'?($('#ag-model').value||'flagship'):'flagship',
+    constraints,
+    user_prompt:$('#ag-prompt').value.trim(),
+    max_trials:Number($('#ag-trials').value)||5
+  };
+}
+
+function renderAgentResult(title,data){
+  AG_LAST_RESULT=data;
+  $('#ag-result-card').classList.remove('hide');
+  $('#ag-result-title').textContent=title;
+  const moe=data.moe;
+  $('#ag-result-moe').innerHTML=moe
+    ?('<span class="tag '+(moe.feasible?'ok':'err')+'">'+(moe.is_moe?'MoE · '+esc(moe.strategy):esc(moe.strategy))+'</span>'
+      +(moe.gpu_hot_path_mb?'<span class="tag mut">GPU hot: '+moe.gpu_hot_path_mb+' MB</span>':'')
+      +(moe.cpu_cold_experts_mb?'<span class="tag mut">CPU experts: '+moe.cpu_cold_experts_mb+' MB</span>':'')
+      +(data.fit?'<span class="tag '+(data.fit.status==='fit'?'ok':data.fit.status==='tight'?'warn':'err')+'">'+esc(data.fit.badge)+' ('+data.fit.pct+'%)</span>':''))
+    :'';
+  const notes=data.notes||data.remediation_steps||[];
+  const extra=data.llm_analysis||data.llm_diagnosis||'';
+  $('#ag-result-notes').innerHTML=(notes.map(n=>'<div>• '+esc(n)+'</div>').join(''))
+    +(extra?'<div style="margin-top:8px;padding:8px;border-left:2px solid var(--acc);background:var(--bg-2)">'+esc(extra)+'</div>':'');
+  const cfg=data.config||data.fix_config;
+  $('#ag-result-cfg').textContent=cfg?JSON.stringify(cfg,null,2):(data.cause||'No config changes proposed.');
+  $('#ag-apply-btn').classList.toggle('hide',!cfg);
+  $('#ag-save-preset-btn').classList.toggle('hide',!cfg);
+}
+
+async function loadAgentStatus(){
+  try{
+    const d=await api('/api/agent/status');
+    const lm=d.llm||{};
+    const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
+    if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
+    if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+    renderTuneStatus(d.tune);
+  }catch(e){}
+}
+
+function renderTuneStatus(t){
+  const running=!!(t&&t.running);
+  if($('#ag-tune-chip')){$('#ag-tune-chip').textContent=running?'tuning…':(t&&t.session?t.session.state:'idle');$('#ag-tune-chip').className='tag '+(running?'acc':'mut');}
+  if(!t||!t.session){$('#ag-tune-card')?.classList.add('hide');return;}
+  const s=t.session;
+  $('#ag-tune-card').classList.remove('hide');
+  $('#ag-tune-state').textContent=s.state+' · '+s.completed_trials+'/'+s.max_trials+' trials';
+  $('#ag-tune-trials').innerHTML=(s.trials||[]).map(tr=>
+    '<div class="kvs" style="margin-bottom:4px">'
+    +'<span class="tag '+(tr.ok?'ok':'err')+'">#'+tr.index+' '+esc(tr.label)+'</span>'
+    +(tr.ok?'<span class="tag acc">'+tr.metrics.tok_s+' tok/s</span><span class="tag mut">TTFT '+tr.metrics.ttft_ms+'ms</span><span class="tag mut">VRAM '+tr.metrics.vram_mb+' MB</span><span class="tag mut">score '+tr.score+'</span>'
+      :'<span class="hint">'+esc(tr.error||'failed')+'</span>')
+    +'</div>'
+  ).join('')||'<span class="hint">Starting first trial…</span>';
+  $('#ag-tune-log').textContent=(s.log||[]).join('\n');
+}
+
+async function loadAgentCheckpoints(){
+  try{
+    const d=await api('/api/agent/checkpoints');
+    const cps=d.checkpoints||[];
+    $('#ag-checkpoints').innerHTML=cps.length?cps.map(c=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(c.label)+'</div><div class="hint">'+esc(c.id)+' · '+esc(c.engine)+' · '+new Date(c.ts*1000).toLocaleString()+'</div></div>'
+      +'<div style="display:flex;gap:4px">'
+      +'<button class="btn xs" data-cp-restore="'+esc(c.id)+'">Restore</button>'
+      +'<button class="btn xs danger" data-cp-del="'+esc(c.id)+'">×</button>'
+      +'</div></div>'
+    ).join(''):'<span class="hint">No checkpoints yet. One is auto-created before any Apply or Auto-Tune.</span>';
+  }catch(e){}
+}
+
+async function loadAgentPresets(){
+  try{
+    const d=await api('/api/agent/presets');
+    const ps=d.presets||[];
+    $('#ag-presets').innerHTML=ps.length?ps.map(p=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(p.name)+' <span class="tag mut">'+esc(p.engine)+'</span></div>'
+      +'<div class="hint">'+esc(p.notes||p.goal)+'</div></div>'
+      +'<div style="display:flex;gap:4px">'
+      +'<button class="btn xs primary" data-pre-apply="'+esc(p.id)+'">Apply</button>'
+      +(p.builtin?'':'<button class="btn xs danger" data-pre-del="'+esc(p.id)+'">×</button>')
+      +'</div></div>'
+    ).join(''):'<span class="hint">No presets.</span>';
+    $('#ag-presets')._items=ps;
+  }catch(e){}
+}
+
+async function loadAgentMemory(){
+  try{
+    const m=await api('/api/agent/memory');
+    const cal=m.vram_calibration||{};
+    const best=m.best||[];
+    $('#ag-memory').innerHTML=
+      '<div class="kvs" style="margin-bottom:8px">'
+      +'<span class="tag mut">Trials: '+m.trial_count+'</span>'
+      +'<span class="tag ok">Winners: '+m.best_count+'</span>'
+      +'<span class="tag mut">Failure signatures: '+m.failure_count+'</span>'
+      +'<span class="tag acc">VRAM calibration samples: '+(cal.total_samples||0)+'</span>'
+      +'</div>'
+      +(best.length?best.slice(0,8).map(b=>
+        '<div class="hint" style="padding:3px 0">• <b>'+esc(b.engine)+'</b> / '+esc(b.model_key)+' ('+esc(b.goal)+'): '
+        +((b.metrics&&b.metrics.tok_s)?b.metrics.tok_s+' tok/s, '+b.metrics.vram_mb+' MB VRAM':'recorded')+'</div>'
+      ).join(''):'<span class="hint">Run Active Auto-Tune to record empirically verified winners & calibrate VRAM estimates.</span>');
+  }catch(e){}
+}
+
+async function loadAgentAll(){
+  syncAgentModelOptions();
+  const sm=$('#ag-spec-model');
+  if(sm)sm.innerHTML='<option value="">(auto-select active / pinned)</option>'+MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
+  await Promise.all([loadAgentStatus(),loadAgentCheckpoints(),loadAgentPresets(),loadAgentMemory(),loadThermalGuard()]);
+}
+
+/* Phase 2 UI: Thermal Guard */
+async function loadThermalGuard(){
+  try{
+    const d=await api('/api/agent/thermal');
+    const c=d.config||{};
+    if($('#tg-warn'))$('#tg-warn').value=c.warn_temp_c||80;
+    if($('#tg-throttle'))$('#tg-throttle').value=c.throttle_temp_c||88;
+    if($('#tg-kill'))$('#tg-kill').value=c.kill_temp_c||95;
+    if($('#tg-cool'))$('#tg-cool').value=c.cool_temp_c||70;
+    if($('#tg-pwrpct'))$('#tg-pwrpct').value=c.power_throttle_pct||15;
+    if($('#tg-vrampct'))$('#tg-vrampct').value=c.vram_pressure_pct||92;
+    if($('#tg-enabled'))$('#tg-enabled').checked=!!c.enabled;
+    if($('#tg-autoact'))$('#tg-autoact').checked=!!c.auto_act;
+    const ch=$('#tg-state-chip');
+    if(ch){
+      ch.textContent=d.state+(d.hw_override_active?' · hw override':'');
+      ch.className='tag '+(d.level===0?'ok':d.level===1?'warn':'err');
+    }
+    const hc=d.hw_caps||{};
+    if($('#tg-hw-hint')&&hc.setup_hint){
+      $('#tg-hw-hint').textContent='Hardware: '+hc.vendor+' (fan writable: '+hc.fan_writable+', power writable: '+hc.power_writable+'). '+hc.setup_hint;
+    }
+    const evs=d.events||[];
+    if($('#tg-events')){
+      $('#tg-events').innerHTML=evs.length?evs.slice(0,6).map(e=>'<div>• ['+new Date(e.ts*1000).toLocaleTimeString()+'] <b>'+esc(e.action)+'</b>: '+esc(e.detail)+'</div>').join(''):'No thermal events recorded.';
+    }
+  }catch(e){}
+}
+$('#tg-save')?.addEventListener('click',async()=>{
+  try{
+    await post('/api/agent/thermal/config',{
+      enabled:$('#tg-enabled').checked,auto_act:$('#tg-autoact').checked,
+      warn_temp_c:Number($('#tg-warn').value),throttle_temp_c:Number($('#tg-throttle').value),
+      kill_temp_c:Number($('#tg-kill').value),cool_temp_c:Number($('#tg-cool').value),
+      power_throttle_pct:Number($('#tg-pwrpct').value),vram_pressure_pct:Number($('#tg-vrampct').value)
+    });
+    toast('Thermal guard policy saved','ok');loadThermalGuard();
+  }catch(e){toast('Save failed: '+e.message,'err')}
+});
+$('#tg-eval-now')?.addEventListener('click',async()=>{
+  try{const r=await post('/api/agent/thermal/evaluate',{});toast('Thermal eval: '+r.state+' ('+(r.eff_temp_c||0)+'°C)','ok');loadThermalGuard();}
+  catch(e){toast('Eval failed: '+e.message,'err')}
+});
+$$('[data-tg-act]').forEach(b=>b.addEventListener('click',async()=>{
+  try{const r=await post('/api/agent/thermal/action',{action:b.dataset.tgAct});toast(r.ok?(r.detail||'Action executed'):(r.error||'Action failed'),r.ok?'ok':'warn');loadThermalGuard();}
+  catch(e){toast('Action failed: '+e.message,'err')}
+}));
+
+/* Phase 2 UI: Workload Router */
+async function runWorkloadRoute(apply){
+  const out=$('#ag-route-out');
+  try{
+    const r=await post('/api/agent/route',{task:$('#ag-route-task').value,apply,sync_agents:$('#ag-route-sync').checked});
+    const s=r.selected;
+    out.innerHTML='<div><b>Selected:</b> '+esc(s.engine)+' · <code>'+esc(s.model_key)+'</code> (score '+s.score+')</div>'
+      +'<div class="hint">'+(s.reasons||[]).map(esc).join(' · ')+'</div>'
+      +(r.applied?'<div class="tag ok" style="margin-top:6px">Launched (checkpoint '+esc(r.applied.checkpoint_id)+')</div>':'')
+      +(r.synced_agents?'<div class="tag acc" style="margin-top:6px">Synced coding agents</div>':'');
+    if(apply){loadAgentCheckpoints();pollStatus(true);}
+  }catch(e){toast('Route failed: '+e.message,'err')}
+}
+$('#ag-route-preview')?.addEventListener('click',()=>runWorkloadRoute(false));
+$('#ag-route-apply')?.addEventListener('click',()=>runWorkloadRoute(true));
+
+/* Phase 2 UI: Speculative Decoding Tuner */
+$('#ag-spec-run')?.addEventListener('click',async()=>{
+  const btn=$('#ag-spec-run');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/speculate',{model:$('#ag-spec-model').value,apply_best:true});
+    $('#ag-spec-out').innerHTML='<div><b>'+esc(r.verdict)+'</b></div>'
+      +(r.trials||[]).map(t=>'<div class="hint">• '+esc(t.label)+': '+(t.ok?t.tok_s+' tok/s ('+(t.speedup_pct>=0?'+':'')+t.speedup_pct+'%)':esc(t.error))+'</div>').join('');
+    loadAgentCheckpoints();loadAgentMemory();
+  }catch(e){toast('Speculation tuner failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+
+/* Phase 2 UI: HF Recommender */
+$('#ag-hf-go')?.addEventListener('click',async()=>{
+  const q=($('#ag-hf-q').value||'').trim();if(!q)return;
+  const btn=$('#ag-hf-go');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/hf/recommend',{query:q,goal:$('#ag-hf-goal').value});
+    const recs=r.recommendations||[];
+    $('#ag-hf-out').innerHTML=recs.length?recs.map((x,i)=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(x.repo)+' · <span class="tag acc">'+esc(x.quant)+'</span> <span class="tag '+(x.is_moe?'warn':'ok')+'">'+esc(x.fit_label)+'</span></div>'
+      +'<div class="hint">'+x.size_gb+' GB · GPU ~'+x.gpu_est_mb+' MB'+(x.ram_est_mb?' · RAM experts ~'+x.ram_est_mb+' MB':'')+(x.mmproj?' · +mmproj':'')+(x.draft?' · +draft':'')+'</div></div>'
+      +'<button class="btn xs primary" data-hf-rec-pull="'+i+'">Queue Pull</button></div>'
+    ).join(''):'<span class="hint">No fitting GGUF quants found for that query.</span>';
+    $('#ag-hf-out')._recs=recs;
+  }catch(e){toast('HF recommend failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-hf-out')?.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-hf-rec-pull]');if(!b)return;
+  const rec=($('#ag-hf-out')._recs||[])[Number(b.dataset.hfRecPull)];if(!rec)return;
+  try{await post('/api/hf/pull',{repo:rec.repo,files:rec.pull_files});toast('Queued '+rec.pull_files.length+' file(s) from '+rec.repo,'ok');pollDownloads();}
+  catch(err){toast('Pull failed: '+err.message,'err')}
+});
+
+$('#ag-advise')?.addEventListener('click',async()=>{
+  const btn=$('#ag-advise');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/advise',buildAgentPayload());
+    renderAgentResult('Dry-Run Recommendation ('+d.engine+' · '+d.goal+')',d);
+  }catch(e){toast('Advise failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-tune-start')?.addEventListener('click',async()=>{
+  const btn=$('#ag-tune-start');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/tune/start',buildAgentPayload());
+    renderTuneStatus(d);loadAgentCheckpoints();toast('Auto-tune started (safety checkpoint created)','ok');
+  }catch(e){toast('Auto-tune failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-tune-stop')?.addEventListener('click',async()=>{
+  await post('/api/agent/tune/stop',{rollback:false});toast('Stopping auto-tune…','ok');loadAgentStatus();
+});
+$('#ag-tune-rollback')?.addEventListener('click',async()=>{
+  await post('/api/agent/tune/stop',{rollback:true});toast('Stopped and rolled back to checkpoint','ok');loadAgentStatus();
+});
+$('#ag-diagnose')?.addEventListener('click',async()=>{
+  const btn=$('#ag-diagnose');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/diagnose',{engine:$('#ag-engine').value});
+    renderAgentResult('Failure Diagnosis ('+d.engine+'): '+d.title,d);
+  }catch(e){toast('Diagnose failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-cp-now')?.addEventListener('click',async()=>{
+  try{
+    const cp=await post('/api/agent/checkpoints',{engine:$('#ag-engine').value,label:'Manual checkpoint ('+$('#ag-engine').value+')'});
+    toast('Created checkpoint '+cp.id,'ok');loadAgentCheckpoints();
+  }catch(e){toast('Checkpoint failed: '+e.message,'err')}
+});
+$('#ag-apply-btn')?.addEventListener('click',async()=>{
+  if(!AG_LAST_RESULT)return;
+  const cfg=AG_LAST_RESULT.config||AG_LAST_RESULT.fix_config;if(!cfg)return;
+  const btn=$('#ag-apply-btn');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/apply',{engine:AG_LAST_RESULT.engine,config:cfg,launch:true,goal:AG_LAST_RESULT.goal||'balanced'});
+    toast('Applied & launched (checkpoint '+r.checkpoint_id+')','ok');
+    loadAgentCheckpoints();pollStatus(true);
+  }catch(e){toast('Apply failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-save-preset-btn')?.addEventListener('click',async()=>{
+  if(!AG_LAST_RESULT)return;
+  const cfg=AG_LAST_RESULT.config||AG_LAST_RESULT.fix_config;if(!cfg)return;
+  const nm=prompt('Preset name:',(AG_LAST_RESULT.engine||'llama')+' · '+(AG_LAST_RESULT.goal||'custom'));
+  if(!nm)return;
+  try{
+    await post('/api/agent/presets',{name:nm,engine:AG_LAST_RESULT.engine,goal:AG_LAST_RESULT.goal||'balanced',config:cfg,notes:(AG_LAST_RESULT.notes||[])[0]||''});
+    toast('Preset saved','ok');loadAgentPresets();
+  }catch(e){toast('Save preset failed: '+e.message,'err')}
+});
+$('#ag-cp-refresh')?.addEventListener('click',loadAgentCheckpoints);
+$('#ag-pre-refresh')?.addEventListener('click',loadAgentPresets);
+$('#ag-mem-refresh')?.addEventListener('click',loadAgentMemory);
+$('#ag-mem-clear')?.addEventListener('click',async()=>{
+  if(!confirm('Clear persistent agent experience memory?'))return;
+  await fetch('/api/agent/memory',{method:'DELETE'});toast('Agent memory cleared','ok');loadAgentMemory();
+});
+$('#ag-checkpoints')?.addEventListener('click',async e=>{
+  const r=e.target.closest('[data-cp-restore]');
+  if(r){
+    try{await post('/api/agent/checkpoints/'+r.dataset.cpRestore+'/restore',{relaunch:true});toast('Checkpoint restored','ok');pollStatus(true);}
+    catch(err){toast('Restore failed: '+err.message,'err')}
+    return;
+  }
+  const d=e.target.closest('[data-cp-del]');
+  if(d){await fetch('/api/agent/checkpoints/'+d.dataset.cpDel,{method:'DELETE'});loadAgentCheckpoints();}
+});
+$('#ag-presets')?.addEventListener('click',async e=>{
+  const a=e.target.closest('[data-pre-apply]');
+  if(a){
+    const p=($('#ag-presets')._items||[]).find(x=>x.id===a.dataset.preApply);
+    if(!p)return;
+    try{const r=await post('/api/agent/apply',{engine:p.engine,config:p.config,launch:true,goal:p.goal||'balanced'});toast('Applied preset '+p.name+' (checkpoint '+r.checkpoint_id+')','ok');loadAgentCheckpoints();pollStatus(true);}
+    catch(err){toast('Apply preset failed: '+err.message,'err')}
+    return;
+  }
+  const d=e.target.closest('[data-pre-del]');
+  if(d){await fetch('/api/agent/presets/'+d.dataset.preDel,{method:'DELETE'});loadAgentPresets();}
+});
+
+/* Quick triggers on llama.cpp / Strata / Avalon tabs */
+document.addEventListener('click',e=>{
+  const q=e.target.closest('[data-agent-quick]');if(!q)return;
+  const [eng,act]=q.dataset.agentQuick.split(':');
+  setTab('agent');
+  if($('#ag-engine')){$('#ag-engine').value=eng;syncAgentModelOptions();}
+  if(act==='diagnose')$('#ag-diagnose')?.click();
+  else $('#ag-advise')?.click();
+});
+
+/* Collapsible Agent Chat Sidebar */
+function toggleAgentDrawer(force){
+  const dr=$('#agentdrawer');if(!dr)return;
+  dr.classList.toggle('open',typeof force==='boolean'?force:!dr.classList.contains('open'));
+  if(dr.classList.contains('open')){$('#ag-sb-in')?.focus();loadAgentStatus();}
+}
+$('#agentdrawerbtn')?.addEventListener('click',()=>toggleAgentDrawer());
+$('#ag-open-sidebar')?.addEventListener('click',()=>toggleAgentDrawer(true));
+$('#ag-sb-close')?.addEventListener('click',()=>toggleAgentDrawer(false));
+
+function appendAgentBubble(role,text,actions){
+  const box=$('#ag-sb-msgs');if(!box)return;
+  const div=document.createElement('div');
+  div.className='agent-msg '+(role==='user'?'usr':'bot');
+  div.textContent=text;
+  if(actions&&actions.length){
+    const acts=document.createElement('div');acts.className='agent-acts';
+    actions.forEach(a=>{
+      const b=document.createElement('button');b.type='button';b.className='btn xs primary';b.textContent=a.label;
+      b.addEventListener('click',async()=>{
+        b.disabled=true;
+        try{
+          if(a.type==='apply'){
+            const r=await post('/api/agent/apply',{engine:a.engine,config:a.config,launch:true,goal:a.goal||'balanced'});
+            toast('Applied (checkpoint '+r.checkpoint_id+')','ok');pollStatus(true);
+          }else if(a.type==='start_tune'){
+            await post('/api/agent/tune/start',{engine:a.engine,goal:a.goal||'fastest',model:a.model||''});
+            setTab('agent');loadAgentStatus();toast('Auto-tune started','ok');
+          }else if(a.type==='restore_checkpoint'){
+            await post('/api/agent/checkpoints/'+a.checkpoint_id+'/restore',{relaunch:true});
+            toast('Restored '+a.checkpoint_id,'ok');pollStatus(true);
+          }
+        }catch(err){toast('Action failed: '+err.message,'err')}
+        b.disabled=false;
+      });
+      acts.appendChild(b);
+    });
+    div.appendChild(acts);
+  }
+  box.appendChild(div);
+  box.scrollTop=box.scrollHeight;
+}
+async function sendAgentChat(text){
+  const msg=(text||$('#ag-sb-in').value||'').trim();if(!msg)return;
+  $('#ag-sb-in').value='';
+  appendAgentBubble('user',msg);
+  try{
+    const eng=(tab==='strata'||tab==='avalon')?tab:($('#ag-engine')?.value||'llama');
+    const r=await post('/api/agent/chat',{message:msg,engine:eng});
+    appendAgentBubble('bot',r.reply,r.actions||[]);
+  }catch(e){appendAgentBubble('bot','Error: '+e.message);}
+}
+$('#ag-sb-send')?.addEventListener('click',()=>sendAgentChat());
+$('#ag-sb-in')?.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendAgentChat();}});
+$$('[data-ag-chip]').forEach(b=>b.addEventListener('click',()=>sendAgentChat(b.dataset.agChip)));
+
 /* ============================== polling & keys ============================== */
 function tick(){
   if(document.hidden)return;
@@ -7855,6 +8871,7 @@ function tick(){
   pollTelemetry();
   if(tab==='strata'){loadStrata();pollStrataTelemetry();}
   if(tab==='avalon')loadAvalon();
+  if(tab==='agent')loadAgentStatus();
   if(tab==='maya')loadMaya();
 }
 setInterval(tick,2500);
