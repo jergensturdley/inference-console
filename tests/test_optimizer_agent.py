@@ -676,4 +676,50 @@ def test_agent_chat_surfaces_provider_errors_and_handles_reasoning_models(tmp_pa
     assert "24GB GPU" in res_ok["reply"]
 
 
+def test_strata_timeout_preserves_output_and_advise_inherits_last_preset(tmp_path, monkeypatch):
+    """Strata timeouts must keep partial stdout/stderr and auto-tune must log the command + use >=300s timeout."""
+    import subprocess
+
+    # 1. panel._strata_run preserves partial stderr/stdout on TimeoutExpired
+    monkeypatch.setattr(panel, "strata_bin", lambda: "/usr/local/bin/strata")
+
+    def fake_run(*a, **kw):
+        raise subprocess.TimeoutExpired(
+            cmd=a[0],
+            timeout=kw.get("timeout", 10),
+            output=b"Loading shards...\n",
+            stderr=b"Downloading qwen3.8-flash-next 14%\n",
+        )
+
+    monkeypatch.setattr(panel.subprocess, "run", fake_run)
+    r = panel._strata_run(["launch", "--context", "64k"], timeout=120)
+    assert r["ok"] is False
+    assert "14%" in r["error"]
+    assert "Downloading qwen3.8-flash-next 14%" in r["stderr"]
+    assert "Loading shards" in r["stdout"]
+
+    # 2. _advise_strata inherits preset from strata_last & handles dict strata_run results cleanly
+    agent, _, _, host = _make_stub_agent(tmp_path)
+    host.cfg["strata_last"] = {"preset": "my-local-preset", "port": 8080}
+    host.strata_bin = lambda: "/usr/local/bin/strata"
+    seen = []
+
+    def fake_strata_run(args, timeout=25):
+        seen.append((list(args), timeout))
+        if "--plan" in args:
+            return {"ok": True, "rc": 0, "json": {"vram_gb": 18.2}, "stdout": '{"vram_gb": 18.2}', "stderr": "", "error": None}
+        return {"ok": False, "rc": None, "json": None, "stdout": "", "stderr": "waiting on GPU 0", "error": "strata timed out after 300s"}
+
+    host.strata_run = fake_strata_run
+    rec = agent.advise(engine="strata", goal="balanced", use_llm=False)
+    assert rec["config"].get("preset") == "my-local-preset"
+    assert rec["plan_preview"] == {"vram_gb": 18.2}
+
+    ok, err = agent._launch_for_trial("strata", rec["config"])
+    assert ok is False
+    assert seen[-1][1] == 300
+    assert "waiting on GPU 0" in err and "timed out after 300s" in err
+
+
+
 
