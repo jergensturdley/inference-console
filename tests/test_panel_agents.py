@@ -18,6 +18,7 @@ REPO = Path(__file__).resolve().parent.parent
 HOME_TMP = tempfile.mkdtemp(prefix="inference-console-agents-")
 os.environ["HOME"] = HOME_TMP          # must be set before panel is imported
 sys.path.insert(0, str(REPO))
+sys.modules.pop("panel", None)         # evict any earlier test's cached panel so panel.HOME binds here
 
 import panel  # noqa: E402
 
