@@ -882,15 +882,18 @@ def test_agent_chat_preserves_context_on_action_menu_followups(tmp_path, monkeyp
     )
     assert "Q4_K_M" in r1["reply"] and "IQ3_XS" in r1["reply"]
 
-    # 2. Analytical follow-up ("why did you pick #1 over #2?") must send full multi-turn history to LLM
-    r2 = agent.chat("Why did you pick #1 over #2 for max context?")
+    # 2. Analytical follow-up WITHOUT trailing '?' ("What context window would i have for each")
+    # must NOT be hijacked by local-model advise() — it must send full multi-turn history + kv_headroom_mb to LLM!
+    r2 = agent.chat("What context window would i have for each")
     assert "Q4_K_M (#1)" in r2["reply"]
+    assert "LLAMA recommendation" not in r2["reply"]
     assert captured_payloads, "Expected LLM to be called with multi-turn history"
     sent_msgs = captured_payloads[-1]["messages"]
     assert sent_msgs[0]["role"] == "system"
     assert "Qwen3-32B" in sent_msgs[0]["content"]  # structured last_action_context in system prompt
+    assert "kv_headroom_mb" in sent_msgs[0]["content"]
     assert any(m["role"] == "assistant" and "Q4_K_M" in m["content"] for m in sent_msgs)  # prior action output in history
-    assert sent_msgs[-1] == {"role": "user", "content": "Why did you pick #1 over #2 for max context?"}
+    assert sent_msgs[-1] == {"role": "user", "content": "What context window would i have for each"}
 
     # 3. Direct selection follow-up ("pull #2") must resolve #2 from previous action without searching HF for "2"
     r3 = agent.chat("pull #2")

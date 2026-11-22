@@ -2433,7 +2433,11 @@ class OptimizerAgent:
             },
             indent=1,
         )
-        return self._llm_complete(sys_p, f"User goal: {user_prompt}\n\nComputed plan:\n{ctx_blob}\n\nSummarize trade-offs and any tweaks in <=6 bullet points.")
+        return self._llm_complete(
+            sys_p,
+            f"User goal: {user_prompt}\n\nComputed plan:\n{ctx_blob}\n\nSummarize trade-offs and any tweaks in <=6 bullet points.",
+            max_tokens=1536,
+        )
 
     def _llm_diagnose_log(
         self, engine: str, tail: str, cfg: dict[str, Any], doc_ref: dict[str, Any]
@@ -2445,7 +2449,7 @@ class OptimizerAgent:
         return self._llm_complete(
             sys_p,
             f"Engine: {engine}\nConfig: {json.dumps(cfg)}\nDocs: {json.dumps(doc_ref.get('guides'))}\nLog tail:\n{tail[-2000:]}",
-            max_tokens=400,
+            max_tokens=1536,
         )
 
     # ------------------------------------------------------------ Conversational Agent Sidebar & Action Templates
@@ -2980,6 +2984,7 @@ class OptimizerAgent:
                         "size_gb": r.get("size_gb"),
                         "fit_label": r.get("fit_label"),
                         "gpu_est_mb": r.get("gpu_est_mb"),
+                        "kv_headroom_mb": r.get("kv_headroom_mb"),
                         "ram_est_mb": r.get("ram_est_mb"),
                         "pull_files": r.get("pull_files"),
                     }
@@ -2988,7 +2993,7 @@ class OptimizerAgent:
         system_prompt = (
             "You are the Inference Console Agent assistant in an ongoing multi-turn conversation. "
             "ALWAYS use the prior conversation history and the structured last_action_context below to understand "
-            "follow-up references like '#1', '#2', 'that one', 'it', 'why', 'what about max context', etc. "
+            "follow-up references like '#1', '#2', 'for each', 'that one', 'it', 'why', 'what context window', etc. "
             "You support every app workflow: calculating and pulling Hugging Face GGUF quants (empty GPU or free VRAM), "
             "optimizing/auto-tuning llama.cpp, Avalon, Strata, and Maya, diagnosing crashes, benchmarking, "
             "workload routing, speculative decoding, thermal guard, checkpoints, and coding-agent sync. "
@@ -3003,7 +3008,7 @@ class OptimizerAgent:
         return self._llm_complete(
             system_prompt,
             msg,
-            max_tokens=1024,
+            max_tokens=2048,
             history=self._build_llm_history(limit=8),
         )
 
@@ -3119,16 +3124,27 @@ class OptimizerAgent:
         # D. Analytical / conversational follow-up question -> route to multi-turn LLM with full history!
         # Prevents broad keywords like "context", "recommend", "quant", "error" inside a follow-up question
         # from hijacking the turn and running a fresh unrelated deterministic command.
+        is_explicit_new_cmd = (
+            any(k in low for k in ("what is running", "what's running", "show status", "list models", "show checkpoints", "show presets"))
+            or (
+                any(k in low for k in ("quant", "pull", "download", "gguf"))
+                and bool(self._extract_hf_query(msg))
+                and self._extract_hf_query(msg).lower() != (ctx.get("query") or "").lower()
+            )
+        )
         followup_question = (
-            low.endswith("?")
-            or bool(re.match(r"^(why|how|what about|what if|would|could|will|is that|are those|tell me|explain|compare|elaborate|which one|can you explain)\b", low))
-            or bool(re.search(r"\b(that one|those|the first|the second|#1|#2|#3|instead|difference between|above|previous)\b", low))
+            not is_explicit_new_cmd
+            and (
+                low.endswith("?")
+                or bool(re.match(r"^(what|which|why|how|where|when|would|could|should|will|can|is|are|do|does|tell me|explain|compare|elaborate|estimate)\b", low))
+                or bool(re.search(r"\b(for each|each one|each of|of them|for them|of these|for these|that one|those|the first|the second|the third|#1|#2|#3|instead|difference between|above|previous|versus|vs\.?)\b", low))
+            )
         )
         if followup_question and self._chat_history:
             llm_reply = self._llm_chat_with_context(msg)
             if llm_reply:
                 # Keep previous turn's actionable buttons handy if relevant
-                carry_acts = [a for a in (ctx.get("last_actions") or []) if a.get("type") in ("hf_pull", "apply", "killswitch")][:2]
+                carry_acts = [a for a in (ctx.get("last_actions") or []) if a.get("type") in ("hf_pull", "apply", "killswitch")][:3]
                 return {"reply": llm_reply, "actions": carry_acts}
             # If an external LLM is configured but errored, surface the error clearly rather than misrouting
             st = self.llm_status()
@@ -3139,6 +3155,19 @@ class OptimizerAgent:
                 return {
                     "reply": f"Configured LLM ({lbl}{f' · `{mod}`' if mod else ''}) failed on follow-up: {err}",
                     "actions": [],
+                }
+            # Deterministic fallback when user asks about context window for the previous HF quant list
+            if ctx.get("kind") == "hf_quant" and recs and any(k in low for k in ("context", "ctx", "kv", "headroom")):
+                lines = []
+                for idx, r in enumerate(recs[:5], 1):
+                    kv_mb = r.get("kv_headroom_mb", 0)
+                    # Rough rule of thumb for typical GQA 8-32B models at q8_0 KV (~0.06-0.12 MB/tok)
+                    est_k_q8 = max(2, int(kv_mb / 90.0))
+                    lines.append(f"{idx}. **{r['quant']}** ({r['size_gb']} GB): ~**{kv_mb} MB** VRAM left for KV cache (~{est_k_q8}k tokens est. at q8_0 KV)")
+                carry_acts = [a for a in (ctx.get("last_actions") or []) if a.get("type") == "hf_pull"][:3]
+                return {
+                    "reply": f"**Estimated KV-Cache Headroom** for `{ctx.get('query', '')}`:\n" + "\n".join(lines),
+                    "actions": carry_acts,
                 }
         return None
 
@@ -3939,6 +3968,7 @@ class OptimizerAgent:
                     pull_files.append(drafts[0])
                 pull_sizes = {p: size_by_path.get(p, 0) for p in pull_files}
 
+                kv_headroom_mb = max(0, round(usable_vram - max(0.0, moe_info["gpu_hot_path_mb"] - kv_budget_mb)))
                 recommendations.append({
                     "repo": rid,
                     "downloads": repo.get("downloads", 0),
@@ -3948,6 +3978,7 @@ class OptimizerAgent:
                     "is_moe": is_moe,
                     "fit_label": fit_label,
                     "gpu_est_mb": moe_info["gpu_hot_path_mb"],
+                    "kv_headroom_mb": kv_headroom_mb,
                     "ram_est_mb": moe_info["cpu_cold_experts_mb"],
                     "mmproj": mmprojs[0] if mmprojs else "",
                     "draft": drafts[0] if drafts else "",
