@@ -721,5 +721,126 @@ def test_strata_timeout_preserves_output_and_advise_inherits_last_preset(tmp_pat
     assert "waiting on GPU 0" in err and "timed out after 300s" in err
 
 
+def test_agent_chat_quant_calc_and_pull_empty_gpu_vs_free_vram(tmp_path):
+    """Agent chat must understand quant calculation & pull assuming empty GPU vs free VRAM only."""
+    # GPU has 20480 MB total, 14000 MB currently occupied by another workload
+    vit = {
+        "gpu": {"name": "RX 7900 XT", "total_mb": 20480, "used_mb": 14000, "temp": 55, "util": 40},
+        "mem": {"total_gb": 64.0, "used_gb": 12.0},
+        "cpu": {"cores": 16, "percent": 10},
+    }
+    agent, _, _, host = _make_stub_agent(tmp_path, vit=vit)
+
+    search_queries = []
+    host.hf_search_fn = lambda q: (search_queries.append(q) or [
+        {"id": "bartowski/Qwen3-32B-GGUF", "downloads": 90000},
+    ])
+    host.hf_files_fn = lambda repo: [
+        {"path": "Qwen3-32B-Q8_0.gguf", "size": 34 * 1024**3},    # 34 GiB > 20 GB VRAM
+        {"path": "Qwen3-32B-Q4_K_M.gguf", "size": 17 * 1024**3},  # 17 GiB fits in empty 20 GB GPU
+        {"path": "Qwen3-32B-IQ3_XS.gguf", "size": 4 * 1024**3},   # 4 GiB fits even in ~5.9 GB free VRAM
+    ]
+
+    # 1. Exact user scenario: calculate & pull quant assuming nothing else is occupying GPU
+    r1 = agent.chat("calculate and pull the correct quant of Qwen3-32B assuming nothing else is occupying gpu")
+    assert "Qwen3-32B" in search_queries[-1]
+    assert "assuming empty GPU" in r1["reply"]
+    assert "Q4_K_M" in r1["reply"]
+    pull_acts = [a for a in r1["actions"] if a["type"] == "hf_pull"]
+    assert pull_acts, f"Expected hf_pull actions, got {r1['actions']}"
+    assert pull_acts[0]["repo"] == "bartowski/Qwen3-32B-GGUF"
+    assert "Qwen3-32B-Q4_K_M.gguf" in pull_acts[0]["files"]
+    assert pull_acts[0]["sizes"]["Qwen3-32B-Q4_K_M.gguf"] == 17 * 1024**3
+    # Because 14000 MB is currently used, agent should also offer a 1-click Free GPU button
+    assert any(a["type"] == "killswitch" for a in r1["actions"])
+
+    # 2. Same prompt but requesting currently free VRAM only -> Q4_K_M won't fit full GPU, IQ3_XS does
+    r2 = agent.chat("calculate best quant for Qwen3-32B using currently free vram only")
+    assert "currently free VRAM only" in r2["reply"]
+    rec_free = agent.recommend_hf(query="Qwen3-32B", goal="fastest", assume_empty_gpu=False)
+    assert rec_free["hardware_budget"]["assume_empty_gpu"] is False
+    assert rec_free["hardware_budget"]["usable_vram_mb"] == 20480 - 14000 - 512
+    assert rec_free["recommendations"][0]["quant"] == "IQ3_XS"
+
+    # 3. Generic prompt with no model name -> explains empty-GPU budget and offers Quant Calculator template
+    r3 = agent.chat("calculate and pull the correct quant of a model assuming nothing else is occupying gpu")
+    assert "19968 MB usable VRAM" in r3["reply"]
+    assert any(a["type"] == "open_template" and a["action_id"] == "hf_quant_empty_gpu" for a in r3["actions"])
+
+
+def test_agent_action_templates_execution_and_auto_pull(tmp_path):
+    """Structured action templates from the clickable menu execute deterministically across all app categories."""
+    agent, _, _, host = _make_stub_agent(tmp_path)
+    pulled = []
+    host.hf_search_fn = lambda q: [{"id": "unsloth/Qwen3-30B-A3B-GGUF", "downloads": 50000}]
+    host.hf_files_fn = lambda repo: [
+        {"path": "Qwen3-30B-A3B-Q4_K_M.gguf", "size": 16 * 1024**3},
+    ]
+    host.hf_pull_fn = lambda repo, files, sizes: (pulled.append((repo, files, sizes)) or {"started": [f"{repo}:{files[0]}"]})
+    host.downloads_fn = lambda: [{"id": "r:f.gguf", "file": "f.gguf", "status": "downloading", "done": 500, "total": 1000}]
+    host.thermal_status_fn = lambda: {"state": "nominal", "enabled": True, "auto_act": False, "eff_temp_c": 52}
+    host.coding_agents_list = lambda: ["opencode", "claude-code"]
+    host.sync_agents_fn = lambda ags, src: {"results": {a: {"ok": True} for a in ags}}
+
+    # Auto-pull template queues top match directly
+    r_pull = agent.chat(
+        action_id="hf_quant_empty_gpu",
+        params={"query": "unsloth/Qwen3-30B-A3B-GGUF", "goal": "balanced", "assume_empty_gpu": True, "auto_pull": True},
+    )
+    assert len(pulled) == 1
+    assert pulled[0][0] == "unsloth/Qwen3-30B-A3B-GGUF"
+    assert "Queued download" in r_pull["reply"]
+
+    # Other categories execute cleanly
+    r_st = agent.chat(action_id="system_status")
+    assert "Hardware & Engine Status" in r_st["reply"]
+
+    r_dl = agent.chat(action_id="downloads_status")
+    assert "f.gguf" in r_dl["reply"] and "50%" in r_dl["reply"]
+
+    r_lm = agent.chat(action_id="list_models")
+    assert "Qwen3-80B-MoE-Q4_K_M" in r_lm["reply"]
+
+    r_opt = agent.chat(action_id="optimize_engine", params={"engine": "llama", "goal": "fastest"})
+    assert "LLAMA recommendation" in r_opt["reply"]
+    assert any(a["type"] == "apply" for a in r_opt["actions"])
+
+    r_stop = agent.chat(action_id="stop_all_engines")
+    assert "Safety checkpoint" in r_stop["reply"]
+
+    r_th = agent.chat(action_id="thermal_status")
+    assert "nominal" in r_th["reply"]
+
+    r_sync = agent.chat(action_id="sync_coding_agents", params={"source": "auto"})
+    assert "Synced 2/2 coding agents" in r_sync["reply"]
+
+    r_cp = agent.chat(action_id="checkpoints_list")
+    assert "Recent Checkpoints" in r_cp["reply"]
+
+    r_pre = agent.chat(action_id="presets_list")
+    assert "Optimization Presets" in r_pre["reply"]
+
+
+def test_panel_agent_actions_endpoint_and_chat_template_api():
+    """Panel API exposes /api/agent/actions and executes template actions via /api/agent/chat."""
+    res = panel.api_agent_actions()
+    acts = res["actions"]
+    ids = {a["id"] for a in acts}
+    assert {
+        "hf_quant_empty_gpu",
+        "hf_quant_free_vram",
+        "optimize_engine",
+        "start_autotune",
+        "system_status",
+        "stop_all_engines",
+        "sync_coding_agents",
+    } <= ids
+
+    body = panel.api_agent_chat(panel.AgentChatBody(action_id="system_status", params={}, engine="llama"))
+    assert "Hardware & Engine Status" in body["reply"]
+
+
+
+
 
 

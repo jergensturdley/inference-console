@@ -4807,7 +4807,7 @@ def api_setup_install(b: SetupInstallBody):
 
 # ---------------------------------------------------------------- optimization agent api
 from agent_memory import AgentStore
-from optimizer_agent import HostContext, OptimizerAgent, PROVIDER_PRESETS
+from optimizer_agent import AGENT_ACTION_TEMPLATES, HostContext, OptimizerAgent, PROVIDER_PRESETS
 from thermal_guard import ThermalGuard
 
 AGENT_STORE = AgentStore(APP_DIR / "agent")
@@ -4842,6 +4842,11 @@ OPT_AGENT = OptimizerAgent(
         coding_agents_list=lambda: list(AGENTS.keys()),
         hf_search_fn=api_hf_search,
         hf_files_fn=api_hf_files,
+        hf_pull_fn=lambda repo, files, sizes: api_hf_pull(PullBody(repo=repo, files=files, sizes=sizes)),
+        downloads_fn=api_downloads,
+        thermal_status_fn=lambda: THERMAL_GUARD.status(),
+        thermal_eval_fn=lambda: THERMAL_GUARD.evaluate_once(),
+        strata_doctor_fn=api_strata_doctor,
         maya_mgr=MAYA,
     ),
     store=AGENT_STORE,
@@ -4919,9 +4924,15 @@ class AgentDocsBody(BaseModel):
     query: str = ""
 
 class AgentChatBody(BaseModel):
-    message: str
+    message: str = ""
     engine: str = "llama"
     model: str = ""
+    action_id: str = ""
+    params: dict | None = None
+
+@app.get("/api/agent/actions")
+def api_agent_actions():
+    return {"actions": AGENT_ACTION_TEMPLATES}
 
 @app.get("/api/agent/status")
 def api_agent_status():
@@ -5039,7 +5050,13 @@ def api_agent_docs(b: AgentDocsBody):
 
 @app.post("/api/agent/chat")
 def api_agent_chat(b: AgentChatBody):
-    return OPT_AGENT.chat(message=b.message, engine=b.engine, model=b.model)
+    return OPT_AGENT.chat(
+        message=b.message,
+        engine=b.engine,
+        model=b.model,
+        action_id=b.action_id,
+        params=b.params,
+    )
 
 class AgentThermalConfigBody(BaseModel):
     enabled: bool | None = None
@@ -5069,6 +5086,7 @@ class AgentHFRecommendBody(BaseModel):
     query: str
     goal: str = "balanced"
     max_repos: int = 4
+    assume_empty_gpu: bool = True
 
 @app.get("/api/agent/thermal")
 def api_agent_thermal():
@@ -5108,7 +5126,12 @@ def api_agent_speculate(b: AgentSpeculateBody):
 @app.post("/api/agent/hf/recommend")
 def api_agent_hf_recommend(b: AgentHFRecommendBody):
     try:
-        return OPT_AGENT.recommend_hf(query=b.query, goal=b.goal, max_repos=b.max_repos)
+        return OPT_AGENT.recommend_hf(
+            query=b.query,
+            goal=b.goal,
+            max_repos=b.max_repos,
+            assume_empty_gpu=b.assume_empty_gpu,
+        )
     except Exception as e:
         raise HTTPException(502, f"HF recommendation failed: {e}")
 
@@ -5548,19 +5571,57 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   .thread{max-height:none}
 }
 /* ---------- agent chat sidebar ---------- */
-.agent-drawer{position:fixed;top:0;right:0;bottom:0;width:min(410px,94vw);background:var(--panel);
+.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap;border:0}
+.agent-drawer{position:fixed;top:0;right:0;bottom:0;width:min(470px,96vw);background:var(--panel);
   border-left:1px solid var(--bd-2);box-shadow:-8px 0 28px rgba(0,0,0,.45);z-index:85;
   display:flex;flex-direction:column;transform:translateX(100%);transition:transform .2s ease}
 .agent-drawer.open{transform:translateX(0)}
-.agent-drawer-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:12px 14px;border-bottom:1px solid var(--bd)}
+.agent-drawer-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:11px 14px;border-bottom:1px solid var(--bd)}
 .agent-drawer-hd h2{font-size:14px;font-weight:650;margin:0;display:flex;align-items:center;gap:6px}
 .agent-drawer-bd{flex:1;overflow-y:auto;padding:12px 14px;display:flex;flex-direction:column;gap:10px}
 .agent-drawer-ft{padding:10px 12px;border-top:1px solid var(--bd);display:flex;flex-direction:column;gap:8px;background:var(--bg-2)}
-.agent-msg{padding:9px 11px;border-radius:10px;border:1px solid var(--bd);background:var(--bg-2);font-size:12.5px;line-height:1.45;white-space:pre-wrap;word-break:break-word}
+.agent-msg{padding:9px 11px;border-radius:10px;border:1px solid var(--bd);background:var(--bg-2);font-size:12.5px;line-height:1.48;white-space:pre-wrap;word-break:break-word}
 .agent-msg.usr{background:color-mix(in srgb,var(--acc) 12%,var(--panel));border-color:color-mix(in srgb,var(--acc) 35%,var(--bd));align-self:flex-end;max-width:88%}
-.agent-msg.bot{align-self:flex-start;max-width:96%}
+.agent-msg.bot{align-self:flex-start;max-width:97%}
 .agent-acts{display:flex;gap:6px;flex-wrap:wrap;margin-top:8px}
 .agent-chips{display:flex;gap:5px;flex-wrap:wrap}
+/* ---------- agent clickable action menu & templates ---------- */
+.ag-menu-panel{border-bottom:1px solid var(--bd);background:var(--bg-2);max-height:48vh;display:flex;flex-direction:column;overflow:hidden}
+.ag-menu-panel[hidden]{display:none}
+.ag-menu-bar{display:flex;align-items:center;gap:6px;padding:8px 12px;border-bottom:1px solid var(--bd)}
+.ag-menu-bar input{flex:1;min-width:0;padding:5px 8px;font-size:12px}
+.ag-menu-toggle-all[aria-expanded="true"] .expand,
+.ag-menu-toggle-all[aria-expanded="false"] .collapse{display:none}
+.ag-menu-acc{overflow-y:auto;padding:6px 10px 10px;display:flex;flex-direction:column;gap:5px}
+.ag-menu-acc details{border:1px solid var(--bd);border-radius:8px;background:var(--panel)}
+.ag-menu-acc summary{list-style:none;display:flex;align-items:center;gap:6px;padding:7px 10px;font-size:12px;font-weight:650;color:var(--fg);cursor:pointer;user-select:none}
+.ag-menu-acc summary::-webkit-details-marker{display:none}
+.ag-menu-acc summary::before{content:"";inline-size:10px;block-size:10px;flex-shrink:0;
+  border-right:1.75px solid currentColor;border-bottom:1.75px solid currentColor;
+  transform:rotate(-45deg) translate(-1px,-1px);margin-right:2px;opacity:.75}
+.ag-menu-acc details[open]>summary::before{transform:rotate(45deg) translate(-1px,-1px)}
+.ag-menu-acc details::details-content{interpolate-size:allow-keywords;overflow:clip;contain:layout}
+.ag-menu-acc details:not([open])::details-content{block-size:0}
+@media (prefers-reduced-motion:no-preference){
+  .ag-menu-acc summary::before{transition:transform .18s ease}
+  .ag-menu-acc details::details-content{transition:block-size .2s ease,content-visibility .2s ease;transition-behavior:allow-discrete}
+}
+.ag-menu-grid{display:grid;grid-template-columns:1fr;gap:4px;padding:0 8px 8px}
+.ag-act-item{display:flex;flex-direction:column;align-items:flex-start;gap:2px;width:100%;text-align:left;
+  padding:7px 9px;border-radius:7px;border:1px solid var(--bd);background:var(--bg-2);color:var(--fg);cursor:pointer}
+.ag-act-item:hover,.ag-act-item:focus-visible{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 10%,var(--panel))}
+.ag-act-item-top{display:flex;align-items:center;justify-content:space-between;gap:6px;width:100%;font-size:12px;font-weight:600}
+.ag-act-item-desc{font-size:11px;color:var(--fg-2);line-height:1.3}
+.ag-tpl-form{border:1px solid color-mix(in srgb,var(--acc) 40%,var(--bd));border-radius:9px;
+  background:var(--panel);padding:9px 10px;display:flex;flex-direction:column;gap:7px}
+.ag-tpl-form[hidden]{display:none}
+.ag-tpl-hd{display:flex;align-items:center;justify-content:space-between;gap:6px}
+.ag-tpl-title{font-size:12.5px;font-weight:650}
+.ag-tpl-fields{display:flex;flex-direction:column;gap:6px}
+.ag-tpl-field{display:flex;flex-direction:column;gap:3px;font-size:11.5px;color:var(--fg-2)}
+.ag-tpl-field.chk{flex-direction:row;align-items:center;gap:6px;color:var(--fg);cursor:pointer}
+.ag-tpl-field input[type="text"],.ag-tpl-field input[type="number"],.ag-tpl-field select{padding:5px 7px;font-size:12px}
+.ag-tpl-btns{display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px}
 
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
@@ -6457,27 +6518,53 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 <!-- ==================== AGENT CHAT SIDEBAR ==================== -->
 <aside id="agentdrawer" class="agent-drawer" aria-label="Optimization Agent Chat">
   <div class="agent-drawer-hd">
-    <h2>Optimization Agent</h2>
+    <h2>Agent</h2>
     <div style="display:flex;gap:6px;align-items:center">
+      <button type="button" class="btn xs" id="ag-menu-toggle" aria-expanded="false" aria-controls="ag-menu-panel">Actions Menu</button>
+      <button type="button" class="btn xs" id="ag-sb-clear" title="Clear chat">Clear</button>
       <span class="tag mut" id="ag-sb-llm">deterministic</span>
       <button class="icon" id="ag-sb-close" aria-label="Close sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
     </div>
   </div>
+  <div id="ag-menu-panel" class="ag-menu-panel" hidden>
+    <div class="ag-menu-bar">
+      <label for="ag-menu-filter" class="sr-only">Filter agent actions</label>
+      <input id="ag-menu-filter" type="search" placeholder="Filter actions (quant, pull, tune, stop, bench, sync)…">
+      <button type="button" class="btn xs ag-menu-toggle-all" id="ag-menu-expand-all" aria-expanded="false">
+        <span class="expand">Expand all</span>
+        <span class="collapse">Collapse all</span>
+      </button>
+    </div>
+    <div id="ag-menu-acc" class="ag-menu-acc" aria-label="Agent action categories"></div>
+  </div>
   <div class="agent-drawer-bd" id="ag-sb-msgs">
-    <div class="agent-msg bot">Ask me to optimize any engine (llama.cpp, Avalon, Strata), explain MoE fit, diagnose a crash, or restore a checkpoint.</div>
+    <div class="agent-msg bot">Pick any workflow from <b>Actions Menu</b> above (quant calculator &amp; HF pull, engine optimization, auto-tune, benchmarks, diagnostics, thermal guard, coding-agent sync) or type freely below.</div>
   </div>
   <div class="agent-drawer-ft">
+    <form id="ag-tpl-form" class="ag-tpl-form" hidden>
+      <div class="ag-tpl-hd">
+        <span class="ag-tpl-title" id="ag-tpl-title">Action Template</span>
+        <button type="button" class="btn xs" id="ag-tpl-cancel">Cancel</button>
+      </div>
+      <div class="hint" id="ag-tpl-desc"></div>
+      <div class="ag-tpl-fields" id="ag-tpl-fields"></div>
+      <div class="ag-tpl-btns">
+        <button type="button" class="btn xs" id="ag-tpl-insert">Insert as Prompt</button>
+        <button type="submit" class="btn xs primary" id="ag-tpl-run">Run Action</button>
+      </div>
+    </form>
     <div class="agent-chips">
-      <button type="button" class="btn xs" data-ag-chip="Optimize llama.cpp for fastest speed">Fastest llama.cpp</button>
-      <button type="button" class="btn xs" data-ag-chip="Optimize Maya for fastest speed">Fastest Maya</button>
-      <button type="button" class="btn xs" data-ag-chip="Longest context config for Avalon">Max ctx Avalon</button>
-      <button type="button" class="btn xs" data-ag-chip="Diagnose last crash">Diagnose crash</button>
-      <button type="button" class="btn xs" data-ag-chip="Show checkpoints">Checkpoints</button>
+      <button type="button" class="btn xs primary" data-ag-tpl="hf_quant_empty_gpu">Calc &amp; Pull Quant (Empty GPU)</button>
+      <button type="button" class="btn xs" data-ag-tpl="optimize_engine">Optimize Engine</button>
+      <button type="button" class="btn xs" data-ag-tpl="system_status">System Status</button>
+      <button type="button" class="btn xs" data-ag-tpl="diagnose_engine">Diagnose Crash</button>
+      <button type="button" class="btn xs" data-ag-tpl="stop_all_engines">Free GPU</button>
     </div>
-    <div style="display:flex;gap:6px">
-      <input id="ag-sb-in" type="text" placeholder="Ask the optimization agent…" style="flex:1">
-      <button class="btn primary sm" id="ag-sb-send">Send</button>
-    </div>
+    <form id="ag-sb-form" style="display:flex;gap:6px">
+      <label for="ag-sb-in" class="sr-only">Message the agent</label>
+      <input id="ag-sb-in" type="text" placeholder="Ask anything or pick an action template…" style="flex:1">
+      <button type="submit" class="btn primary sm" id="ag-sb-send">Send</button>
+    </form>
   </div>
 </aside>
 
@@ -9074,15 +9161,215 @@ document.addEventListener('click',e=>{
   else $('#ag-advise')?.click();
 });
 
-/* Collapsible Agent Chat Sidebar */
+/* Collapsible Agent Chat Sidebar + Comprehensive Clickable Action Menu */
+let AG_ACTIONS=[];
+let AG_ACTIVE_TPL=null;
+
+function currentAgentEngine(){
+  return (tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
+}
+function toggleAgentMenu(force){
+  const p=$('#ag-menu-panel'),btn=$('#ag-menu-toggle');if(!p||!btn)return;
+  const open=typeof force==='boolean'?force:p.hidden;
+  p.hidden=!open;
+  btn.setAttribute('aria-expanded',String(open));
+  if(open){loadAgentActions();$('#ag-menu-filter')?.focus();}
+}
+function syncMenuExpandBtn(){
+  const acc=$('#ag-menu-acc'),btn=$('#ag-menu-expand-all');if(!acc||!btn)return;
+  const items=[...acc.querySelectorAll(':scope > details')];
+  const allOpen=items.length>0&&items.every(d=>d.open);
+  btn.setAttribute('aria-expanded',String(allOpen));
+}
+function renderAgentActionMenu(filterText=''){
+  const acc=$('#ag-menu-acc');if(!acc)return;
+  const q=(filterText||'').trim().toLowerCase();
+  const byCat=new Map();
+  AG_ACTIONS.forEach(a=>{
+    const hay=(a.label+' '+a.description+' '+a.category+' '+a.id).toLowerCase();
+    if(q&&!hay.includes(q))return;
+    if(!byCat.has(a.category))byCat.set(a.category,[]);
+    byCat.get(a.category).push(a);
+  });
+  acc.innerHTML='';
+  if(!byCat.size){
+    const empty=document.createElement('div');empty.className='hint';empty.style.padding='8px';
+    empty.textContent='No matching actions.';acc.appendChild(empty);syncMenuExpandBtn();return;
+  }
+  let idx=0;
+  for(const [cat,items] of byCat.entries()){
+    const det=document.createElement('details');
+    if(q||idx===0)det.open=true;
+    const sum=document.createElement('summary');
+    sum.textContent=cat+' ('+items.length+')';
+    det.appendChild(sum);
+    const grid=document.createElement('div');grid.className='ag-menu-grid';
+    items.forEach(a=>{
+      const b=document.createElement('button');b.type='button';b.className='ag-act-item';
+      b.dataset.agMenuAct=a.id;
+      const top=document.createElement('span');top.className='ag-act-item-top';
+      const lbl=document.createElement('span');lbl.textContent=a.label;
+      const badge=document.createElement('span');badge.className='tag '+(a.instant?'ok':'acc');
+      badge.textContent=a.instant?'1-click':'template';
+      top.appendChild(lbl);top.appendChild(badge);
+      const desc=document.createElement('span');desc.className='ag-act-item-desc';desc.textContent=a.description||'';
+      b.appendChild(top);b.appendChild(desc);
+      grid.appendChild(b);
+    });
+    det.appendChild(grid);
+    acc.appendChild(det);
+    idx++;
+  }
+  syncMenuExpandBtn();
+}
+async function loadAgentActions(force=false){
+  if(AG_ACTIONS.length&&!force){renderAgentActionMenu($('#ag-menu-filter')?.value||'');return;}
+  try{
+    const d=await api('/api/agent/actions');
+    AG_ACTIONS=d.actions||[];
+    renderAgentActionMenu($('#ag-menu-filter')?.value||'');
+  }catch(e){toast('Failed to load agent actions: '+e.message,'err')}
+}
+function closeAgentTemplateForm(){
+  AG_ACTIVE_TPL=null;
+  const f=$('#ag-tpl-form');if(f)f.hidden=true;
+}
+function formatTemplatePrompt(tpl,vals){
+  let s=tpl.prompt_template||tpl.label;
+  Object.entries(vals).forEach(([k,v])=>{s=s.replaceAll('{'+k+'}',String(v));});
+  return s;
+}
+function readTemplateFormValues(){
+  const vals={};
+  if(!AG_ACTIVE_TPL)return vals;
+  (AG_ACTIVE_TPL.fields||[]).forEach(f=>{
+    const el=$('#ag-tf-'+f.name);if(!el)return;
+    if(f.type==='checkbox')vals[f.name]=!!el.checked;
+    else if(f.type==='number')vals[f.name]=Number(el.value||f.default||0);
+    else vals[f.name]=(el.value||'').trim();
+  });
+  return vals;
+}
+function openAgentTemplate(actionId){
+  const tpl=AG_ACTIONS.find(a=>a.id===actionId);
+  if(!tpl){
+    loadAgentActions().then(()=>{const t=AG_ACTIONS.find(a=>a.id===actionId);if(t)openAgentTemplate(actionId);});
+    return;
+  }
+  if(tpl.instant||!(tpl.fields&&tpl.fields.length)){
+    toggleAgentMenu(false);
+    closeAgentTemplateForm();
+    runAgentActionTemplate(tpl,{});
+    return;
+  }
+  AG_ACTIVE_TPL=tpl;
+  toggleAgentMenu(false);
+  const form=$('#ag-tpl-form'),fieldsBox=$('#ag-tpl-fields');if(!form||!fieldsBox)return;
+  $('#ag-tpl-title').textContent=tpl.label;
+  $('#ag-tpl-desc').textContent=tpl.description||'';
+  fieldsBox.innerHTML='';
+  const curEng=currentAgentEngine();
+  (tpl.fields||[]).forEach(f=>{
+    const wrap=document.createElement('label');
+    wrap.className='ag-tpl-field'+(f.type==='checkbox'?' chk':'');
+    const id='ag-tf-'+f.name;
+    let inp;
+    if(f.type==='checkbox'){
+      inp=document.createElement('input');inp.type='checkbox';inp.id=id;inp.checked=!!f.default;
+      const sp=document.createElement('span');sp.textContent=f.label;
+      wrap.appendChild(inp);wrap.appendChild(sp);
+    }else if(f.type==='select'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('select');inp.id=id;
+      const defVal=(f.name==='engine')?curEng:(f.default||'');
+      (f.options||[]).forEach(opt=>{
+        const o=document.createElement('option');o.value=opt;o.textContent=opt;
+        if(opt===defVal)o.selected=true;
+        inp.appendChild(o);
+      });
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else if(f.type==='model_select'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('select');inp.id=id;
+      const autoOpt=document.createElement('option');autoOpt.value='';autoOpt.textContent='(auto / active model)';
+      inp.appendChild(autoOpt);
+      (typeof MODELS!=='undefined'&&Array.isArray(MODELS)?MODELS:[]).forEach(m=>{
+        const o=document.createElement('option');o.value=m.path||m.name;o.textContent=m.name+(m.quant?' ('+m.quant+')':'');
+        inp.appendChild(o);
+      });
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else if(f.type==='number'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('input');inp.type='number';inp.id=id;inp.value=f.default!=null?f.default:'';
+      if(f.min!=null)inp.min=f.min;if(f.max!=null)inp.max=f.max;
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else{
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('input');inp.type='text';inp.id=id;inp.placeholder=f.placeholder||'';
+      if(f.default)inp.value=f.default;
+      if(f.required)inp.required=true;
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }
+    fieldsBox.appendChild(wrap);
+  });
+  form.hidden=false;
+  const firstInp=fieldsBox.querySelector('input[type="text"],input[type="number"],select');
+  firstInp?.focus();
+}
+async function runAgentActionTemplate(tpl,params){
+  const displayMsg=formatTemplatePrompt(tpl,params);
+  appendAgentBubble('user',displayMsg);
+  try{
+    const eng=params.engine||currentAgentEngine();
+    const r=await post('/api/agent/chat',{message:displayMsg,engine:eng,model:params.model||'',action_id:tpl.id,params});
+    if(r.llm)renderAgentLlmChip(r.llm);
+    appendAgentBubble('bot',r.reply,r.actions||[]);
+  }catch(e){appendAgentBubble('bot','Error: '+e.message);}
+}
+
 function toggleAgentDrawer(force){
   const dr=$('#agentdrawer');if(!dr)return;
   dr.classList.toggle('open',typeof force==='boolean'?force:!dr.classList.contains('open'));
-  if(dr.classList.contains('open')){$('#ag-sb-in')?.focus();loadAgentStatus();}
+  if(dr.classList.contains('open')){$('#ag-sb-in')?.focus();loadAgentStatus();loadAgentActions();}
 }
 $('#agentdrawerbtn')?.addEventListener('click',()=>toggleAgentDrawer());
 $('#ag-open-sidebar')?.addEventListener('click',()=>toggleAgentDrawer(true));
 $('#ag-sb-close')?.addEventListener('click',()=>toggleAgentDrawer(false));
+$('#ag-menu-toggle')?.addEventListener('click',()=>toggleAgentMenu());
+$('#ag-sb-clear')?.addEventListener('click',()=>{
+  const box=$('#ag-sb-msgs');if(!box)return;
+  box.innerHTML='<div class="agent-msg bot">Chat cleared. Pick any workflow from <b>Actions Menu</b> or type below.</div>';
+});
+$('#ag-menu-filter')?.addEventListener('input',e=>renderAgentActionMenu(e.target.value));
+$('#ag-menu-expand-all')?.addEventListener('click',e=>{
+  const btn=e.currentTarget,acc=$('#ag-menu-acc');if(!acc)return;
+  const expand=btn.getAttribute('aria-expanded')!=='true';
+  acc.querySelectorAll(':scope > details').forEach(d=>{d.open=expand;});
+  btn.setAttribute('aria-expanded',String(expand));
+});
+$('#ag-menu-acc')?.addEventListener('toggle',e=>{
+  if(e.target.matches('.ag-menu-acc > details'))syncMenuExpandBtn();
+},{capture:true});
+$('#ag-menu-acc')?.addEventListener('click',e=>{
+  const b=e.target.closest('[data-ag-menu-act]');if(!b)return;
+  openAgentTemplate(b.dataset.agMenuAct);
+});
+$('#ag-tpl-cancel')?.addEventListener('click',closeAgentTemplateForm);
+$('#ag-tpl-insert')?.addEventListener('click',()=>{
+  if(!AG_ACTIVE_TPL)return;
+  const vals=readTemplateFormValues();
+  $('#ag-sb-in').value=formatTemplatePrompt(AG_ACTIVE_TPL,vals);
+  closeAgentTemplateForm();
+  $('#ag-sb-in').focus();
+});
+$('#ag-tpl-form')?.addEventListener('submit',async e=>{
+  e.preventDefault();
+  if(!AG_ACTIVE_TPL)return;
+  const tpl=AG_ACTIVE_TPL;
+  const vals=readTemplateFormValues();
+  closeAgentTemplateForm();
+  await runAgentActionTemplate(tpl,vals);
+});
 
 function appendAgentBubble(role,text,actions){
   const box=$('#ag-sb-msgs');if(!box)return;
@@ -9091,8 +9378,10 @@ function appendAgentBubble(role,text,actions){
   div.textContent=text;
   if(actions&&actions.length){
     const acts=document.createElement('div');acts.className='agent-acts';
-    actions.forEach(a=>{
-      const b=document.createElement('button');b.type='button';b.className='btn xs primary';b.textContent=a.label;
+    actions.forEach((a,idx)=>{
+      const b=document.createElement('button');b.type='button';
+      b.className='btn xs'+(idx===0?' primary':'');
+      b.textContent=a.label;
       b.addEventListener('click',async()=>{
         b.disabled=true;
         try{
@@ -9102,9 +9391,47 @@ function appendAgentBubble(role,text,actions){
           }else if(a.type==='start_tune'){
             await post('/api/agent/tune/start',{engine:a.engine,goal:a.goal||'fastest',model:a.model||''});
             setTab('agent');loadAgentStatus();toast('Auto-tune started','ok');
+          }else if(a.type==='stop_tune'){
+            await post('/api/agent/tune/stop',{rollback:!!a.rollback});
+            loadAgentStatus();toast(a.rollback?'Stopped & rolled back':'Auto-tune stopped','ok');
           }else if(a.type==='restore_checkpoint'){
             await post('/api/agent/checkpoints/'+a.checkpoint_id+'/restore',{relaunch:true});
             toast('Restored '+a.checkpoint_id,'ok');pollStatus(true);
+          }else if(a.type==='create_checkpoint'){
+            const cp=await post('/api/agent/checkpoints',{engine:a.engine||currentAgentEngine(),label:'Chat checkpoint'});
+            toast('Created checkpoint '+cp.id,'ok');loadAgentCheckpoints();
+          }else if(a.type==='hf_pull'){
+            await post('/api/hf/pull',{repo:a.repo,files:a.files||[],sizes:a.sizes||{}});
+            toast('Queued '+(a.files||[]).length+' file(s) from '+a.repo,'ok');pollDownloads();
+          }else if(a.type==='stop_engine'){
+            const ep=a.engine==='avalon'?'/api/avalon/stop':(a.engine==='strata'?'/api/strata/stop':(a.engine==='maya'?'/api/maya/stop':'/api/server/stop'));
+            await post(ep,{});toast('Stopped '+a.engine,'ok');pollStatus(true);
+          }else if(a.type==='killswitch'){
+            const r=await post('/api/agent/thermal/action',{action:'killswitch'});
+            toast(r.detail||'Stopped all engines','ok');pollStatus(true);
+          }else if(a.type==='downshift'){
+            const r=await post('/api/agent/thermal/action',{action:'downshift'});
+            toast(r.detail||'Downshifted active engine','ok');pollStatus(true);
+          }else if(a.type==='thermal_evaluate'){
+            const r=await post('/api/agent/thermal/evaluate',{});
+            toast('Thermal: '+r.state+' ('+(r.eff_temp_c||0)+'°C)','ok');
+          }else if(a.type==='benchmark'){
+            const r=await post('/api/benchmarks/run',{prompt_key:a.prompt_key||'short',max_tokens:a.max_tokens||128});
+            toast('Benchmark: '+(r.gen_tps||r.tok_s||0)+' tok/s','ok');
+          }else if(a.type==='sync_agents'){
+            const agd=await api('/api/agents');
+            const ids=(agd.agents||[]).map(x=>x.id);
+            await post('/api/agents/sync',{agents:ids,source:a.source||'auto'});
+            toast('Synced '+ids.length+' coding agents','ok');
+          }else if(a.type==='heal'){
+            const r=await post('/api/agent/heal',{engine:a.engine||currentAgentEngine()});
+            toast(r.healed?'Engine healed & relaunched':(r.detail||'No fix applied'),r.healed?'ok':'warn');pollStatus(true);
+          }else if(a.type==='open_tab'){
+            setTab(a.tab||'agent');
+          }else if(a.type==='open_template'){
+            openAgentTemplate(a.action_id);
+          }else if(a.type==='send_chat'){
+            await sendAgentChat(a.message||'');
           }
         }catch(err){toast('Action failed: '+err.message,'err')}
         b.disabled=false;
@@ -9119,17 +9446,24 @@ function appendAgentBubble(role,text,actions){
 async function sendAgentChat(text){
   const msg=(text||$('#ag-sb-in').value||'').trim();if(!msg)return;
   $('#ag-sb-in').value='';
+  closeAgentTemplateForm();
   appendAgentBubble('user',msg);
   try{
-    const eng=(tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
+    const eng=currentAgentEngine();
     const r=await post('/api/agent/chat',{message:msg,engine:eng});
     if(r.llm)renderAgentLlmChip(r.llm);
     appendAgentBubble('bot',r.reply,r.actions||[]);
   }catch(e){appendAgentBubble('bot','Error: '+e.message);}
 }
-$('#ag-sb-send')?.addEventListener('click',()=>sendAgentChat());
-$('#ag-sb-in')?.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();sendAgentChat();}});
-$$('[data-ag-chip]').forEach(b=>b.addEventListener('click',()=>sendAgentChat(b.dataset.agChip)));
+$('#ag-sb-form')?.addEventListener('submit',e=>{e.preventDefault();sendAgentChat();});
+$('#ag-sb-in')?.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){
+    e.preventDefault();
+    if(e.isComposing||e.keyCode===229)return;
+    $('#ag-sb-form')?.requestSubmit();
+  }
+});
+$$('[data-ag-tpl]').forEach(b=>b.addEventListener('click',()=>openAgentTemplate(b.dataset.agTpl)));
 
 /* ============================== polling & keys ============================== */
 function tick(){
