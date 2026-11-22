@@ -535,8 +535,9 @@ def test_truncate_accepts_keep_and_drops_turns():
 def test_avalon_tune_preview_does_not_persist():
     draft = Path(HOME_TMP) / "draft.gguf"
     draft.write_bytes(b"x" * 16)
-    ov = (panel.AVALON_DRAFT, panel.CFG.get("avalon_tune"), panel.SMGR.info)
-    panel.AVALON_DRAFT = draft
+    ov = (panel.CFG.get("avalon_draft"), panel.CFG.get("avalon_tune"), panel.SMGR.info)
+    panel.CFG["avalon_draft"] = str(draft)
+    panel._avalon_target_invalidate()
     panel.SMGR.info = {}
     try:
         panel.CFG["avalon_tune"] = {}
@@ -557,8 +558,9 @@ def test_avalon_tune_preview_does_not_persist():
         args = " ".join(panel.SMGR.build_args("flagship"))
         assert f"-c {panel.AVALON_PROFILES['flagship']['defaults']['ctx']}" in args
     finally:
-        panel.AVALON_DRAFT, panel.SMGR.info = ov[0], ov[2]
+        panel.CFG["avalon_draft"], panel.SMGR.info = ov[0], ov[2]
         panel.CFG["avalon_tune"] = ov[1]
+        panel._avalon_target_invalidate()
 
 
 def test_profiles_expose_saved_tune():
@@ -1114,19 +1116,20 @@ def test_agent_zed_jsonc_comments_and_trailing_commas():
 
 def test_api_agents_source_pinning():
     """GET /api/agents?source=strata must report running=None when only llama.cpp is up."""
-    ov = (panel.MGR.status, panel.SMGR.status, panel.strata_status, panel._proc_ctx)
+    ov = (panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx)
     panel.MGR.status = lambda: {"running": True, "alias": "local-m", "port": 8830, "pid": 1234}
     panel.SMGR.status = lambda: {"running": False}
     panel.strata_status = lambda refresh=False: {"installed": False, "running": False, "port": None}
+    panel.MAYA.status = lambda: {"running": False}
     panel._proc_ctx = lambda pid: 16384
     try:
         auto = panel.api_agents()
         assert auto["running"] is not None and auto["running"][0] == "local-m"
-        assert auto["sources"] == {"panel": True, "avalon": False, "strata": False}
+        assert auto["sources"] == {"panel": True, "avalon": False, "strata": False, "maya": False}
         pinned = panel.api_agents(source="strata")
         assert pinned["running"] is None
     finally:
-        panel.MGR.status, panel.SMGR.status, panel.strata_status, panel._proc_ctx = ov
+        panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx = ov
 
 
 # ---------------------------------------------------------------- llama.cpp extra knobs
