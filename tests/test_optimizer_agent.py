@@ -629,3 +629,51 @@ def test_hermes_provider_presets_custom_provider_and_model_polling(tmp_path, mon
     assert "anthropic-version" in seen_calls[-1][1]
 
 
+def test_agent_chat_surfaces_provider_errors_and_handles_reasoning_models(tmp_path, monkeypatch):
+    """Configured provider failures must report the error rather than claiming deterministic mode."""
+    import optimizer_agent
+
+    agent, _, _, host = _make_stub_agent(tmp_path)
+    host.cfg["agent_llm_provider"] = "openai"
+    host.cfg["agent_llm_url"] = "https://api.openai.com/v1"
+    host.cfg["agent_llm_model"] = "o3-mini"
+    host.cfg["agent_llm_key"] = "sk-test"
+
+    class FakePostResp:
+        def __init__(self, status_code, body, reason="OK"):
+            self.status_code = status_code
+            self._body = body
+            self.text = json.dumps(body) if isinstance(body, dict) else str(body)
+            self.reason_phrase = reason
+
+        def json(self):
+            return self._body
+
+    # 1. HTTP 401 should surface the real error, NOT "Deterministic mode active"
+    monkeypatch.setattr(
+        optimizer_agent.httpx,
+        "post",
+        lambda *a, **kw: FakePostResp(401, {"error": {"message": "Invalid API key"}}, "Unauthorized"),
+    )
+    res_err = agent.chat("Hello, what GPU do I have?")
+    assert "Deterministic mode active" not in res_err["reply"]
+    assert "HTTP 401" in res_err["reply"] and "Invalid API key" in res_err["reply"]
+    assert res_err["llm"]["mode"] == "external"
+
+    # 2. HTTP 400 demanding max_completion_tokens retries cleanly and reads reasoning_content fallback
+    calls = []
+
+    def fake_reasoning_post(url, headers=None, json=None, timeout=None):
+        calls.append(dict(json or {}))
+        if "max_tokens" in (json or {}):
+            return FakePostResp(400, {"error": {"message": "Use max_completion_tokens instead of max_tokens"}}, "Bad Request")
+        return FakePostResp(200, {"choices": [{"message": {"content": "", "reasoning_content": "You have a 24GB GPU."}}]})
+
+    monkeypatch.setattr(optimizer_agent.httpx, "post", fake_reasoning_post)
+    res_ok = agent.chat("Hello, what GPU do I have?")
+    assert len(calls) == 2
+    assert "max_completion_tokens" in calls[1]
+    assert "24GB GPU" in res_ok["reply"]
+
+
+

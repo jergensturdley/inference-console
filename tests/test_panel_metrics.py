@@ -1084,6 +1084,54 @@ def test_agent_toml_invalid_leaves_file_untouched():
         panel.HOME = real_home
 
 
+def test_agent_zed_jsonc_comments_and_trailing_commas():
+    """Zed settings.json is JSONC (// comments, /* */ comments, trailing commas)."""
+    real_home = panel.HOME
+    h = Path(tempfile.mkdtemp(prefix="inference-console-zed-"))
+    panel.HOME = h
+    try:
+        p = h / ".config" / "zed" / "settings.json"
+        p.parent.mkdir(parents=True)
+        p.write_text(
+            "// Zed settings\n"
+            "{\n"
+            "  /* block comment */\n"
+            "  \"theme\": \"One Dark\",\n"
+            "  \"docs_url\": \"https://zed.dev/docs\", // inline comment after URL\n"
+            "  \"tab_size\": 2,\n"
+            "}\n"
+        )
+        panel._w_zed("model-z", "http://127.0.0.1:8830", 32768)
+        data = json.loads(p.read_text())
+        assert data["theme"] == "One Dark"
+        assert data["docs_url"] == "https://zed.dev/docs"
+        assert data["tab_size"] == 2
+        lm = data["language_models"]["openai"]
+        assert lm["api_url"] == "http://127.0.0.1:8830/v1"
+        assert lm["available_models"][0]["name"] == "model-z"
+        assert lm["available_models"][0]["max_tokens"] == 32768
+    finally:
+        panel.HOME = real_home
+
+
+def test_api_agents_source_pinning():
+    """GET /api/agents?source=strata must report running=None when only llama.cpp is up."""
+    ov = (panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx)
+    panel.MGR.status = lambda: {"running": True, "alias": "local-m", "port": 8830, "pid": 1234}
+    panel.SMGR.status = lambda: {"running": False}
+    panel.strata_status = lambda refresh=False: {"installed": False, "running": False, "port": None}
+    panel.MAYA.status = lambda: {"running": False}
+    panel._proc_ctx = lambda pid: 16384
+    try:
+        auto = panel.api_agents()
+        assert auto["running"] is not None and auto["running"][0] == "local-m"
+        assert auto["sources"] == {"panel": True, "avalon": False, "strata": False, "maya": False}
+        pinned = panel.api_agents(source="strata")
+        assert pinned["running"] is None
+    finally:
+        panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx = ov
+
+
 # ---------------------------------------------------------------- llama.cpp extra knobs
 _FULL_CAPS = {"exists": True, "metrics": True, "fa_value": True, "ctk": True, "mlock": True,
               "no_mmap": True, "parallel": True, "ncmoe": True, "draft": True, "draft_max": True,

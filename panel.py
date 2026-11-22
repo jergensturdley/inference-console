@@ -4247,8 +4247,14 @@ def _w_claude(alias, base, ctx, key):
 
 def _w_pi(alias, base, ctx, key):
     path = HOME / ".pi/agent/models.json"
-    cfg = json.loads(path.read_text()) if path.exists() else {
-        "$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}}
+    if path.exists():
+        text = path.read_text()
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError:
+            cfg = _jsonc_load(text)
+    else:
+        cfg = {"$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}}
     cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = {
         "baseUrl": base + "/v1", "api": "openai-completions", "apiKey": key or "none",
         "models": [{"id": alias, "name": alias, "api": "openai-completions",
@@ -4295,7 +4301,7 @@ AGENTS = {
 }
 
 @app.get("/api/agents")
-def api_agents():
+def api_agents(source: str | None = None):
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
@@ -4313,7 +4319,8 @@ def api_agents():
             continue
         cur = _current_llm(src_name)
         targets[src_name] = {"alias": cur[0], "port": cur[1], "ctx": cur[2], "source": cur[4]} if cur else None
-    running = _current_llm()
+    src = (source or "auto").lower()
+    running = _current_llm(None if src == "auto" else src)
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
             "running": [running[0], running[1], running[2], running[4]] if running else None,
@@ -7750,7 +7757,7 @@ $('#ag-apply').addEventListener('click',async()=>{
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
-  toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':'warn', 8000);
+  toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':(okN===0?'err':'warn'), 8000);
   openAgentsDlg(AGSRC,true);  // re-render so the registry tags show the new alias/port
   pollStatus();
 });
@@ -8495,7 +8502,7 @@ $('#set-save').addEventListener('click',async()=>{
       agent_llm_fallback_local:$('#set-agentfallback')?$('#set-agentfallback').checked:undefined
     });
     toast('Settings saved','ok');
-    await loadSettings();await loadModels();
+    await Promise.all([loadSettings(),loadModels(),loadAgentProvider(),loadAgentStatus()]);
   }catch(e){toast('Save failed: '+e.message,'err')}
   btn.disabled=false;
 });
@@ -8696,15 +8703,27 @@ $('#ag-prov-poll')?.addEventListener('click',()=>pollAgentProviderModels(false))
 $('#ag-prov-save')?.addEventListener('click',async()=>{
   const btn=$('#ag-prov-save');btn.disabled=true;
   try{
-    await post('/api/agent/provider',{
-      provider:$('#ag-prov-select').value,
-      url:$('#ag-prov-url').value.trim(),
-      model:$('#ag-prov-model').value.trim(),
+    const prov=$('#ag-prov-select').value;
+    const url=$('#ag-prov-url').value.trim();
+    const model=$('#ag-prov-model').value.trim();
+    const fallback=$('#ag-prov-fallback').checked;
+    const res=await post('/api/agent/provider',{
+      provider:prov,
+      url:url,
+      model:model,
       api_key:$('#ag-prov-key').value.trim(),
       headers:$('#ag-prov-headers').value.trim(),
-      fallback_local:$('#ag-prov-fallback').checked
+      fallback_local:fallback
     });
-    toast('Agent LLM provider saved','ok');
+    if($('#set-agenturl'))$('#set-agenturl').value=res.url||'';
+    if($('#set-agentmodel'))$('#set-agentmodel').value=res.model||'';
+    if($('#set-agentfallback'))$('#set-agentfallback').checked=res.fallback_local!==false;
+    if(res.status)renderAgentLlmChip(res.status);
+    if(prov!=='local_fallback'&&!model){
+      toast('Saved, but Model ID is empty — pick or enter a model to enable LLM mode','warn',8000);
+    }else{
+      toast('Agent LLM provider saved','ok');
+    }
     await Promise.all([loadAgentProvider(),loadAgentStatus()]);
   }catch(e){toast('Save provider failed: '+e.message,'err')}
   btn.disabled=false;
@@ -8756,13 +8775,17 @@ function renderAgentResult(title,data){
   $('#ag-save-preset-btn').classList.toggle('hide',!cfg);
 }
 
+function renderAgentLlmChip(lm){
+  lm=lm||{};
+  const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
+  if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
+  if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+}
+
 async function loadAgentStatus(){
   try{
     const d=await api('/api/agent/status');
-    const lm=d.llm||{};
-    const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
-    if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
-    if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+    renderAgentLlmChip(d.llm);
     renderTuneStatus(d.tune);
   }catch(e){}
 }
@@ -9088,6 +9111,7 @@ async function sendAgentChat(text){
   try{
     const eng=(tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
     const r=await post('/api/agent/chat',{message:msg,engine:eng});
+    if(r.llm)renderAgentLlmChip(r.llm);
     appendAgentBubble('bot',r.reply,r.actions||[]);
   }catch(e){appendAgentBubble('bot','Error: '+e.message);}
 }
@@ -9140,7 +9164,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();loadAgentStatus();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
