@@ -469,7 +469,275 @@ class HostContext:
     coding_agents_list: Callable[[], list[str]] | None = None
     hf_search_fn: Callable[[str], list[dict[str, Any]]] | None = None
     hf_files_fn: Callable[[str], list[dict[str, Any]]] | None = None
+    hf_pull_fn: Callable[[str, list[str], dict[str, int]], dict[str, Any]] | None = None
+    downloads_fn: Callable[[], list[dict[str, Any]]] | None = None
+    thermal_status_fn: Callable[[], dict[str, Any]] | None = None
+    thermal_eval_fn: Callable[[], dict[str, Any]] | None = None
+    strata_doctor_fn: Callable[[], dict[str, Any]] | None = None
     maya_mgr: Any = None
+
+
+# ----------------------------------------------------------------------------
+# Comprehensive Clickable Action Menu & Templates (single source of truth)
+# ----------------------------------------------------------------------------
+
+AGENT_ACTION_TEMPLATES: list[dict[str, Any]] = [
+    # ---- Quant & Download ----
+    {
+        "id": "hf_quant_empty_gpu",
+        "category": "Quant & Download",
+        "label": "Calculate & Pull Best Quant (Empty GPU)",
+        "description": "Search Hugging Face GGUFs and rank the best quant assuming full GPU VRAM is unoccupied.",
+        "instant": False,
+        "fields": [
+            {"name": "query", "label": "Model name or HF repo", "type": "text", "required": True, "placeholder": "e.g. Qwen3-32B, DeepSeek-R1, unsloth/Qwen3-30B-A3B-GGUF"},
+            {"name": "goal", "label": "Target goal", "type": "select", "default": "balanced", "options": ["balanced", "fastest", "max_context", "low_vram"]},
+            {"name": "assume_empty_gpu", "label": "Assume empty GPU (ignore current VRAM use)", "type": "checkbox", "default": True},
+            {"name": "auto_pull", "label": "Queue top matching quant immediately", "type": "checkbox", "default": False},
+        ],
+        "prompt_template": "Calculate best quant for {query} ({goal}, empty GPU={assume_empty_gpu})",
+    },
+    {
+        "id": "hf_quant_free_vram",
+        "category": "Quant & Download",
+        "label": "Calculate Quant (Free VRAM Only)",
+        "description": "Find the best quant that fits in currently free VRAM alongside running workloads.",
+        "instant": False,
+        "fields": [
+            {"name": "query", "label": "Model name or HF repo", "type": "text", "required": True, "placeholder": "e.g. Llama-3.1-8B, Qwen2.5-Coder-14B"},
+            {"name": "goal", "label": "Target goal", "type": "select", "default": "low_vram", "options": ["low_vram", "balanced", "fastest", "max_context"]},
+            {"name": "assume_empty_gpu", "label": "Assume empty GPU", "type": "checkbox", "default": False},
+            {"name": "auto_pull", "label": "Queue top matching quant immediately", "type": "checkbox", "default": False},
+        ],
+        "prompt_template": "Calculate best quant for {query} using currently free VRAM ({goal})",
+    },
+    {
+        "id": "downloads_status",
+        "category": "Quant & Download",
+        "label": "Check Active Downloads",
+        "description": "Show Hugging Face download queue, progress, and recent transfers.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Show active Hugging Face downloads",
+    },
+    # ---- Optimize & Tune ----
+    {
+        "id": "optimize_engine",
+        "category": "Optimize & Tune",
+        "label": "Optimize Engine Config",
+        "description": "Compute a hardware-tuned config (dry-run) for llama.cpp, Avalon, Strata, or Maya.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+            {"name": "goal", "label": "Goal", "type": "select", "default": "balanced", "options": ["balanced", "fastest", "max_context", "low_vram", "low_latency", "multi_user"]},
+            {"name": "model", "label": "Local model (optional)", "type": "model_select", "default": ""},
+            {"name": "notes", "label": "Extra constraints (optional)", "type": "text", "placeholder": "e.g. ctx 32k, keep 2gb free"},
+        ],
+        "prompt_template": "Optimize {engine} for {goal}",
+    },
+    {
+        "id": "start_autotune",
+        "category": "Optimize & Tune",
+        "label": "Start Active Auto-Tune",
+        "description": "Create a safety checkpoint and run benchmarked config trials to find the fastest setup.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+            {"name": "goal", "label": "Goal", "type": "select", "default": "fastest", "options": ["fastest", "balanced", "max_context", "low_vram", "low_latency", "multi_user"]},
+            {"name": "model", "label": "Local model (optional)", "type": "model_select", "default": ""},
+            {"name": "max_trials", "label": "Max trials", "type": "number", "default": 5, "min": 1, "max": 12},
+        ],
+        "prompt_template": "Start active auto-tune on {engine} for {goal} ({max_trials} trials)",
+    },
+    {
+        "id": "stop_autotune",
+        "category": "Optimize & Tune",
+        "label": "Stop / Rollback Auto-Tune",
+        "description": "Stop an active auto-tune session, optionally rolling back to its pre-tune checkpoint.",
+        "instant": False,
+        "fields": [
+            {"name": "rollback", "label": "Rollback to pre-tune checkpoint", "type": "checkbox", "default": False},
+        ],
+        "prompt_template": "Stop auto-tune (rollback={rollback})",
+    },
+    {
+        "id": "route_workload",
+        "category": "Optimize & Tune",
+        "label": "Route Workload to Best Engine",
+        "description": "Pick the best installed model & engine for coding, vision, reasoning, chat, or long context.",
+        "instant": False,
+        "fields": [
+            {"name": "task", "label": "Workload", "type": "select", "default": "coding", "options": ["coding", "chat", "vision", "reasoning", "long_context"]},
+            {"name": "apply", "label": "Apply & launch winner now", "type": "checkbox", "default": False},
+            {"name": "sync_agents", "label": "Sync coding agents after launch", "type": "checkbox", "default": False},
+        ],
+        "prompt_template": "Route {task} workload to best engine",
+    },
+    {
+        "id": "tune_speculation",
+        "category": "Optimize & Tune",
+        "label": "Benchmark Speculative Decoding",
+        "description": "Compare baseline vs draft/MTP models on llama.cpp and keep the faster setup.",
+        "instant": False,
+        "fields": [
+            {"name": "model", "label": "Local model (optional)", "type": "model_select", "default": ""},
+            {"name": "apply_best", "label": "Apply fastest configuration", "type": "checkbox", "default": True},
+        ],
+        "prompt_template": "Benchmark speculative decoding",
+    },
+    # ---- Engines & Benchmarks ----
+    {
+        "id": "system_status",
+        "category": "Engines & Benchmarks",
+        "label": "Hardware & Engine Status",
+        "description": "Inspect GPU VRAM, system RAM, CPU, and which engines are currently running.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Show hardware vitals and running engine status",
+    },
+    {
+        "id": "run_benchmark",
+        "category": "Engines & Benchmarks",
+        "label": "Run Speed Benchmark",
+        "description": "Benchmark prompt & generation tok/s on whichever engine is currently serving.",
+        "instant": False,
+        "fields": [
+            {"name": "prompt_key", "label": "Suite", "type": "select", "default": "short", "options": ["short", "standard", "code"]},
+            {"name": "max_tokens", "label": "Max tokens", "type": "number", "default": 128, "min": 16, "max": 1024},
+        ],
+        "prompt_template": "Run {prompt_key} benchmark ({max_tokens} tokens)",
+    },
+    {
+        "id": "stop_engine",
+        "category": "Engines & Benchmarks",
+        "label": "Stop an Engine",
+        "description": "Stop a specific inference engine to free GPU VRAM.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine to stop", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+        ],
+        "prompt_template": "Stop {engine} engine",
+    },
+    {
+        "id": "stop_all_engines",
+        "category": "Engines & Benchmarks",
+        "label": "Stop All Engines (Free GPU)",
+        "description": "Create a safety checkpoint and stop all running engines so the GPU is completely empty.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Stop all running engines and free GPU VRAM",
+    },
+    {
+        "id": "strata_doctor",
+        "category": "Engines & Benchmarks",
+        "label": "Strata Doctor Check",
+        "description": "Run Strata CLI health diagnostics.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Run Strata doctor diagnostics",
+    },
+    # ---- Diagnose & Safety ----
+    {
+        "id": "diagnose_engine",
+        "category": "Diagnose & Safety",
+        "label": "Diagnose Last Failure",
+        "description": "Inspect engine logs for OOM, bad flags, or draft mismatches and propose a fix.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+        ],
+        "prompt_template": "Diagnose last failure on {engine}",
+    },
+    {
+        "id": "heal_engine",
+        "category": "Diagnose & Safety",
+        "label": "Auto-Heal Engine",
+        "description": "Diagnose the last failure and immediately apply the safe fix + relaunch.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+        ],
+        "prompt_template": "Auto-heal {engine}",
+    },
+    {
+        "id": "thermal_status",
+        "category": "Diagnose & Safety",
+        "label": "Thermal Guard Status",
+        "description": "Check GPU temperature, VRAM pressure, and thermal guard actions.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Check thermal guard status",
+    },
+    {
+        "id": "thermal_downshift",
+        "category": "Diagnose & Safety",
+        "label": "Downshift Active Engine",
+        "description": "Checkpoint and downshift the active engine to a cooler / low-VRAM profile.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Downshift active engine to low-VRAM/cooler profile",
+    },
+    {
+        "id": "checkpoints_list",
+        "category": "Diagnose & Safety",
+        "label": "Checkpoints & Rollback",
+        "description": "View saved safety checkpoints with one-click restore.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Show checkpoints",
+    },
+    {
+        "id": "checkpoint_create",
+        "category": "Diagnose & Safety",
+        "label": "Create Safety Checkpoint",
+        "description": "Snapshot the current engine configuration before making changes.",
+        "instant": False,
+        "fields": [
+            {"name": "engine", "label": "Engine", "type": "select", "default": "llama", "options": ["llama", "avalon", "strata", "maya"]},
+            {"name": "label", "label": "Label (optional)", "type": "text", "placeholder": "e.g. Before quant swap"},
+        ],
+        "prompt_template": "Create checkpoint for {engine}",
+    },
+    # ---- Library & Coding Agents ----
+    {
+        "id": "list_models",
+        "category": "Library & Coding Agents",
+        "label": "List Local Models & Fit",
+        "description": "List installed GGUF models with sizes, quants, and MoE/VRAM fit.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "List local models and VRAM fit",
+    },
+    {
+        "id": "presets_list",
+        "category": "Library & Coding Agents",
+        "label": "Saved Optimization Presets",
+        "description": "View built-in and saved presets with one-click apply.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Show saved optimization presets",
+    },
+    {
+        "id": "sync_coding_agents",
+        "category": "Library & Coding Agents",
+        "label": "Register in Coding Agents",
+        "description": "Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, and kimi at the active server.",
+        "instant": False,
+        "fields": [
+            {"name": "source", "label": "Engine source", "type": "select", "default": "auto", "options": ["auto", "llama", "avalon", "strata", "maya"]},
+        ],
+        "prompt_template": "Register active engine ({source}) in coding agents",
+    },
+    {
+        "id": "agent_memory",
+        "category": "Library & Coding Agents",
+        "label": "Agent Experience Memory",
+        "description": "Show top recorded benchmark winners and VRAM calibrations.",
+        "instant": True,
+        "fields": [],
+        "prompt_template": "Show agent experience memory",
+    },
+]
 
 
 # ----------------------------------------------------------------------------
@@ -2150,11 +2418,489 @@ class OptimizerAgent:
             max_tokens=400,
         )
 
-    # ------------------------------------------------------------ Conversational Agent Sidebar
-    def chat(self, message: str, engine: str = "llama", model: str = "") -> dict[str, Any]:
+    # ------------------------------------------------------------ Conversational Agent Sidebar & Action Templates
+    @staticmethod
+    def _extract_hf_query(msg: str) -> str:
+        """Extract a model name or HF org/repo from a natural-language quant/pull prompt."""
+        raw = (msg or "").strip()
+        if not raw:
+            return ""
+        # 1. Explicit Hugging Face org/repo token (excluding units like tok/s, gpu/cpu)
+        bad_slashes = {"tok/s", "mb/s", "gb/s", "gpu/cpu", "cpu/gpu", "vram/ram", "ram/vram"}
+        for m in re.finditer(r"\b([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)\b", raw):
+            tok = m.group(1)
+            if tok.lower() not in bad_slashes and not tok.startswith("http"):
+                return tok
+
+        # 2. Strip trailing hardware/assumption clauses
+        cleaned = re.sub(
+            r"\b(?:assuming|using|with|given|when|if|on my|for my|to fit|that fits|fits my|fits on)\b.*$",
+            "",
+            raw,
+            flags=re.I,
+        ).strip()
+        cleaned = re.sub(
+            r"\bfor\s+(?:fastest|balanced|max[\s_-]?context|max[\s_-]?ctx|low[\s_-]?vram|speed|coding|chat|reasoning)\b.*$",
+            "",
+            cleaned,
+            flags=re.I,
+        ).strip()
+
+        # 3. Strip conversational filler words while preserving model identifiers
+        stop = {
+            "the", "a", "an", "model", "models", "quant", "quants", "quantization", "quantisation",
+            "gguf", "ggufs", "correct", "best", "optimal", "right", "fitting", "fit", "fits",
+            "calculate", "calc", "compute", "figure", "out", "find", "search", "recommend",
+            "suggest", "pick", "choose", "pull", "download", "fetch", "get", "grab", "queue",
+            "please", "can", "could", "would", "you", "me", "my", "gpu", "vram", "ram",
+            "empty", "free", "idle", "unoccupied", "nothing", "else", "is", "are", "occupying",
+            "and", "to", "for", "of", "on", "in", "that", "what", "which", "size", "weights",
+            "from", "hugging", "face", "huggingface", "hf", "repo", "file", "files", "it",
+        }
+        tokens = re.findall(r"[A-Za-z0-9._+-]+", cleaned)
+        kept = [t for t in tokens if t.lower() not in stop]
+        return " ".join(kept).strip()
+
+    def _active_engines_summary(self) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        try:
+            st = self.host.mgr.status() or {}
+            out.append({"engine": "llama", "running": bool(st.get("running")), "model": st.get("model") or "", "port": st.get("port")})
+        except Exception:
+            out.append({"engine": "llama", "running": False, "model": ""})
+        try:
+            av = self.host.smgr.status() or {}
+            out.append({"engine": "avalon", "running": bool(av.get("running")), "model": av.get("profile") or "", "port": av.get("port")})
+        except Exception:
+            out.append({"engine": "avalon", "running": False, "model": ""})
+        try:
+            sr = self.host.strata_status(refresh=False) or {}
+            out.append({"engine": "strata", "running": bool(sr.get("running")), "model": sr.get("model") or sr.get("preset") or "", "port": sr.get("port")})
+        except Exception:
+            out.append({"engine": "strata", "running": False, "model": ""})
+        if self.host.maya_mgr:
+            try:
+                my = self.host.maya_mgr.status() or {}
+                out.append({"engine": "maya", "running": bool(my.get("running")), "model": my.get("config_id") or "", "port": my.get("port")})
+            except Exception:
+                out.append({"engine": "maya", "running": False, "model": ""})
+        return out
+
+    def _format_hf_recommendations(
+        self,
+        rec_data: dict[str, Any],
+        *,
+        auto_pull: bool = False,
+    ) -> tuple[str, list[dict[str, Any]]]:
+        hb = rec_data.get("hardware_budget") or {}
+        recs = rec_data.get("recommendations") or []
+        gpu_name = hb.get("gpu_name") or "GPU"
+        total_mb = hb.get("gpu_total_mb") or 0
+        used_mb = hb.get("gpu_used_mb") or 0
+        res_mb = hb.get("vram_reserve_mb") or 512
+        usable_mb = hb.get("usable_vram_mb") or 0
+        ram_mb = hb.get("avail_ram_mb") or 0
+        empty_gpu = hb.get("assume_empty_gpu", True)
+
+        mode_note = (
+            f"assuming empty GPU (ignoring {used_mb} MB currently used)"
+            if empty_gpu
+            else f"using currently free VRAM only ({used_mb} MB currently used)"
+        )
+        header = (
+            f"**HF Quant Calculator ({rec_data.get('goal', 'balanced')})** for `{rec_data.get('query', '')}`\n"
+            f"Budget: {gpu_name} · {total_mb} MB total − {res_mb} MB reserve = **{usable_mb} MB usable VRAM** "
+            f"({mode_note}) · {round(ram_mb / 1024.0, 1)} GB free RAM"
+        )
+        actions: list[dict[str, Any]] = []
+        if not recs:
+            msg = (
+                header
+                + "\n\nNo fitting GGUF quants were found for that query within your VRAM+RAM budget. "
+                "Try a broader model name (e.g. `Qwen3-32B`, `unsloth/Qwen3-30B-A3B-GGUF`) or switch goal to `low_vram`."
+            )
+            actions.append({"label": "Open Quant Calculator", "type": "open_template", "action_id": "hf_quant_empty_gpu"})
+            return msg, actions
+
+        lines = []
+        for idx, r in enumerate(recs[:5], 1):
+            ram_part = f" + {r['ram_est_mb']} MB RAM experts" if r.get("ram_est_mb") else ""
+            extras = []
+            if r.get("mmproj"):
+                extras.append("+mmproj")
+            if r.get("draft"):
+                extras.append("+draft")
+            extra_str = (" " + " ".join(extras)) if extras else ""
+            lines.append(
+                f"{idx}. `{r['repo']}` · **{r['quant']}** ({r['size_gb']} GB) — {r['fit_label']} "
+                f"(~{r['gpu_est_mb']} MB GPU{ram_part}){extra_str}"
+            )
+
+        body = header + "\n\n" + "\n".join(lines)
+
+        if auto_pull and self.host.hf_pull_fn:
+            top = recs[0]
+            try:
+                pulled = self.host.hf_pull_fn(top["repo"], top["pull_files"], top.get("pull_sizes") or {})
+                started = (pulled or {}).get("started") or top["pull_files"]
+                body += f"\n\nQueued download for **{top['repo']} ({top['quant']})**: {len(started)} file(s)."
+                actions.append({"label": "View Downloads", "type": "open_tab", "tab": "models"})
+            except Exception as e:
+                body += f"\n\nAuto-pull failed: {e}"
+                actions.append({
+                    "label": f"Retry Pull #{1}: {top['quant']} ({top['size_gb']} GB)",
+                    "type": "hf_pull",
+                    "repo": top["repo"],
+                    "files": top["pull_files"],
+                    "sizes": top.get("pull_sizes") or {},
+                })
+        else:
+            for idx, r in enumerate(recs[:3], 1):
+                actions.append({
+                    "label": f"Queue Pull #{idx}: {r['quant']} ({r['size_gb']} GB)",
+                    "type": "hf_pull",
+                    "repo": r["repo"],
+                    "files": r["pull_files"],
+                    "sizes": r.get("pull_sizes") or {},
+                })
+
+        if empty_gpu and used_mb > 1024:
+            actions.append({"label": "Stop All Engines (Free GPU)", "type": "killswitch"})
+        return body, actions
+
+    def execute_action(
+        self,
+        action_id: str,
+        params: dict[str, Any] | None = None,
+        engine: str = "llama",
+        model: str = "",
+    ) -> dict[str, Any]:
+        """Deterministically execute a structured action template from the Agent Chat Action Menu."""
+        p = dict(params or {})
+        eng = (p.get("engine") or engine or "llama").strip().lower()
+        mod = (p.get("model") or model or "").strip()
+        actions: list[dict[str, Any]] = []
+        reply = ""
+
+        if action_id in ("hf_quant_empty_gpu", "hf_quant_free_vram"):
+            query = str(p.get("query") or "").strip()
+            goal = str(p.get("goal") or ("low_vram" if action_id == "hf_quant_free_vram" else "balanced"))
+            default_empty = action_id == "hf_quant_empty_gpu"
+            assume_empty = bool(p.get("assume_empty_gpu", default_empty))
+            auto_pull = bool(p.get("auto_pull", False))
+            if not query:
+                vit = self.host.vitals(refresh=False)
+                gpu = vit.get("gpu") or {}
+                total_mb = round(float(gpu.get("total_mb") or 8192))
+                res_mb = round(float(self.host.cfg.get("vram_reserve_mb") or 512))
+                usable = max(512, total_mb - res_mb)
+                reply = (
+                    f"Specify a model name or Hugging Face repo to calculate the best quant.\n"
+                    f"Assuming an empty GPU ({gpu.get('name') or 'GPU'}), you have **{usable} MB usable VRAM** "
+                    f"({total_mb} MB total − {res_mb} MB reserve)."
+                )
+                actions.append({"label": "Open Quant Calculator", "type": "open_template", "action_id": action_id})
+            else:
+                try:
+                    rec_data = self.recommend_hf(query=query, goal=goal, assume_empty_gpu=assume_empty)
+                    reply, actions = self._format_hf_recommendations(rec_data, auto_pull=auto_pull)
+                except Exception as e:
+                    reply = f"HF quant calculation failed for `{query}`: {e}"
+
+        elif action_id == "downloads_status":
+            if self.host.downloads_fn:
+                dls = self.host.downloads_fn() or []
+                if not dls:
+                    reply = "No active or recent Hugging Face downloads."
+                else:
+                    lines = []
+                    for d in dls[:8]:
+                        pct = f" ({round(100 * d['done'] / d['total'])}%)" if d.get("total") else ""
+                        lines.append(f"- `{d.get('file') or d.get('id')}` — **{d.get('status')}**{pct}")
+                    reply = "**Hugging Face Downloads**\n" + "\n".join(lines)
+                actions.append({"label": "Open Models & Downloads Tab", "type": "open_tab", "tab": "models"})
+            else:
+                reply = "Download status hook is not available."
+
+        elif action_id == "optimize_engine":
+            goal = str(p.get("goal") or "balanced")
+            notes = str(p.get("notes") or "")
+            goal, constraints = self._parse_prompt_constraints(notes, goal, {})
+            try:
+                rec = self.advise(engine=eng, goal=goal, model=mod, constraints=constraints, user_prompt=notes, use_llm=True)
+                reply = (
+                    f"**{eng.upper()} recommendation ({rec['goal']})** for `{rec['model_key']}`:\n"
+                    + "\n".join(f"- {n}" for n in rec.get("notes", [])[:6])
+                )
+                if rec.get("llm_analysis"):
+                    reply += "\n\n" + rec["llm_analysis"]
+                actions.append({"label": f"Apply & Launch ({eng})", "type": "apply", "engine": eng, "goal": rec["goal"], "config": rec["config"]})
+                actions.append({"label": f"Start Auto-Tune ({rec['goal']})", "type": "start_tune", "engine": eng, "goal": rec["goal"], "model": rec.get("model_path") or mod})
+            except Exception as e:
+                reply = f"Could not optimize {eng}: {e}"
+
+        elif action_id == "start_autotune":
+            goal = str(p.get("goal") or "fastest")
+            max_trials = int(p.get("max_trials") or 5)
+            try:
+                st = self.start_tune(engine=eng, goal=goal, model=mod, max_trials=max_trials)
+                reply = (
+                    f"**Active Auto-Tune started** on `{eng}` (goal: `{goal}`, max {max_trials} trials).\n"
+                    f"Safety checkpoint `{st.get('checkpoint_id', '')}` created."
+                )
+                actions.append({"label": "Open Agent Tab", "type": "open_tab", "tab": "agent"})
+                actions.append({"label": "Stop Auto-Tune", "type": "stop_tune", "rollback": False})
+                actions.append({"label": "Stop & Rollback", "type": "stop_tune", "rollback": True})
+            except Exception as e:
+                reply = f"Could not start auto-tune on {eng}: {e}"
+
+        elif action_id == "stop_autotune":
+            rb = bool(p.get("rollback", False))
+            st = self.stop_tune(rollback=rb)
+            reply = f"Auto-tune stop requested (rollback={rb}). Current status: `{st.get('state', 'idle')}`."
+
+        elif action_id == "route_workload":
+            task = str(p.get("task") or "coding")
+            do_apply = bool(p.get("apply", False))
+            do_sync = bool(p.get("sync_agents", False))
+            try:
+                r = self.route_workload(task=task, apply=do_apply, sync_agents=do_sync)
+                w = r.get("winner") or {}
+                reply = (
+                    f"**Workload Router ({task})**\n"
+                    f"Best match: `{w.get('model_name') or w.get('model_path') or 'default'}` on **{w.get('engine', 'llama')}** "
+                    f"(goal: `{w.get('goal', 'balanced')}`, score: {w.get('score', 0)}).\n"
+                    + (f"Applied: yes (checkpoint `{r['applied'].get('checkpoint_id', '')}`)" if r.get("applied") else "Dry-run preview (not yet launched).")
+                )
+                if not do_apply and w.get("config"):
+                    actions.append({"label": f"Apply & Launch ({w.get('engine', 'llama')})", "type": "apply", "engine": w.get("engine", "llama"), "goal": w.get("goal", "balanced"), "config": w["config"]})
+                actions.append({"label": "Register in Coding Agents", "type": "sync_agents", "source": "auto"})
+            except Exception as e:
+                reply = f"Workload routing failed: {e}"
+
+        elif action_id == "tune_speculation":
+            apply_best = bool(p.get("apply_best", True))
+            try:
+                r = self.tune_speculation(model=mod, apply_best=apply_best)
+                trials = r.get("trials") or []
+                lines = [
+                    f"- {t['label']}: {t['tok_s']} tok/s ({'+' if t.get('speedup_pct', 0) >= 0 else ''}{t.get('speedup_pct', 0)}%)"
+                    if t.get("ok") else f"- {t['label']}: failed ({t.get('error', '')})"
+                    for t in trials
+                ]
+                reply = f"**Speculative Decoding Tuner**\n{r.get('verdict', '')}\n" + "\n".join(lines)
+            except Exception as e:
+                reply = f"Speculative decoding tuner failed: {e}"
+
+        elif action_id == "system_status":
+            vit = self.host.vitals(refresh=False)
+            gpu = vit.get("gpu") or {}
+            mem = vit.get("mem") or {}
+            cpu = vit.get("cpu") or {}
+            engines = self._active_engines_summary()
+            eng_lines = [
+                f"- **{e['engine']}**: {'RUNNING' if e['running'] else 'stopped'}"
+                + (f" (`{e['model']}` on :{e['port']})" if e["running"] and e.get("port") else (f" (`{e['model']}`)" if e["running"] and e.get("model") else ""))
+                for e in engines
+            ]
+            total_mb = round(float(gpu.get("total_mb") or 0))
+            used_mb = round(float(gpu.get("used_mb") or 0))
+            free_mb = max(0, total_mb - used_mb)
+            reply = (
+                f"**Hardware & Engine Status**\n"
+                f"- GPU: {gpu.get('name') or 'Unknown'} · {used_mb} / {total_mb} MB VRAM ({free_mb} MB free) · {gpu.get('temp', '?')}°C · {gpu.get('util', '?')}% util\n"
+                f"- RAM: {round(float(mem.get('used_gb') or 0), 1)} / {round(float(mem.get('total_gb') or 0), 1)} GB\n"
+                f"- CPU: {cpu.get('cores', '?')} cores · {cpu.get('percent', '?')}%\n\n"
+                f"**Engines**\n" + "\n".join(eng_lines)
+            )
+            running = [e for e in engines if e["running"]]
+            for e in running:
+                actions.append({"label": f"Stop {e['engine']}", "type": "stop_engine", "engine": e["engine"]})
+            if running:
+                actions.append({"label": "Run Short Benchmark", "type": "benchmark", "prompt_key": "short", "max_tokens": 128})
+                actions.append({"label": "Register in Coding Agents", "type": "sync_agents", "source": "auto"})
+            actions.append({"label": "Calculate Best Quant (Empty GPU)", "type": "open_template", "action_id": "hf_quant_empty_gpu"})
+
+        elif action_id == "run_benchmark":
+            pk = str(p.get("prompt_key") or "short")
+            mt = int(p.get("max_tokens") or 128)
+            try:
+                res = self.host.benchmark_run(pk, mt)
+                gen = res.get("gen_tps") or res.get("tok_s") or res.get("tokens_per_second") or 0
+                pp = res.get("prompt_tps") or res.get("prefill_tps") or 0
+                reply = f"**Benchmark complete (`{pk}`, {mt} tok)**\n- Generation: **{round(float(gen), 2)} tok/s**" + (f"\n- Prefill: **{round(float(pp), 2)} tok/s**" if pp else "")
+                actions.append({"label": "Open Benchmarks Tab", "type": "open_tab", "tab": "bench"})
+            except Exception as e:
+                reply = f"Benchmark failed (make sure an engine is running first): {e}"
+
+        elif action_id == "stop_engine":
+            try:
+                if eng == "llama":
+                    self.host.mgr.stop()
+                elif eng == "avalon":
+                    self.host.smgr.stop()
+                elif eng == "strata":
+                    self.host.strata_stop()
+                elif eng == "maya" and self.host.maya_mgr:
+                    self.host.maya_mgr.stop()
+                else:
+                    raise ValueError(f"Unknown or unavailable engine: {eng}")
+                reply = f"Stopped **{eng}** engine."
+            except Exception as e:
+                reply = f"Failed to stop {eng}: {e}"
+
+        elif action_id == "stop_all_engines":
+            res = self.emergency_killswitch()
+            stopped = res.get("stopped") or []
+            reply = (
+                f"**Stopped all running engines** ({', '.join(stopped) if stopped else 'none were running'}).\n"
+                f"Safety checkpoint `{res.get('checkpoint_id', '')}` saved. GPU VRAM is now free."
+            )
+            if res.get("checkpoint_id"):
+                actions.append({"label": f"Restore checkpoint ({res['checkpoint_id']})", "type": "restore_checkpoint", "checkpoint_id": res["checkpoint_id"]})
+            actions.append({"label": "Calculate Best Quant (Empty GPU)", "type": "open_template", "action_id": "hf_quant_empty_gpu"})
+
+        elif action_id == "strata_doctor":
+            if self.host.strata_doctor_fn:
+                try:
+                    d = self.host.strata_doctor_fn() or {}
+                    out = d.get("output") or d.get("detail") or json.dumps(d)
+                    reply = f"**Strata Doctor**\n{str(out)[:1400]}"
+                except Exception as e:
+                    reply = f"Strata doctor failed: {e}"
+            else:
+                reply = "Strata doctor hook is not wired."
+
+        elif action_id == "diagnose_engine":
+            diag = self.diagnose_failure(engine=eng, use_llm=True)
+            reply = f"**{diag['title']}** ({eng})\n{diag['cause']}"
+            if diag.get("remediation_steps"):
+                reply += "\n\nProposed fix:\n" + "\n".join(f"- {s}" for s in diag["remediation_steps"])
+                actions.append({"label": f"Fix & Relaunch ({eng})", "type": "apply", "engine": eng, "config": diag["fix_config"]})
+            if diag.get("llm_diagnosis"):
+                reply += "\n\n" + diag["llm_diagnosis"]
+
+        elif action_id == "heal_engine":
+            res = self.heal_failure(engine=eng)
+            diag = res.get("diagnosis") or {}
+            reply = f"**Auto-Heal ({eng})**: {diag.get('title', 'Completed')}\n"
+            if res.get("healed"):
+                reply += f"Applied fix and relaunched (checkpoint `{(res.get('applied') or {}).get('checkpoint_id', '')}`)."
+            else:
+                reply += res.get("detail") or diag.get("cause") or "No automatic fix was required."
+
+        elif action_id == "thermal_status":
+            if self.host.thermal_status_fn:
+                st = self.host.thermal_status_fn() or {}
+                reply = (
+                    f"**Thermal Guard**: `{st.get('state', 'unknown')}` · enabled={st.get('enabled', False)} · "
+                    f"auto_act={st.get('auto_act', False)} · eff_temp={st.get('eff_temp_c', '?')}°C"
+                )
+            else:
+                vit = self.host.vitals(refresh=False)
+                gpu = vit.get("gpu") or {}
+                reply = f"**GPU Thermals**: {gpu.get('temp', '?')}°C · {gpu.get('util', '?')}% util"
+            actions.append({"label": "Evaluate Thermals Now", "type": "thermal_evaluate"})
+            actions.append({"label": "Downshift Active Engine", "type": "downshift"})
+            actions.append({"label": "Emergency Stop All", "type": "killswitch"})
+
+        elif action_id == "thermal_downshift":
+            res = self.downshift_active_engine()
+            reply = f"**Thermal Downshift**: {res.get('detail', 'Done')}"
+
+        elif action_id == "checkpoints_list":
+            cps = self.store.list_checkpoints(limit=6)
+            if not cps:
+                reply = "No checkpoints saved yet. One is created automatically before Apply or Auto-Tune."
+            else:
+                lines = [f"- `{c['id']}` · {c['label']} ({c['engine']})" for c in cps]
+                reply = "**Recent Checkpoints**\n" + "\n".join(lines)
+                for c in cps[:2]:
+                    actions.append({"label": f"Restore {c['id']} ({c['engine']})", "type": "restore_checkpoint", "checkpoint_id": c["id"]})
+            actions.append({"label": f"Create Checkpoint ({eng})", "type": "create_checkpoint", "engine": eng})
+
+        elif action_id == "checkpoint_create":
+            lbl = str(p.get("label") or f"Chat checkpoint ({eng})")
+            cp = self.capture_checkpoint(engine=eng, label=lbl, reason="manual_chat")
+            reply = f"Created checkpoint `{cp['id']}` for **{eng}**: {cp['label']}."
+            actions.append({"label": f"Restore {cp['id']}", "type": "restore_checkpoint", "checkpoint_id": cp["id"]})
+
+        elif action_id == "list_models":
+            scan = self.host.scan_models() or {}
+            models = scan.get("models") or []
+            if not models:
+                reply = "No local GGUF models found. Use **Calculate & Pull Best Quant** to download one from Hugging Face."
+                actions.append({"label": "Calculate & Pull Best Quant", "type": "open_template", "action_id": "hf_quant_empty_gpu"})
+            else:
+                lines = []
+                for m in models[:12]:
+                    sz = round(float(m.get("size") or 0) / (1024**3), 2)
+                    tag = "MoE" if m.get("moe") else "Dense"
+                    lines.append(f"- `{m.get('name')}` · {m.get('quant') or '?'} · {sz} GB · {tag}")
+                reply = f"**Local Models ({len(models)} total)**\n" + "\n".join(lines)
+                top_m = models[0]
+                actions.append({"label": f"Optimize {top_m.get('name', 'top model')[:24]}", "type": "send_chat", "message": f"Optimize llama.cpp for {top_m.get('name', '')}"})
+                actions.append({"label": "Open Models Tab", "type": "open_tab", "tab": "models"})
+
+        elif action_id == "presets_list":
+            presets = self.store.list_presets()
+            if not presets:
+                reply = "No optimization presets saved."
+            else:
+                lines = [f"- **{pr['name']}** ({pr['engine']} · {pr['goal']})" for pr in presets[:10]]
+                reply = "**Optimization Presets**\n" + "\n".join(lines)
+                for pr in presets[:3]:
+                    actions.append({"label": f"Apply {pr['name'][:22]}", "type": "apply", "engine": pr["engine"], "goal": pr["goal"], "config": pr["config"]})
+
+        elif action_id == "sync_coding_agents":
+            src = str(p.get("source") or "auto")
+            if self.host.sync_agents_fn and self.host.coding_agents_list:
+                ags = self.host.coding_agents_list()
+                try:
+                    res = self.host.sync_agents_fn(ags, src)
+                    ok_cnt = sum(1 for v in (res.get("results") or {}).values() if isinstance(v, dict) and v.get("ok"))
+                    reply = f"**Synced {ok_cnt}/{len(ags)} coding agents** (source: `{src}`)."
+                except Exception as e:
+                    reply = f"Coding-agent sync failed (is an engine running?): {e}"
+            else:
+                reply = "Coding-agent sync hook is not wired."
+
+        elif action_id == "agent_memory":
+            mem = self.store.memory_summary(limit=8)
+            best = mem.get("best") or []
+            if not best:
+                reply = "No benchmarked experience records saved yet. Run Active Auto-Tune to populate memory."
+            else:
+                lines = [f"- `{b.get('model_key')}` ({b.get('engine')} · {b.get('goal')}): **{b.get('tok_s', 0)} tok/s**" for b in best[:6]]
+                reply = f"**Agent Experience Memory ({mem.get('total_records', 0)} records)**\n" + "\n".join(lines)
+
+        else:
+            reply = f"Unknown action template `{action_id}`."
+
+        return {"reply": reply, "actions": actions, "action_id": action_id, "llm": self.llm_status()}
+
+    def chat(
+        self,
+        message: str = "",
+        engine: str = "llama",
+        model: str = "",
+        action_id: str = "",
+        params: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        if action_id:
+            res = self.execute_action(action_id=action_id, params=params, engine=engine, model=model)
+            entry = {"ts": time.time(), "user": message or f"[{action_id}]", "reply": res["reply"], "actions": res["actions"]}
+            self._chat_history.append(entry)
+            self._chat_history = self._chat_history[-40:]
+            return res
+
         msg = (message or "").strip()
         if not msg:
-            return {"reply": "Ask me to optimize a model, diagnose a crash, explain MoE fit, or manage checkpoints.", "actions": []}
+            return {
+                "reply": "Pick any workflow from the **Actions** menu or ask me to calculate & pull a quant, optimize an engine, diagnose a crash, run a benchmark, or manage checkpoints.",
+                "actions": [{"label": "Calculate & Pull Best Quant (Empty GPU)", "type": "open_template", "action_id": "hf_quant_empty_gpu"}],
+                "llm": self.llm_status(),
+            }
 
         low = msg.lower()
         actions: list[dict[str, Any]] = []
@@ -2166,28 +2912,141 @@ class OptimizerAgent:
                 engine = eng_id
                 break
 
-        # Deterministic intent routing so sidebar works great even with zero LLM configured!
-        if any(k in low for k in ("diagnose", "crash", "oom", "error", "failed", "why did it fail", "fix")):
-            diag = self.diagnose_failure(engine=engine, use_llm=True)
-            reply_parts.append(f"**{diag['title']}** ({engine})\n{diag['cause']}")
-            if diag["remediation_steps"]:
-                reply_parts.append("Proposed fix:\n" + "\n".join(f"- {s}" for s in diag["remediation_steps"]))
-                actions.append({
-                    "label": f"Fix & Relaunch ({engine})",
-                    "type": "apply",
-                    "engine": engine,
-                    "config": diag["fix_config"],
-                })
-            if diag.get("llm_diagnosis"):
-                reply_parts.append(diag["llm_diagnosis"])
-        elif any(k in low for k in ("checkpoint", "rollback", "revert", "undo")):
-            cps = self.store.list_checkpoints(limit=5)
-            if not cps:
-                reply_parts.append("No checkpoints saved yet. One is automatically created before any Apply or Auto-Tune run.")
+        # 1. Hugging Face Quant Calculation & Pull intent (checked BEFORE generic 'recommend' -> advise!)
+        hf_quant_kws = ("quant", "quantiz", "pull", "download", "hugging face", "huggingface", "hf ", "gguf")
+        is_download_status = any(k in low for k in ("download status", "active download", "show download", "check download"))
+        if is_download_status:
+            res = self.execute_action("downloads_status", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+        elif any(k in low for k in hf_quant_kws):
+            goal, _ = self._parse_prompt_constraints(msg, "balanced", {})
+            free_only_kws = ("currently free", "free vram only", "remaining vram", "alongside", "with current")
+            assume_empty = not any(k in low for k in free_only_kws)
+            query = self._extract_hf_query(msg)
+            if not query:
+                vit = self.host.vitals(refresh=False)
+                gpu = vit.get("gpu") or {}
+                mem = vit.get("mem") or {}
+                total_mb = round(float(gpu.get("total_mb") or 8192))
+                used_mb = round(float(gpu.get("used_mb") or 0))
+                res_mb = round(float(self.host.cfg.get("vram_reserve_mb") or 512))
+                usable_mb = max(512, total_mb - res_mb) if assume_empty else max(512, total_mb - used_mb - res_mb)
+                free_ram_gb = round(max(1.0, float(mem.get("total_gb") or 32) - float(mem.get("used_gb") or 8)), 1)
+                mode_label = "assuming nothing else is occupying the GPU" if assume_empty else "using currently free VRAM only"
+                reply_parts.append(
+                    f"**Ready to calculate & pull the best quant ({mode_label})**\n"
+                    f"- GPU: {gpu.get('name') or 'GPU'} · **{usable_mb} MB usable VRAM** "
+                    f"({total_mb} MB total − {res_mb} MB reserve"
+                    + (f"; ignoring {used_mb} MB currently used" if assume_empty else f" − {used_mb} MB used")
+                    + f") · {free_ram_gb} GB free RAM\n\n"
+                    "Which model or Hugging Face repo would you like me to calculate for? "
+                    "Type a model name (e.g. *\"Calculate and pull best quant for Qwen3-32B\"*) or click **Open Quant Calculator** below."
+                )
+                actions.append({"label": "Open Quant Calculator", "type": "open_template", "action_id": "hf_quant_empty_gpu" if assume_empty else "hf_quant_free_vram"})
+                actions.append({"label": "Try Qwen3-32B", "type": "send_chat", "message": "Calculate and pull best quant for Qwen3-32B assuming empty GPU"})
+                actions.append({"label": "Try Qwen3-30B-A3B", "type": "send_chat", "message": "Calculate and pull best quant for Qwen3-30B-A3B assuming empty GPU"})
             else:
-                lines = [f"- `{c['id']}` · {c['label']} ({c['engine']})" for c in cps]
-                reply_parts.append("Recent checkpoints:\n" + "\n".join(lines))
-                actions.append({"label": f"Restore latest ({cps[0]['id']})", "type": "restore_checkpoint", "checkpoint_id": cps[0]["id"]})
+                try:
+                    rec_data = self.recommend_hf(query=query, goal=goal, assume_empty_gpu=assume_empty)
+                    body, hf_acts = self._format_hf_recommendations(rec_data, auto_pull=False)
+                    reply_parts.append(body)
+                    actions.extend(hf_acts)
+                except Exception as e:
+                    reply_parts.append(f"Could not calculate HF quants for `{query}`: {e}")
+
+        # 2. Diagnose / Heal
+        elif any(k in low for k in ("diagnose", "crash", "oom", "error", "failed", "why did it fail", "fix", "heal")):
+            if "auto-heal" in low or "auto heal" in low or low.startswith("heal"):
+                res = self.execute_action("heal_engine", {"engine": engine}, engine=engine, model=model)
+                reply_parts.append(res["reply"])
+                actions.extend(res["actions"])
+            else:
+                diag = self.diagnose_failure(engine=engine, use_llm=True)
+                reply_parts.append(f"**{diag['title']}** ({engine})\n{diag['cause']}")
+                if diag["remediation_steps"]:
+                    reply_parts.append("Proposed fix:\n" + "\n".join(f"- {s}" for s in diag["remediation_steps"]))
+                    actions.append({
+                        "label": f"Fix & Relaunch ({engine})",
+                        "type": "apply",
+                        "engine": engine,
+                        "config": diag["fix_config"],
+                    })
+                if diag.get("llm_diagnosis"):
+                    reply_parts.append(diag["llm_diagnosis"])
+
+        # 3. Checkpoints
+        elif any(k in low for k in ("checkpoint", "rollback", "revert", "undo")):
+            res = self.execute_action("checkpoints_list", {"engine": engine}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 4. Stop / Unload / Free GPU
+        elif any(k in low for k in ("stop all", "killswitch", "free gpu", "clear vram", "unload all")):
+            res = self.execute_action("stop_all_engines", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+        elif re.search(r"\b(stop|unload)\s+(llama|avalon|strata|maya)\b", low):
+            res = self.execute_action("stop_engine", {"engine": engine}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 5. Workload Router
+        elif any(k in low for k in ("route ", "workload", "best model for coding", "best model for vision", "best model for reasoning", "best model for chat")):
+            task = "coding"
+            for t in ("vision", "reasoning", "long_context", "chat", "coding"):
+                if t.replace("_", " ") in low or t in low:
+                    task = t
+                    break
+            res = self.execute_action("route_workload", {"task": task, "apply": False, "sync_agents": False}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 6. Speculative Decoding
+        elif any(k in low for k in ("speculat", "draft model")):
+            res = self.execute_action("tune_speculation", {"model": model, "apply_best": True}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 7. Benchmark
+        elif any(k in low for k in ("benchmark", "speed test", "tok/s test")):
+            pk = "code" if "code" in low else ("standard" if "standard" in low else "short")
+            res = self.execute_action("run_benchmark", {"prompt_key": pk, "max_tokens": 128}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 8. Coding-Agent Sync
+        elif any(k in low for k in ("sync coding", "register coding", "coding agent", "register in", "opencode", "claude-code", "codex", "aider")):
+            res = self.execute_action("sync_coding_agents", {"source": "auto"}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 9. Thermal Guard
+        elif any(k in low for k in ("thermal", "overheat", "downshift", "gpu temp")):
+            act = "thermal_downshift" if "downshift" in low else "thermal_status"
+            res = self.execute_action(act, {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 10. Local Models / Presets / Memory / Status
+        elif any(k in low for k in ("list models", "local models", "installed models", "my models")):
+            res = self.execute_action("list_models", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+        elif any(k in low for k in ("presets", "saved preset")):
+            res = self.execute_action("presets_list", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+        elif any(k in low for k in ("memory", "past trials", "history")):
+            res = self.execute_action("agent_memory", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+        elif any(k in low for k in ("status", "vitals", "what is running", "what's running", "gpu usage", "vram usage")):
+            res = self.execute_action("system_status", {}, engine=engine, model=model)
+            reply_parts.append(res["reply"])
+            actions.extend(res["actions"])
+
+        # 11. Optimize / Advise / Auto-Tune
         elif any(k in low for k in ("optimi", "config", "tune", "fastest", "longest", "context", "max ctx", "low vram", "moe", "recommend")):
             goal, constraints = self._parse_prompt_constraints(msg, "balanced", {})
             try:
@@ -2214,14 +3073,29 @@ class OptimizerAgent:
                 })
             except Exception as e:
                 reply_parts.append(f"Could not compute advice for {engine}: {e}")
+
+        # 12. General LLM fallback with full live app context
         else:
-            # General question: try LLM with live system context, else helpful deterministic summary
             vit = self.host.vitals(refresh=False)
             mem = self.store.memory_summary(limit=5)
+            engines_st = self._active_engines_summary()
+            local_models = [
+                {"name": m.get("name"), "quant": m.get("quant"), "size_gb": round(float(m.get("size") or 0) / (1024**3), 2), "moe": bool(m.get("moe"))}
+                for m in ((self.host.scan_models() or {}).get("models") or [])[:10]
+            ]
+            caps_summary = [f"{a['id']}: {a['label']}" for a in AGENT_ACTION_TEMPLATES]
             llm_reply = self._llm_complete(
-                "You are the Inference Console Optimization Agent sidebar assistant. Be concise, technical, "
-                "and grounded in the live hardware, engine docs, and persistent memory provided.",
-                f"Hardware: {json.dumps(vit)}\nMemory summary: {json.dumps(mem['best'][:3])}\nUser: {msg}",
+                "You are the Inference Console Agent assistant. You can help with ANY workflow in the app: "
+                "calculating and pulling Hugging Face GGUF quants (assuming empty GPU or free VRAM), "
+                "optimizing/auto-tuning llama.cpp, Avalon, Strata, and Maya, diagnosing crashes, benchmarking, "
+                "workload routing, speculative decoding, thermal guard, checkpoints, and coding-agent sync. "
+                "Be concise, technical, and grounded in the live hardware, models, and engine state provided.",
+                f"Hardware: {json.dumps(vit)}\n"
+                f"Engines: {json.dumps(engines_st)}\n"
+                f"Local models: {json.dumps(local_models)}\n"
+                f"Available app actions: {json.dumps(caps_summary)}\n"
+                f"Memory summary: {json.dumps(mem['best'][:3])}\n"
+                f"User: {msg}",
                 max_tokens=1024,
             )
             if llm_reply:
@@ -2238,13 +3112,14 @@ class OptimizerAgent:
                     )
                 else:
                     reply_parts.append(
-                        "Deterministic mode active (configure an OpenAI-compatible LLM in **Agent → LLM Provider** "
-                        "or **Settings → Optimization Agent**, or load a local model for free-form chat). Try asking:\n"
+                        "Deterministic mode active (open the **Actions** menu above for every app workflow, or configure an LLM in **Agent → LLM Provider**). Try asking:\n"
+                        "- *\"Calculate and pull best quant for Qwen3-32B assuming empty GPU\"*\n"
                         "- *\"Optimize llama.cpp for fastest speed\"*\n"
-                        "- *\"Longest context config for Avalon\"*\n"
-                        "- *\"Diagnose last crash\"*\n"
-                        "- *\"Show checkpoints\"*"
+                        "- *\"Show hardware and engine status\"*\n"
+                        "- *\"Diagnose last crash\"*"
                     )
+                    actions.append({"label": "Calculate & Pull Best Quant", "type": "open_template", "action_id": "hf_quant_empty_gpu"})
+                    actions.append({"label": "Hardware & Engine Status", "type": "send_chat", "message": "Show hardware and engine status"})
 
         reply = "\n\n".join(p for p in reply_parts if p)
         entry = {"ts": time.time(), "user": msg, "reply": reply, "actions": actions}
@@ -2679,27 +3554,52 @@ class OptimizerAgent:
         query: str,
         goal: str = "balanced",
         max_repos: int = 4,
+        assume_empty_gpu: bool = True,
     ) -> dict[str, Any]:
-        """Search Hugging Face GGUF repos and rank best-fitting quants using MoE-aware VRAM+RAM fit math."""
+        """Search Hugging Face GGUF repos and rank best-fitting quants using MoE-aware VRAM+RAM fit math.
+
+        When assume_empty_gpu=True (default), calculates usable VRAM from total GPU VRAM minus
+        vram_reserve_mb, ignoring currently occupied VRAM (for planning a dedicated run).
+        When assume_empty_gpu=False, subtracts currently used GPU VRAM so the quant fits alongside
+        existing GPU workloads.
+        """
         if not self.host.hf_search_fn or not self.host.hf_files_fn:
             raise RuntimeError("HF search hooks are not wired")
         vit = self.host.vitals(refresh=False)
-        usable_vram = max(
-            512.0,
-            float((vit.get("gpu") or {}).get("total_mb") or 8192) - float(self.host.cfg.get("vram_reserve_mb") or 512),
-        )
+        gpu = vit.get("gpu") or {}
+        mem = vit.get("mem") or {}
+        total_mb = float(gpu.get("total_mb") or 8192)
+        used_mb = float(gpu.get("used_mb") or 0)
+        reserve_mb = float(self.host.cfg.get("vram_reserve_mb") or 512)
+        if assume_empty_gpu:
+            usable_vram = max(512.0, total_mb - reserve_mb)
+        else:
+            usable_vram = max(512.0, total_mb - used_mb - reserve_mb)
         avail_ram_mb = max(
             1024.0,
-            (float((vit.get("mem") or {}).get("total_gb") or 32) - float((vit.get("mem") or {}).get("used_gb") or 8)) * 1024.0,
+            (float(mem.get("total_gb") or 32) - float(mem.get("used_gb") or 8)) * 1024.0,
         )
 
         q = query.strip()
+        direct_repo = "/" in q and " " not in q
         if "gguf" not in q.lower():
             q_search = f"{q} GGUF"
         else:
             q_search = q
 
-        repos = self.host.hf_search_fn(q_search) or []
+        repos: list[dict[str, Any]] = []
+        if direct_repo:
+            repos.append({"id": q, "downloads": 0})
+        try:
+            searched = self.host.hf_search_fn(q_search) or []
+            seen = {r.get("id") for r in repos}
+            for r in searched:
+                if r.get("id") not in seen:
+                    repos.append(r)
+                    seen.add(r.get("id"))
+        except Exception:
+            if not direct_repo:
+                raise
         moe_name_re = re.compile(r"(moe|mixtral|a\d+b|deepseek|qwen3.*next|flash.?next|\d+x\d+b)", re.I)
         quant_quality = {
             "Q8_0": 95, "Q6_K": 90, "Q5_K_M": 85, "Q5_K_S": 82,
@@ -2720,6 +3620,7 @@ class OptimizerAgent:
             if not files:
                 continue
 
+            size_by_path = {f["path"]: int(f.get("size") or 0) for f in files if f.get("path")}
             mmprojs = [f["path"] for f in files if "mmproj" in f["path"].lower()]
             drafts = [f["path"] for f in files if any(k in f["path"].lower() for k in ("mtp", "draft"))]
             weights = [
@@ -2776,6 +3677,7 @@ class OptimizerAgent:
                     pull_files.append(mmprojs[0])
                 if drafts and goal in ("fastest", "balanced"):
                     pull_files.append(drafts[0])
+                pull_sizes = {p: size_by_path.get(p, 0) for p in pull_files}
 
                 recommendations.append({
                     "repo": rid,
@@ -2790,6 +3692,7 @@ class OptimizerAgent:
                     "mmproj": mmprojs[0] if mmprojs else "",
                     "draft": drafts[0] if drafts else "",
                     "pull_files": pull_files,
+                    "pull_sizes": pull_sizes,
                     "score": round(score, 1),
                     "notes": moe_info["notes"][:2],
                 })
@@ -2798,6 +3701,14 @@ class OptimizerAgent:
         return {
             "query": query,
             "goal": goal,
-            "hardware_budget": {"usable_vram_mb": round(usable_vram), "avail_ram_mb": round(avail_ram_mb)},
+            "hardware_budget": {
+                "gpu_name": gpu.get("name") or "GPU",
+                "gpu_total_mb": round(total_mb),
+                "gpu_used_mb": round(used_mb),
+                "vram_reserve_mb": round(reserve_mb),
+                "usable_vram_mb": round(usable_vram),
+                "avail_ram_mb": round(avail_ram_mb),
+                "assume_empty_gpu": bool(assume_empty_gpu),
+            },
             "recommendations": recommendations[:10],
         }
