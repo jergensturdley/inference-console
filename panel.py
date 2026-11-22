@@ -3212,11 +3212,81 @@ def _yaml_merge(path, apply):
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     return str(path)
 
+def _strip_jsonc(text):
+    """Strip // and /* */ comments and trailing commas outside JSON strings."""
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                i += 1
+                out.append(text[i])
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "/":
+            i += 2
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and i + 1 < n and text[i + 1] == "*":
+            i += 2
+            while i + 1 < n and not (text[i] == "*" and text[i + 1] == "/"):
+                i += 1
+            i += 2
+        else:
+            out.append(c)
+            i += 1
+    s = "".join(out)
+    res, i, n, in_str = [], 0, len(s), False
+    while i < n:
+        c = s[i]
+        if in_str:
+            res.append(c)
+            if c == "\\" and i + 1 < n:
+                i += 1
+                res.append(s[i])
+            elif c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            res.append(c)
+            i += 1
+        elif c == ",":
+            j = i + 1
+            while j < n and s[j] in " \t\r\n":
+                j += 1
+            if j < n and s[j] in "}]":
+                i += 1
+                continue
+            res.append(c)
+            i += 1
+        else:
+            res.append(c)
+            i += 1
+    return "".join(res)
+
+def _load_jsonc(path, default=None):
+    path = Path(path)
+    if not path.exists():
+        return {} if default is None else default
+    raw = path.read_text()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        cleaned = _strip_jsonc(raw)
+        return json.loads(cleaned) if cleaned.strip() else ({} if default is None else default)
+
 def _json_merge(path, apply):
     path = Path(path)
-    cfg = {}
-    if path.exists():
-        cfg = json.loads(path.read_text())
+    cfg = _load_jsonc(path)
     apply(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2))
@@ -3305,8 +3375,8 @@ def _w_claude(alias, base, ctx, key):
 
 def _w_pi(alias, base, ctx, key):
     path = HOME / ".pi/agent/models.json"
-    cfg = json.loads(path.read_text()) if path.exists() else {
-        "$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}}
+    cfg = _load_jsonc(path, {
+        "$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}})
     cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = {
         "baseUrl": base + "/v1", "api": "openai-completions", "apiKey": key or "none",
         "models": [{"id": alias, "name": alias, "api": "openai-completions",
@@ -3352,13 +3422,14 @@ AGENTS = {
 }
 
 @app.get("/api/agents")
-def api_agents():
+def api_agents(source: str | None = None):
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
+    src = (source or "auto").lower()
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
-            "running": _current_llm(),
+            "running": _current_llm(None if src == "auto" else src),
             "sources": {
                 "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
                 "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
@@ -5714,7 +5785,7 @@ async function send(){
 let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
 async function openAgentsDlg(source){
   AGSRC=source||null;
-  let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
+  let d;try{d=await api('/api/agents'+(AGSRC?'?source='+encodeURIComponent(AGSRC):''))}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
   const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
   const srcOk=!AGSRC||(d.sources&&d.sources[AGSRC]);
@@ -5742,11 +5813,20 @@ $('#ag-apply').addEventListener('click',async()=>{
   apply.disabled=true;apply.textContent='Applying…';
   let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
   catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
+  const resVals=Object.values(r.results||{});
+  const okN=resVals.filter(v=>v.ok).length;
+  const failN=resVals.length-okN;
   $('#agres').innerHTML=Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
-  toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
+  if(failN===0){
+    toast('Registry updated for '+okN+' agent'+(okN===1?'':'s'),'ok');
+  }else if(okN===0){
+    toast('Registry update failed for '+failN+' agent'+(failN===1?'':'s'),'err',10000);
+  }else{
+    toast('Registry updated for '+okN+' agent'+(okN===1?'':'s')+' ('+failN+' failed)','warn',10000);
+  }
   pollStatus();
 });
 
