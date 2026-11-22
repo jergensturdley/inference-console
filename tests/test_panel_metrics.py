@@ -1290,21 +1290,17 @@ def test_parse_ctx_words():
 
 
 def test_strata_status_without_cli_is_not_installed():
-    ov = panel.CFG.get("strata_bin")
-    ov_env = os.environ.get("STRATA_BIN")
+    ov = panel.strata_bin
     try:
-        panel.CFG["strata_bin"] = str(Path(HOME_TMP) / "definitely-missing-strata")
-        os.environ["STRATA_BIN"] = panel.CFG["strata_bin"]
+        # Stub the resolver itself: pointing CFG at a missing path is not enough on
+        # hosts that have a real strata on PATH or in a fallback location.
+        panel.strata_bin = lambda: None
         st = panel.strata_status()
         assert st["installed"] is False
         assert "install.sh" in st["install_cmd"]
         assert st["running"] is False
     finally:
-        panel.CFG["strata_bin"] = ov
-        if ov_env is None:
-            os.environ.pop("STRATA_BIN", None)
-        else:
-            os.environ["STRATA_BIN"] = ov_env
+        panel.strata_bin = ov
 
 
 def test_strata_key_endpoint_masks_by_default():
@@ -1406,24 +1402,19 @@ def test_setup_job_records_failure_state():
 
 
 def test_setup_status_shape_without_binaries():
-    ov_bin, ov_sbin = panel.CFG.get("server_binary"), panel.CFG.get("strata_bin")
-    ov_env = os.environ.get("STRATA_BIN")
+    ov_bin = panel.CFG.get("server_binary")
+    ov_strata_bin = panel.strata_bin
     try:
         missing = str(Path(HOME_TMP) / "no-llama-server")
         panel.CFG["server_binary"] = missing
-        panel.CFG["strata_bin"] = missing
-        os.environ["STRATA_BIN"] = missing
+        panel.strata_bin = lambda: None  # strata: stub the resolver (PATH/fallbacks)
         st = panel.api_setup_status()
         assert st["llama"]["installed"] is False
         assert st["strata"]["installed"] is False
         assert "avalon" in st and "job" in st
     finally:
         panel.CFG["server_binary"] = ov_bin
-        panel.CFG["strata_bin"] = ov_sbin
-        if ov_env is None:
-            os.environ.pop("STRATA_BIN", None)
-        else:
-            os.environ["STRATA_BIN"] = ov_env
+        panel.strata_bin = ov_strata_bin
 
 
 def test_legacy_path_migration_moves_once_and_never_clobbers():
