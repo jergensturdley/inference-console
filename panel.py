@@ -3574,10 +3574,20 @@ def _strata_run(args: list[str], timeout: int = 25) -> dict:
                 "stderr": "", "error": f"could not run strata: {e}"}
     out = (p.stdout or "").strip()
     err = (p.stderr or "").strip()
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = None
+    parsed = None
+    # Strata can append a human-readable summary line after the JSON payload, which
+    # breaks json.loads on the whole stdout. Decode the first JSON value instead;
+    # raw_decode stops at the end of that value and ignores the trailing text.
+    dec = json.JSONDecoder()
+    for idx, ch in enumerate(out):
+        if ch in "{[":
+            try:
+                val, _ = dec.raw_decode(out[idx:])
+            except Exception:
+                continue
+            if isinstance(val, (dict, list)):
+                parsed = val
+                break
     return {"ok": p.returncode == 0, "rc": p.returncode, "installed": True,
             "json": parsed if isinstance(parsed, (dict, list)) else None,
             "stdout": out[:6000], "stderr": err[:2000], "error": None}
@@ -3743,6 +3753,27 @@ def _strata_status_now() -> dict:
                 out["health"] = strata_health(out["port"])
         except (TypeError, ValueError):
             pass
+        runs = j.get("running")
+        if isinstance(runs, list) and runs and isinstance(runs[0], dict):
+            # Strata >= 0.1.62 `--status --output json` shape: {"ok": true, "running":
+            # [{name, profile, state, port, url, ...}]} instead of the older flat
+            # serving/address shape. Same trust level: only lift keys we can name.
+            r0 = runs[0]
+            if out.get("model") in (None, "") and r0.get("name"):
+                out["model"] = r0["name"]
+            if out.get("preset") in (None, "") and r0.get("profile"):
+                out["preset"] = r0["profile"]
+            if out.get("address") in (None, "") and r0.get("url"):
+                out["address"] = r0["url"]
+            try:
+                rp = int(r0.get("port") or 0)
+                if rp > 0:
+                    out["port"] = rp
+                    out["health"] = strata_health(rp)
+            except (TypeError, ValueError):
+                pass
+            if r0.get("state") in ("ready", "loading"):
+                out["running"] = True
         serving = j.get("serving")
         if isinstance(serving, bool):
             out["running"] = serving
