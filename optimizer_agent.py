@@ -30,7 +30,28 @@ import httpx
 from agent_memory import AgentStore
 
 GOALS = ("fastest", "low_latency", "max_context", "balanced", "low_vram", "multi_user")
-ENGINES = ("llama", "avalon", "strata")
+ENGINES = ("llama", "avalon", "strata", "maya")
+
+PROVIDER_PRESETS: dict[str, dict[str, Any]] = {
+    "custom":         {"label": "Custom OpenAI-Compatible",  "url": "",                                                   "api": "openai",    "key_optional": True},
+    "openai":         {"label": "OpenAI",                    "url": "https://api.openai.com/v1",                          "api": "openai",    "key_optional": False},
+    "anthropic":      {"label": "Anthropic (Claude)",        "url": "https://api.anthropic.com/v1",                       "api": "anthropic", "key_optional": False},
+    "openrouter":     {"label": "OpenRouter",                "url": "https://openrouter.ai/api/v1",                       "api": "openai",    "key_optional": False},
+    "google":         {"label": "Google Gemini",             "url": "https://generativelanguage.googleapis.com/v1beta/openai", "api": "openai", "key_optional": False},
+    "deepseek":       {"label": "DeepSeek",                  "url": "https://api.deepseek.com/v1",                        "api": "openai",    "key_optional": False},
+    "xai":            {"label": "xAI (Grok)",                "url": "https://api.x.ai/v1",                                "api": "openai",    "key_optional": False},
+    "groq":           {"label": "Groq",                      "url": "https://api.groq.com/openai/v1",                     "api": "openai",    "key_optional": False},
+    "together":       {"label": "Together AI",               "url": "https://api.together.xyz/v1",                        "api": "openai",    "key_optional": False},
+    "fireworks":      {"label": "Fireworks AI",              "url": "https://api.fireworks.ai/inference/v1",              "api": "openai",    "key_optional": False},
+    "mistral":        {"label": "Mistral AI",                "url": "https://api.mistral.ai/v1",                          "api": "openai",    "key_optional": False},
+    "moonshot":       {"label": "Moonshot / Kimi",           "url": "https://api.moonshot.ai/v1",                         "api": "openai",    "key_optional": False},
+    "zai":            {"label": "Z.ai / Zhipu (GLM)",        "url": "https://api.z.ai/api/paas/v4",                       "api": "openai",    "key_optional": False},
+    "nous":           {"label": "Nous Portal (Hermes)",      "url": "https://inference-api.nousresearch.com/v1",          "api": "openai",    "key_optional": False},
+    "ollama":         {"label": "Ollama (local)",            "url": "http://127.0.0.1:11434/v1",                          "api": "openai",    "key_optional": True},
+    "lmstudio":       {"label": "LM Studio (local)",         "url": "http://127.0.0.1:1234/v1",                           "api": "openai",    "key_optional": True},
+    "vllm":           {"label": "vLLM / llama-server (local)", "url": "http://127.0.0.1:8000/v1",                         "api": "openai",    "key_optional": True},
+    "local_fallback": {"label": "Active Local Engine Only",  "url": "",                                                   "api": "local",     "key_optional": True},
+}
 
 # ----------------------------------------------------------------------------
 # Deep MoE mechanics (baked-in domain knowledge)
@@ -211,6 +232,21 @@ ENGINE_GUIDES: dict[str, dict[str, str]] = {
         "drafting": (
             "Strata supports `--mtp on|off` and `--drafting auto|mtp|dflash2|off`. "
             "Use `--tune quick|thorough` to invoke Strata's internal kernel tuner, or `--set key=value` for advanced overrides."
+        ),
+    },
+    "maya": {
+        "moe": (
+            "Project Maya runs MoE models (hy4 / glm engines on ROCm) by keeping hot routed experts in VRAM "
+            "and streaming remaining experts from system RAM (logged as 'X of Y routed experts in VRAM'). "
+            "Configs are JSON files in ~/project-maya with `exe`, `args`, `ctx`, `--mtp`, `reasoning_effort`, and `sampling`."
+        ),
+        "speed": (
+            "Maya speed tuning: enable `--mtp` in `args` when supported by the config, set `reasoning_effort` to `low` "
+            "for snappy responses, and keep `ctx` moderate (32k-65k) so more routed experts stay resident in GPU VRAM."
+        ),
+        "oom": (
+            "Maya OOM recovery: disable `--mtp` to reclaim draft buffer VRAM, reduce `--ctx` / context length, "
+            "and verify no other engine (llama.cpp / Avalon / Strata) is holding GPU VRAM. Never bind port 8080."
         ),
     },
 }
@@ -433,6 +469,7 @@ class HostContext:
     coding_agents_list: Callable[[], list[str]] | None = None
     hf_search_fn: Callable[[str], list[dict[str, Any]]] | None = None
     hf_files_fn: Callable[[str], list[dict[str, Any]]] | None = None
+    maya_mgr: Any = None
 
 
 # ----------------------------------------------------------------------------
@@ -533,11 +570,24 @@ class OptimizerAgent:
     def capture_checkpoint(self, engine: str, label: str = "", reason: str = "") -> dict[str, Any]:
         """Capture full restorable state across engines & configs before any mutation."""
         profiles = self.host.read_json(self.host.launch_profiles_path, {})
+        maya_status = {}
+        maya_configs_backup = {}
+        if self.host.maya_mgr:
+            try:
+                maya_status = self.host.maya_mgr.status()
+                for c in self.host.maya_mgr.discover_configs():
+                    p = Path(c["path"])
+                    if p.is_file():
+                        maya_configs_backup[c["path"]] = p.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
         snapshot = {
             "engine": engine,
             "llama_status": self.host.mgr.status(),
             "avalon_status": self.host.smgr.status(),
             "strata_status": self.host.strata_status(refresh=False),
+            "maya_status": maya_status,
+            "maya_configs": maya_configs_backup,
             "launch_profiles": copy.deepcopy(profiles),
             "avalon_tune": copy.deepcopy(self.host.cfg.get("avalon_tune") or {}),
             "strata_last": copy.deepcopy(self.host.cfg.get("strata_last") or {}),
@@ -569,6 +619,13 @@ class OptimizerAgent:
             self.host.cfg["vram_reserve_mb"] = snap["vram_reserve_mb"]
         if "ctx" in snap:
             self.host.cfg["ctx"] = snap["ctx"]
+        for cpath, raw_txt in (snap.get("maya_configs") or {}).items():
+            try:
+                p = Path(cpath)
+                if p.parent.is_dir():
+                    p.write_text(raw_txt, encoding="utf-8")
+            except OSError:
+                pass
         self.host.save_config()
 
         relaunch_result = None
@@ -602,6 +659,12 @@ class OptimizerAgent:
                     relaunch_result = self.host.smgr.start(st["profile"], tune)
                 else:
                     self.host.smgr.stop()
+            elif eng == "maya" and self.host.maya_mgr:
+                st = snap.get("maya_status") or {}
+                if st.get("running") and st.get("config_id"):
+                    relaunch_result = self.host.maya_mgr.switch(st["config_id"])
+                else:
+                    self.host.maya_mgr.stop()
 
         return {
             "ok": True,
@@ -640,6 +703,8 @@ class OptimizerAgent:
             rec = self._advise_llama(model=model, goal=goal, constraints=constraints, vit=vit)
         elif engine == "avalon":
             rec = self._advise_avalon(profile=profile, goal=goal, constraints=constraints, vit=vit)
+        elif engine == "maya":
+            rec = self._advise_maya(model=model, goal=goal, constraints=constraints, vit=vit)
         else:
             rec = self._advise_strata(model=model, goal=goal, constraints=constraints, vit=vit)
 
@@ -1003,6 +1068,147 @@ class OptimizerAgent:
             "docs_consulted": self.docs.lookup("strata", "kv_cache")["guides"],
         }
 
+    def _advise_maya(
+        self,
+        *,
+        model: str,
+        goal: str,
+        constraints: dict[str, Any],
+        vit: dict[str, Any],
+    ) -> dict[str, Any]:
+        if not self.host.maya_mgr:
+            raise ValueError("Project Maya manager is not configured")
+        configs = self.host.maya_mgr.discover_configs() or []
+        if not configs:
+            raise ValueError("No Project Maya JSON configs found in maya_dir (~/project-maya)")
+
+        chosen = None
+        if model:
+            ml = model.strip().lower()
+            chosen = next(
+                (c for c in configs if ml in (c.get("id", "").lower(), c.get("model_name", "").lower(), c.get("path", "").lower())),
+                None,
+            )
+            if not chosen:
+                chosen = next((c for c in configs if ml in c.get("id", "").lower() or ml in c.get("model_name", "").lower()), None)
+        if not chosen:
+            # Pick best available config for goal
+            avail = [c for c in configs if c.get("available")] or configs
+            if goal == "fastest":
+                chosen = sorted(avail, key=lambda c: (bool(c.get("mtp")), -(c.get("dir_size_bytes") or 0)), reverse=True)[0]
+            elif goal == "max_context":
+                chosen = sorted(avail, key=lambda c: int(c.get("ctx") or 0), reverse=True)[0]
+            else:
+                chosen = avail[0]
+
+        cur_ctx = int(chosen.get("ctx") or 32768)
+        notes: list[str] = [
+            f"Project Maya config `{chosen['id']}` ({chosen.get('engine', 'glm')}, {chosen.get('quant') or 'custom quant'}) "
+            "uses MoE expert-in-VRAM streaming so models larger than GPU VRAM run cleanly."
+        ]
+
+        if goal == "fastest":
+            ctx = min(cur_ctx, 32768)
+            mtp = True
+            reasoning = "low"
+            notes.append("Enabled `--mtp` and set `reasoning_effort: low` with 32k ctx to keep more routed experts resident in VRAM.")
+        elif goal == "low_latency":
+            ctx = min(cur_ctx, 16384)
+            mtp = True
+            reasoning = "low"
+            notes.append("Trimmed context to 16k with `--mtp` enabled for minimal TTFT and maximum VRAM expert residency.")
+        elif goal == "max_context":
+            ctx = max(cur_ctx, 131072)
+            mtp = False
+            reasoning = chosen.get("reasoning_effort") or "medium"
+            notes.append("Disabled `--mtp` to free draft VRAM for a deeper KV cache window (131k+).")
+        elif goal == "low_vram":
+            ctx = min(cur_ctx, 16384)
+            mtp = False
+            reasoning = "low"
+            notes.append("Disabled `--mtp` and reduced context to 16k to minimize GPU VRAM and thermals.")
+        else:  # balanced / multi_user
+            ctx = max(32768, min(cur_ctx, 65536))
+            mtp = bool(chosen.get("mtp", True))
+            reasoning = chosen.get("reasoning_effort") or "medium"
+            if goal == "multi_user" and chosen.get("engine") == "hy4":
+                notes.append("Note: Maya `hy4` serves 1 request at a time; prefer a `glm` Maya config or llama.cpp/Strata for multi-user concurrency.")
+
+        if constraints.get("min_ctx"):
+            ctx = max(ctx, int(constraints["min_ctx"]))
+
+        cfg = {
+            "config_id": chosen["id"],
+            "config_path": chosen["path"],
+            "model_name": chosen["model_name"],
+            "engine_flavor": chosen.get("engine", "glm"),
+            "ctx": ctx,
+            "mtp": mtp,
+            "reasoning_effort": reasoning,
+        }
+
+        usable_vram = max(512.0, float((vit.get("gpu") or {}).get("total_mb") or 20480) - float(self.host.cfg.get("vram_reserve_mb") or 512))
+        avail_ram_mb = max(1024.0, (float((vit.get("mem") or {}).get("total_gb") or 64) - float((vit.get("mem") or {}).get("used_gb") or 10)) * 1024.0)
+        moe_info = analyze_moe_mechanics(
+            {"size": chosen.get("dir_size_bytes") or 0, "blocks": 48, "moe": True, "experts": 64, "experts_used": 8},
+            usable_vram_mb=usable_vram,
+            avail_ram_mb=avail_ram_mb,
+            kv_vram_mb=1536.0 if ctx >= 65536 else 768.0,
+        )
+
+        return {
+            "engine": "maya",
+            "goal": goal,
+            "model_key": chosen["model_name"],
+            "config": cfg,
+            "moe": moe_info,
+            "notes": notes,
+            "docs_consulted": self.docs.lookup("maya", "moe")["guides"],
+        }
+
+    def _patch_maya_json_config(self, cfg: dict[str, Any]) -> str:
+        """Apply tuned ctx / --mtp / reasoning_effort fields to a Maya JSON config file safely."""
+        if not self.host.maya_mgr:
+            raise ValueError("Project Maya manager is not configured")
+        ref = cfg.get("config_id") or cfg.get("config_path") or ""
+        found = self.host.maya_mgr._find_config(ref)
+        if not found:
+            configs = self.host.maya_mgr.discover_configs() or []
+            if not configs:
+                raise ValueError("No Project Maya config found")
+            found = self.host.maya_mgr._find_config(configs[0]["id"])
+        cfg_path, raw, pub = found
+        updated = copy.deepcopy(raw)
+
+        # Update --mtp and --ctx / -c in args list if present, plus top-level ctx & reasoning_effort
+        args = list(updated.get("args") or []) if isinstance(updated.get("args"), list) else []
+        if "mtp" in cfg:
+            want_mtp = bool(cfg["mtp"])
+            args = [a for a in args if str(a) != "--mtp"]
+            if want_mtp:
+                args.append("--mtp")
+        if cfg.get("ctx"):
+            ctx_val = int(cfg["ctx"])
+            updated["ctx"] = ctx_val
+            # Also update --ctx / -c / --context in args if present
+            replaced = False
+            for i, a in enumerate(args):
+                if str(a) in ("--ctx", "-c", "--context") and i + 1 < len(args):
+                    args[i + 1] = str(ctx_val)
+                    replaced = True
+                    break
+            if not replaced and any(str(a).startswith("--ctx=") for a in args):
+                args = [f"--ctx={ctx_val}" if str(a).startswith("--ctx=") else a for a in args]
+        if isinstance(updated.get("args"), list) or args:
+            updated["args"] = args
+        if cfg.get("reasoning_effort"):
+            updated["reasoning_effort"] = str(cfg["reasoning_effort"])
+
+        tmp = cfg_path.with_suffix(cfg_path.suffix + ".tmp")
+        tmp.write_text(json.dumps(updated, indent=2), encoding="utf-8")
+        tmp.replace(cfg_path)
+        return pub["id"]
+
     # ------------------------------------------------------------ Apply config (with auto-checkpoint)
     def apply_config(
         self,
@@ -1065,12 +1271,21 @@ class OptimizerAgent:
                 body = self.host.strata_launch_body_cls(**body_kwargs, plan=False)
                 args = self.host.strata_build_args(body, plan=False)
                 r = self.host.strata_run(args, timeout=180)
-                result["launch"] = {
-                    "ok": r.returncode == 0,
-                    "returncode": r.returncode,
-                    "stdout": (r.stdout or "")[-2000:],
-                    "stderr": (r.stderr or "")[-2000:],
-                }
+                if isinstance(r, dict):
+                    result["launch"] = r
+                else:
+                    result["launch"] = {
+                        "ok": getattr(r, "returncode", 1) == 0,
+                        "returncode": getattr(r, "returncode", 1),
+                        "stdout": (getattr(r, "stdout", "") or "")[-2000:],
+                        "stderr": (getattr(r, "stderr", "") or "")[-2000:],
+                    }
+        elif engine == "maya":
+            cid = self._patch_maya_json_config(config)
+            result["maya_config_id"] = cid
+            if launch and self.host.maya_mgr:
+                cur = self.host.maya_mgr.status()
+                result["launch"] = self.host.maya_mgr.switch(cid) if cur.get("running") else self.host.maya_mgr.start(cid)
         else:
             raise ValueError(f"Unsupported engine: {engine}")
 
@@ -1246,6 +1461,18 @@ class OptimizerAgent:
             else:
                 c2 = copy.deepcopy(base); c2["kv"] = "k8v4"
                 cands.append({"label": "k8v4-kv", "config": c2})
+
+        elif engine == "maya":
+            if goal == "fastest":
+                c2 = copy.deepcopy(base); c2["mtp"] = False
+                c3 = copy.deepcopy(base); c3["mtp"] = True; c3["ctx"] = 16384; c3["reasoning_effort"] = "low"
+                cands.extend([{"label": "no-mtp-compare", "config": c2}, {"label": "tight-16k-mtp", "config": c3}])
+            elif goal == "max_context":
+                c2 = copy.deepcopy(base); c2["ctx"] = min(262144, int(base.get("ctx") or 65536) * 2); c2["mtp"] = False
+                cands.append({"label": "ctx-2x-no-mtp", "config": c2})
+            else:
+                c2 = copy.deepcopy(base); c2["mtp"] = not bool(base.get("mtp", True))
+                cands.append({"label": "toggle-mtp", "config": c2})
 
         # Deduplicate identical configs
         seen: set[str] = set()
@@ -1455,7 +1682,14 @@ class OptimizerAgent:
                 body = self.host.strata_launch_body_cls(**body_kwargs, plan=False, restart=True)
                 args = self.host.strata_build_args(body, plan=False)
                 r = self.host.strata_run(args, timeout=120)
+                if isinstance(r, dict):
+                    return bool(r.get("ok")), str(r.get("error") or r.get("stderr") or r.get("stdout") or "")[-400:]
                 return (r.returncode == 0), (r.stderr or r.stdout or "")[-400:]
+            if engine == "maya" and self.host.maya_mgr:
+                cid = self._patch_maya_json_config(cfg)
+                cur = self.host.maya_mgr.status()
+                res = self.host.maya_mgr.switch(cid) if cur.get("running") else self.host.maya_mgr.start(cid)
+                return bool(res.get("running", True) or res.get("ok", True)), str(res.get("error") or "")
         except Exception as e:
             return False, str(e)
         return False, "unknown engine"
@@ -1466,6 +1700,12 @@ class OptimizerAgent:
             return "\n".join(list(getattr(self.host.mgr, "logbuf", []))[-lines:])
         if engine == "avalon":
             return "\n".join(list(getattr(self.host.smgr, "logbuf", []))[-lines:])
+        if engine == "maya" and self.host.maya_mgr:
+            try:
+                t = self.host.maya_mgr.tail_log(max_lines=lines)
+                return str(t.get("log") or "") if isinstance(t, dict) else str(t or "")
+            except Exception:
+                return ""
         if engine == "strata":
             try:
                 if self.host.strata_log_path.exists():
@@ -1541,6 +1781,11 @@ class OptimizerAgent:
                 fix_config["parallel"] = 1
                 fix_config["context"] = "16k"
                 steps.append("Switched Strata to `--kv q4_0 --parallel 1 --context 16k`.")
+            elif engine == "maya":
+                fix_config["mtp"] = False
+                fix_config["ctx"] = max(8192, int(fix_config.get("ctx") or 32768) // 2)
+                fix_config["reasoning_effort"] = "low"
+                steps.append("Disabled Maya `--mtp` draft buffer and halved context to free VRAM for routed experts.")
 
         elif pattern_id == "fa_required_for_kv":
             fix_config["fa"] = "on"
@@ -1597,18 +1842,157 @@ class OptimizerAgent:
         )
         return {"ok": True, "diagnosis": diag, "applied": applied}
 
-    # ------------------------------------------------------------ Optional OpenAI-compatible LLM layer
+    # ------------------------------------------------------------ Optional LLM Provider Layer (Hermes-style presets + Custom + Model Polling)
+    def _provider_api_style(self, provider_id: str, url: str) -> str:
+        p = PROVIDER_PRESETS.get(provider_id or "")
+        if p:
+            return p["api"]
+        if "anthropic.com" in (url or "").lower():
+            return "anthropic"
+        return "openai"
+
+    def _custom_headers(self) -> dict[str, str]:
+        raw = self.host.cfg.get("agent_llm_headers")
+        if isinstance(raw, dict):
+            return {str(k): str(v) for k, v in raw.items() if k and v is not None}
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = json.loads(raw)
+                if isinstance(parsed, dict):
+                    return {str(k): str(v) for k, v in parsed.items() if k and v is not None}
+            except Exception:
+                pass
+        return {}
+
     def llm_status(self) -> dict[str, Any]:
-        url = (self.host.cfg.get("agent_llm_url") or "").strip()
+        provider = (self.host.cfg.get("agent_llm_provider") or "").strip() or "custom"
+        preset = PROVIDER_PRESETS.get(provider) or PROVIDER_PRESETS["custom"]
+        url = (self.host.cfg.get("agent_llm_url") or "").strip() or preset.get("url", "")
         model = (self.host.cfg.get("agent_llm_model") or "").strip()
         key = (self.host.cfg.get("agent_llm_key") or "").strip()
         fallback = bool(self.host.cfg.get("agent_llm_fallback_local", True))
         local = self.host.chat_target()
-        if url and model:
-            return {"available": True, "mode": "external", "url": url, "model": model, "key_set": bool(key)}
-        if fallback and local:
-            return {"available": True, "mode": "local_fallback", "port": local[0], "model": "active-local-engine"}
-        return {"available": False, "mode": "deterministic_only"}
+        if provider != "local_fallback" and url and model:
+            return {
+                "available": True,
+                "mode": "external",
+                "provider": provider,
+                "provider_label": preset["label"],
+                "api_style": self._provider_api_style(provider, url),
+                "url": url,
+                "model": model,
+                "key_set": bool(key),
+            }
+        if (fallback or provider == "local_fallback") and local:
+            return {
+                "available": True,
+                "mode": "local_fallback",
+                "provider": "local_fallback",
+                "provider_label": "Active Local Engine",
+                "port": local[0],
+                "model": "active-local-engine",
+            }
+        return {
+            "available": False,
+            "mode": "deterministic_only",
+            "provider": provider,
+            "provider_label": preset["label"],
+            "url": url,
+            "model": model,
+            "key_set": bool(key),
+        }
+
+    def fetch_provider_models(
+        self,
+        *,
+        provider: str | None = None,
+        url: str | None = None,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        """Always-on model polling for any configured or custom provider (OpenAI-compat, Anthropic, Ollama, or local)."""
+        prov = (provider if provider is not None else (self.host.cfg.get("agent_llm_provider") or "custom")).strip() or "custom"
+        preset = PROVIDER_PRESETS.get(prov) or PROVIDER_PRESETS["custom"]
+        base_url = (url if url is not None else (self.host.cfg.get("agent_llm_url") or "")).strip() or preset.get("url", "")
+        key = (api_key if api_key is not None else (self.host.cfg.get("agent_llm_key") or "")).strip()
+        if key in ("", "__keep__"):
+            key = (self.host.cfg.get("agent_llm_key") or "").strip()
+
+        if prov == "local_fallback" or (not base_url and self.host.chat_target()):
+            tgt = self.host.chat_target()
+            if not tgt:
+                return {"ok": False, "provider": prov, "models": [], "error": "No active local engine running"}
+            base_url = f"http://127.0.0.1:{tgt[0]}/v1"
+            key = tgt[1] or ""
+
+        if not base_url:
+            return {"ok": False, "provider": prov, "models": [], "error": "Enter a Base URL to poll models"}
+
+        api_style = self._provider_api_style(prov, base_url)
+        clean_base = base_url.rstrip("/")
+        if clean_base.endswith("/chat/completions"):
+            clean_base = clean_base[: -len("/chat/completions")]
+        elif clean_base.endswith("/messages"):
+            clean_base = clean_base[: -len("/messages")]
+
+        headers = self._custom_headers()
+        if api_style == "anthropic":
+            if key:
+                headers["x-api-key"] = key
+            headers.setdefault("anthropic-version", "2023-06-01")
+        elif key:
+            headers["Authorization"] = f"Bearer {key}"
+
+        models: list[str] = []
+        last_err = ""
+        try:
+            r = httpx.get(f"{clean_base}/models", headers=headers, timeout=httpx.Timeout(6.0, read=12.0))
+            r.raise_for_status()
+            data = r.json()
+            raw_list = data.get("data") if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            if isinstance(data, dict) and not raw_list and isinstance(data.get("models"), list):
+                raw_list = data["models"]
+            for item in raw_list or []:
+                if isinstance(item, str):
+                    models.append(item)
+                elif isinstance(item, dict):
+                    mid = item.get("id") or item.get("name") or item.get("model")
+                    if mid:
+                        models.append(str(mid))
+        except Exception as e:
+            last_err = str(e)
+            # Ollama native /api/tags fallback if /v1/models fails
+            if prov == "ollama" or ":11434" in clean_base:
+                try:
+                    root = clean_base[:-3] if clean_base.endswith("/v1") else clean_base
+                    r2 = httpx.get(f"{root}/api/tags", timeout=httpx.Timeout(4.0, read=8.0))
+                    r2.raise_for_status()
+                    for item in (r2.json().get("models") or []):
+                        if isinstance(item, dict) and item.get("name"):
+                            models.append(str(item["name"]))
+                    last_err = ""
+                except Exception as e2:
+                    last_err = str(e2)
+
+        uniq = sorted(set(models))
+        return {
+            "ok": bool(uniq) or not last_err,
+            "provider": prov,
+            "url": clean_base,
+            "count": len(uniq),
+            "models": uniq[:300],
+            "error": last_err if not uniq else "",
+        }
+
+    def test_provider(self) -> dict[str, Any]:
+        t0 = time.perf_counter()
+        st = self.llm_status()
+        if not st.get("available"):
+            return {"ok": False, "latency_ms": 0, "error": "No LLM provider configured (set Base URL + Model, or start a local engine)"}
+        reply = self._llm_complete("Reply with the single word OK.", "Ping", max_tokens=16)
+        ms = round((time.perf_counter() - t0) * 1000)
+        if reply:
+            return {"ok": True, "latency_ms": ms, "reply": reply[:120], "status": st}
+        return {"ok": False, "latency_ms": ms, "error": "Provider request failed — check Base URL, API key, and model ID", "status": st}
 
     def _llm_complete(self, system_prompt: str, user_message: str, max_tokens: int = 500) -> str | None:
         st = self.llm_status()
@@ -1616,26 +2000,41 @@ class OptimizerAgent:
             return None
         if st["mode"] == "external":
             base = st["url"].rstrip("/")
-            endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
-            headers = {"Content-Type": "application/json"}
+            headers = {"Content-Type": "application/json", **self._custom_headers()}
             key = (self.host.cfg.get("agent_llm_key") or "").strip()
-            if key:
-                headers["Authorization"] = f"Bearer {key}"
-            payload = {
-                "model": st["model"],
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user_message},
-                ],
-                "temperature": 0.2,
-                "max_tokens": max_tokens,
-            }
+            api_style = st.get("api_style", "openai")
+            if api_style == "anthropic":
+                endpoint = base if base.endswith("/messages") else f"{base}/messages"
+                if key:
+                    headers["x-api-key"] = key
+                headers.setdefault("anthropic-version", "2023-06-01")
+                payload = {
+                    "model": st["model"],
+                    "system": system_prompt,
+                    "messages": [{"role": "user", "content": user_message}],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                }
+            else:
+                endpoint = base if base.endswith("/chat/completions") else f"{base}/chat/completions"
+                if key:
+                    headers["Authorization"] = f"Bearer {key}"
+                payload = {
+                    "model": st["model"],
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message},
+                    ],
+                    "temperature": 0.2,
+                    "max_tokens": max_tokens,
+                }
         else:
             port, key = self.host.chat_target() or (None, "")
             if not port:
                 return None
             endpoint = f"http://127.0.0.1:{port}/v1/chat/completions"
             headers = {"Authorization": f"Bearer {key}"} if key else {}
+            api_style = "openai"
             payload = {
                 "messages": [
                     {"role": "system", "content": system_prompt},
@@ -1648,6 +2047,10 @@ class OptimizerAgent:
             r = httpx.post(endpoint, headers=headers, json=payload, timeout=httpx.Timeout(10.0, read=45.0))
             r.raise_for_status()
             data = r.json()
+            if api_style == "anthropic":
+                blocks = data.get("content") or []
+                txt = "".join(b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text").strip()
+                return txt or None
             msg = ((data.get("choices") or [{}])[0].get("message") or {})
             return (msg.get("content") or "").strip() or None
         except Exception:
@@ -1698,7 +2101,7 @@ class OptimizerAgent:
         reply_parts: list[str] = []
 
         # Detect engine override in message
-        for eng_kw, eng_id in (("llama.cpp", "llama"), ("llama", "llama"), ("avalon", "avalon"), ("strata", "strata")):
+        for eng_kw, eng_id in (("llama.cpp", "llama"), ("llama", "llama"), ("avalon", "avalon"), ("strata", "strata"), ("maya", "maya")):
             if eng_kw in low:
                 engine = eng_id
                 break
@@ -1818,6 +2221,18 @@ class OptimizerAgent:
             )
             return {"ok": True, "engine": "strata", "detail": "Downshifted Strata to low_vram profile", "applied": applied}
 
+        if self.host.maya_mgr and self.host.maya_mgr.status().get("running"):
+            ms = self.host.maya_mgr.status()
+            rec = self.advise(engine="maya", goal="low_vram", model=ms.get("config_id") or "", use_llm=False)
+            applied = self.apply_config(
+                engine="maya",
+                config=rec["config"],
+                launch=True,
+                goal="low_vram",
+                checkpoint_label="Before thermal/VRAM downshift (maya)",
+            )
+            return {"ok": True, "engine": "maya", "detail": "Downshifted Maya to low_vram profile", "applied": applied}
+
         return {"ok": True, "engine": "none", "detail": "No active inference engine running to downshift"}
 
     def emergency_killswitch(self) -> dict[str, Any]:
@@ -1834,6 +2249,12 @@ class OptimizerAgent:
             try:
                 self.host.strata_stop()
                 stopped.append("strata")
+            except Exception:
+                pass
+        if self.host.maya_mgr and self.host.maya_mgr.status().get("running"):
+            try:
+                self.host.maya_mgr.stop()
+                stopped.append("maya")
             except Exception:
                 pass
         return {"ok": True, "checkpoint_id": cp["id"], "stopped": stopped}
@@ -1951,6 +2372,34 @@ class OptimizerAgent:
                 "reasons": ["Avalon Flash-Next MoE pack available with `-fit on` GPU/RAM split"],
             })
 
+        # Also consider Project Maya configs for coding / long_doc / reasoning / fast_chat
+        if self.host.maya_mgr and task in ("reasoning", "coding", "long_doc", "fast_chat"):
+            try:
+                for mc in self.host.maya_mgr.discover_configs():
+                    if not mc.get("available"):
+                        continue
+                    ms = 44.0
+                    mreasons = [f"Project Maya ({mc.get('engine', 'glm')}, {mc.get('quant') or 'MoE'}) available"]
+                    if task in ("reasoning", "coding"):
+                        ms += 14.0
+                    if task == "long_doc" and int(mc.get("ctx") or 0) >= 65536:
+                        ms += 20.0
+                        mreasons.append(f"Context {int(mc['ctx']):,}")
+                    if mc.get("mtp") and task in ("fast_chat", "coding"):
+                        ms += 8.0
+                        mreasons.append("MTP drafting enabled")
+                    if mem_winner and mem_winner.get("engine") == "maya" and mem_winner.get("model_key") == mc.get("model_name"):
+                        ms += 25.0
+                    candidates.append({
+                        "engine": "maya",
+                        "maya_config": mc,
+                        "model_key": mc.get("model_name") or mc["id"],
+                        "score": round(ms, 2),
+                        "reasons": mreasons,
+                    })
+            except Exception:
+                pass
+
         if not candidates:
             raise ValueError(f"No feasible local model found for workload '{task}'")
 
@@ -1962,6 +2411,14 @@ class OptimizerAgent:
                 engine="llama",
                 goal=goal,
                 model=winner["model"]["path"],
+                constraints={"min_ctx": 32768} if task in ("coding", "long_doc") else None,
+                use_llm=False,
+            )
+        elif winner["engine"] == "maya":
+            advice = self.advise(
+                engine="maya",
+                goal=goal,
+                model=winner["maya_config"]["id"],
                 constraints={"min_ctx": 32768} if task in ("coding", "long_doc") else None,
                 use_llm=False,
             )

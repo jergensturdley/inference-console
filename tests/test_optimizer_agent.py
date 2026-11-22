@@ -487,3 +487,145 @@ def test_panel_phase2_thermal_endpoint():
     upd = panel.api_agent_thermal_config(panel.AgentThermalConfigBody(warn_temp_c=82, auto_act=False))
     assert upd["ok"] is True and upd["config"]["warn_temp_c"] == 82
 
+
+# ---------------------------------------------------------------- Maya Engine + Custom Providers & Model Polling
+def test_maya_advise_apply_checkpoint_restore_and_diagnose(tmp_path):
+    maya_dir = tmp_path / "project-maya"
+    maya_dir.mkdir(parents=True)
+    cfg_file = maya_dir / "qwen-maya.json"
+    orig_cfg = {
+        "exe": "/bin/true",
+        "model_name": "Qwen3-Maya-MoE",
+        "port": 8098,
+        "ctx": 32768,
+        "args": ["--ctx", "32768", "--mtp"],
+        "reasoning_effort": "medium",
+    }
+    cfg_file.write_text(json.dumps(orig_cfg, indent=2))
+
+    class FakeMayaMgr:
+        def discover_configs(self):
+            raw = json.loads(cfg_file.read_text())
+            return [{
+                "id": "qwen-maya",
+                "path": str(cfg_file),
+                "model_name": raw["model_name"],
+                "engine": "glm",
+                "quant": "maya-xs",
+                "ctx": raw["ctx"],
+                "mtp": "--mtp" in raw.get("args", []),
+                "port": raw["port"],
+                "reasoning_effort": raw.get("reasoning_effort"),
+                "dir_size_bytes": 40 * 1024**3,
+                "available": True,
+            }]
+
+        def _find_config(self, ref):
+            raw = json.loads(cfg_file.read_text())
+            pub = self.discover_configs()[0]
+            return cfg_file, raw, pub
+
+        def status(self):
+            return {"running": False, "config_id": "qwen-maya"}
+
+        def start(self, cid):
+            return {"ok": True, "running": True, "config_id": cid}
+
+        def switch(self, cid):
+            return {"ok": True, "running": True, "config_id": cid}
+
+        def stop(self):
+            return {"ok": True}
+
+        def tail_log(self, max_lines=150):
+            return {"log": "HIP out of memory while allocating KV cache"}
+
+    agent, _, _, host = _make_stub_agent(tmp_path)
+    host.maya_mgr = FakeMayaMgr()
+
+    # 1. Advise Maya for max_context (should disable --mtp and boost ctx >= 131072)
+    rec = agent.advise(engine="maya", goal="max_context", use_llm=False)
+    assert rec["engine"] == "maya"
+    assert rec["config"]["mtp"] is False
+    assert rec["config"]["ctx"] >= 131072
+    assert rec["moe"]["is_moe"] is True
+
+    # 2. Apply creates checkpoint & patches Maya JSON config
+    applied = agent.apply_config(engine="maya", config=rec["config"], launch=False, goal="max_context")
+    patched = json.loads(cfg_file.read_text())
+    assert patched["ctx"] >= 131072
+    assert "--mtp" not in patched["args"]
+
+    # 3. Restore checkpoint reverts Maya JSON config cleanly back to original!
+    agent.restore_checkpoint(applied["checkpoint_id"], relaunch=False)
+    reverted = json.loads(cfg_file.read_text())
+    assert reverted["ctx"] == 32768
+    assert "--mtp" in reverted["args"]
+
+    # 4. Diagnose Maya OOM from Maya log tail
+    diag = agent.diagnose_failure(engine="maya", last_config={"ctx": 65536, "mtp": True}, use_llm=False)
+    assert diag["pattern_id"] == "vram_oom"
+    assert diag["fix_config"]["mtp"] is False
+    assert diag["fix_config"]["ctx"] == 32768
+
+    # 5. Sidebar chat recognizes Maya
+    chat_r = agent.chat("Optimize Maya for fastest speed")
+    assert "MAYA recommendation" in chat_r["reply"]
+    assert any(a["engine"] == "maya" for a in chat_r["actions"])
+
+
+def test_hermes_provider_presets_custom_provider_and_model_polling(tmp_path, monkeypatch):
+    from optimizer_agent import PROVIDER_PRESETS
+
+    for expected in ("custom", "openai", "anthropic", "openrouter", "google", "deepseek", "xai", "groq", "together", "fireworks", "mistral", "moonshot", "zai", "nous", "ollama", "lmstudio", "vllm"):
+        assert expected in PROVIDER_PRESETS
+
+    # Test Panel provider endpoints (custom provider + masked key)
+    panel.api_agent_provider_set(panel.AgentProviderBody(
+        provider="custom",
+        url="https://my-custom-llm.internal/v1",
+        model="my-custom-model",
+        api_key="sk-custom-99887766",
+        headers='{"X-Custom": "1"}',
+        fallback_local=True,
+    ))
+    got = panel.api_agent_provider_get()
+    assert got["provider"] == "custom"
+    assert got["url"] == "https://my-custom-llm.internal/v1"
+    assert got["model"] == "my-custom-model"
+    assert got["key_set"] is True and got["key_masked"] != "sk-custom-99887766"
+
+    # Stub httpx.get to verify model polling for OpenAI-compatible & Anthropic providers
+    seen_calls = []
+
+    class FakeResp:
+        def __init__(self, payload):
+            self._p = payload
+
+        def raise_for_status(self):
+            pass
+
+        def json(self):
+            return self._p
+
+    def fake_get(url, headers=None, timeout=None):
+        seen_calls.append((url, headers or {}))
+        return FakeResp({"data": [{"id": "model-b"}, {"id": "model-a"}]})
+
+    import optimizer_agent
+    monkeypatch.setattr(optimizer_agent.httpx, "get", fake_get)
+
+    agent, _, _, _ = _make_stub_agent(tmp_path)
+    polled = agent.fetch_provider_models(provider="custom", url="https://my-custom-llm.internal/v1", api_key="sk-abc")
+    assert polled["ok"] is True
+    assert polled["models"] == ["model-a", "model-b"]
+    assert seen_calls[-1][0] == "https://my-custom-llm.internal/v1/models"
+    assert seen_calls[-1][1].get("Authorization") == "Bearer sk-abc"
+
+    # Anthropic uses x-api-key + anthropic-version header
+    polled_anth = agent.fetch_provider_models(provider="anthropic", api_key="sk-ant-123")
+    assert polled_anth["ok"] is True
+    assert seen_calls[-1][1].get("x-api-key") == "sk-ant-123"
+    assert "anthropic-version" in seen_calls[-1][1]
+
+

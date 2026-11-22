@@ -45,10 +45,12 @@ DEFAULT_CONFIG = {
     "strata_ctx": 8192,
     "strata_api_key": "",
     "strata_last": {},           # address/model reported by the last successful launch
-    # Optional OpenAI-compatible LLM for the Optimization Agent (empty = deterministic + local fallback)
+    # Optional LLM provider for the Optimization Agent (empty = deterministic + local fallback)
+    "agent_llm_provider": "custom",
     "agent_llm_url": "",
     "agent_llm_key": "",
     "agent_llm_model": "",
+    "agent_llm_headers": "",
     "agent_llm_fallback_local": True,
     "thermal_guard": {},         # graduated GPU thermal & VRAM pressure guard settings
     # Project Maya (~/project-maya). Empty means use MAYA_DIR / MAYA_ROCM_PATH defaults.
@@ -4375,9 +4377,11 @@ class SettingsBody(BaseModel):
     strata_bin: str | None = None
     strata_alias: str | None = None
     strata_api_key: str | None = None
+    agent_llm_provider: str | None = None
     agent_llm_url: str | None = None
     agent_llm_key: str | None = None
     agent_llm_model: str | None = None
+    agent_llm_headers: str | None = None
     agent_llm_fallback_local: bool | None = None
 
 @app.get("/api/settings")
@@ -4425,8 +4429,10 @@ def api_settings_get():
         "strata_api_key_set": bool(skey),
         "strata_api_key_masked": skey_masked,
         "strata_ctx": int(CFG.get("strata_ctx", 8192) or 8192),
+        "agent_llm_provider": CFG.get("agent_llm_provider", "custom"),
         "agent_llm_url": CFG.get("agent_llm_url", ""),
         "agent_llm_model": CFG.get("agent_llm_model", ""),
+        "agent_llm_headers": CFG.get("agent_llm_headers", ""),
         "agent_llm_key_set": bool(akey),
         "agent_llm_key_masked": akey_masked,
         "agent_llm_fallback_local": bool(CFG.get("agent_llm_fallback_local", True)),
@@ -4466,10 +4472,14 @@ def api_settings_set(b: SettingsBody):
             CFG["strata_api_key"] = ""
         elif val and val != "__keep__":
             CFG["strata_api_key"] = val
+    if b.agent_llm_provider is not None:
+        CFG["agent_llm_provider"] = b.agent_llm_provider.strip() or "custom"
     if b.agent_llm_url is not None:
         CFG["agent_llm_url"] = b.agent_llm_url.strip()
     if b.agent_llm_model is not None:
         CFG["agent_llm_model"] = b.agent_llm_model.strip()
+    if b.agent_llm_headers is not None:
+        CFG["agent_llm_headers"] = b.agent_llm_headers.strip()
     if b.agent_llm_key is not None:
         val = b.agent_llm_key.strip()
         if val == "clear":
@@ -4747,7 +4757,7 @@ def api_setup_install(b: SetupInstallBody):
 
 # ---------------------------------------------------------------- optimization agent api
 from agent_memory import AgentStore
-from optimizer_agent import HostContext, OptimizerAgent
+from optimizer_agent import HostContext, OptimizerAgent, PROVIDER_PRESETS
 from thermal_guard import ThermalGuard
 
 AGENT_STORE = AgentStore(APP_DIR / "agent")
@@ -4782,6 +4792,7 @@ OPT_AGENT = OptimizerAgent(
         coding_agents_list=lambda: list(AGENTS.keys()),
         hf_search_fn=api_hf_search,
         hf_files_fn=api_hf_files,
+        maya_mgr=MAYA,
     ),
     store=AGENT_STORE,
 )
@@ -5050,6 +5061,64 @@ def api_agent_hf_recommend(b: AgentHFRecommendBody):
         return OPT_AGENT.recommend_hf(query=b.query, goal=b.goal, max_repos=b.max_repos)
     except Exception as e:
         raise HTTPException(502, f"HF recommendation failed: {e}")
+
+class AgentProviderBody(BaseModel):
+    provider: str | None = None
+    url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    headers: str | None = None
+    fallback_local: bool | None = None
+
+class AgentProviderModelsBody(BaseModel):
+    provider: str | None = None
+    url: str | None = None
+    api_key: str | None = None
+
+@app.get("/api/agent/provider")
+def api_agent_provider_get():
+    akey = CFG.get("agent_llm_key", "")
+    akey_masked = (akey[:4] + "…" + akey[-4:]) if len(akey) >= 8 else ""
+    return {
+        "presets": PROVIDER_PRESETS,
+        "provider": CFG.get("agent_llm_provider", "custom"),
+        "url": CFG.get("agent_llm_url", ""),
+        "model": CFG.get("agent_llm_model", ""),
+        "headers": CFG.get("agent_llm_headers", ""),
+        "key_set": bool(akey),
+        "key_masked": akey_masked,
+        "fallback_local": bool(CFG.get("agent_llm_fallback_local", True)),
+        "status": OPT_AGENT.llm_status(),
+    }
+
+@app.post("/api/agent/provider")
+def api_agent_provider_set(b: AgentProviderBody):
+    if b.provider is not None:
+        CFG["agent_llm_provider"] = b.provider.strip() or "custom"
+    if b.url is not None:
+        CFG["agent_llm_url"] = b.url.strip()
+    if b.model is not None:
+        CFG["agent_llm_model"] = b.model.strip()
+    if b.headers is not None:
+        CFG["agent_llm_headers"] = b.headers.strip()
+    if b.api_key is not None:
+        val = b.api_key.strip()
+        if val == "clear":
+            CFG["agent_llm_key"] = ""
+        elif val and val != "__keep__":
+            CFG["agent_llm_key"] = val
+    if b.fallback_local is not None:
+        CFG["agent_llm_fallback_local"] = bool(b.fallback_local)
+    _save_config_secure()
+    return api_agent_provider_get()
+
+@app.post("/api/agent/provider/models")
+def api_agent_provider_models(b: AgentProviderModelsBody):
+    return OPT_AGENT.fetch_provider_models(provider=b.provider, url=b.url, api_key=b.api_key)
+
+@app.post("/api/agent/provider/test")
+def api_agent_provider_test():
+    return OPT_AGENT.test_provider()
 
 # ---------------------------------------------------------------- chat api
 @app.post("/api/chat")
@@ -5870,6 +5939,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn primary" id="mayastart">Start selected</button>
       <button class="btn acc2" id="mayaswitch" title="Stop the running Maya config and start the selected one">Switch to selected</button>
       <button class="btn danger" id="mayastop">Stop</button>
+      <button class="btn acc2" data-agent-quick="maya:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="maya:diagnose">Diagnose</button>
       <button class="btn" id="mayaagentsbtn" title="Point coding agents at this Maya server">Register in coding agents…</button>
       <button class="btn sm" id="mayakeybtn" title="Reveal masked API key for the active Maya config">Reveal API key</button>
       <span class="hint">OpenAI &amp; Anthropic API · exclusive GPU · <code>ROCM_PATH</code> managed automatically</span>
@@ -5899,7 +5970,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <button class="btn sm" id="ag-open-sidebar">Open Chat Sidebar</button>
       </div>
     </div>
-    <p class="hint" style="margin:0 0 12px">MoE-aware, doc-grounded optimizer across llama.cpp, Avalon, and Strata. Every Apply or Auto-Tune run automatically creates a safety checkpoint first so you can revert at any time.</p>
+    <p class="hint" style="margin:0 0 12px">MoE-aware, doc-grounded optimizer across llama.cpp, Avalon, Strata, and Project Maya. Every Apply or Auto-Tune run automatically creates a safety checkpoint first so you can revert at any time.</p>
     <div class="form-grid">
       <div class="field">
         <label>Target engine</label>
@@ -5907,6 +5978,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <option value="llama">llama.cpp</option>
           <option value="avalon">Avalon</option>
           <option value="strata">Strata</option>
+          <option value="maya">Project Maya</option>
         </select>
       </div>
       <div class="field">
@@ -5947,6 +6019,50 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn" id="ag-diagnose">Diagnose Engine Failure</button>
       <button class="btn" id="ag-cp-now">Create Checkpoint</button>
     </div>
+  </div>
+
+  <!-- Agent LLM Provider (Hermes-style presets + Custom OpenAI-compatible + Always-On Model Polling) -->
+  <div class="card">
+    <div class="hd">
+      <h2>Agent LLM Provider</h2>
+      <div class="meta">
+        <span class="tag mut" id="ag-prov-models-chip">models: —</span>
+        <button class="btn xs" id="ag-prov-poll">Poll Models</button>
+        <button class="btn xs" id="ag-prov-test">Test Connection</button>
+        <button class="btn primary xs" id="ag-prov-save">Save Provider</button>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 10px">Choose any common provider (OpenAI, Anthropic, OpenRouter, Gemini, DeepSeek, xAI, Groq, Together, Fireworks, Mistral, Moonshot/Kimi, Z.ai, Nous/Hermes, Ollama, LM Studio, vLLM) or a custom OpenAI-compatible URL. Models are polled automatically.</p>
+    <div class="form-grid">
+      <div class="field">
+        <label>Provider</label>
+        <select id="ag-prov-select"></select>
+      </div>
+      <div class="field">
+        <label>Base URL (editable for custom providers)</label>
+        <input id="ag-prov-url" type="text" placeholder="https://api.example.com/v1">
+      </div>
+      <div class="field">
+        <label>API Key <span id="ag-prov-key-status"></span></label>
+        <input id="ag-prov-key" type="password" placeholder="(leave blank to keep existing; type 'clear' to remove)">
+      </div>
+      <div class="field">
+        <label>Model (auto-polled or type custom ID)</label>
+        <div style="display:flex;gap:6px">
+          <input id="ag-prov-model" type="text" list="ag-prov-models-dl" placeholder="select or type model id" style="flex:1">
+          <select id="ag-prov-model-pick" aria-label="Polled models" style="max-width:48%"><option value="">— polled models —</option></select>
+        </div>
+        <datalist id="ag-prov-models-dl"></datalist>
+      </div>
+      <div class="field">
+        <label>Custom Headers JSON (optional)</label>
+        <input id="ag-prov-headers" type="text" placeholder='e.g. {"HTTP-Referer":"https://localhost"}'>
+      </div>
+      <div class="field" style="justify-content:center">
+        <label class="switch"><input type="checkbox" id="ag-prov-fallback" checked><span class="track"></span><span class="hint">Fall back to active local engine when external LLM is unset</span></label>
+      </div>
+    </div>
+    <div id="ag-prov-msg" class="hint" style="margin-top:8px"></div>
   </div>
 
   <div class="card hide" id="ag-result-card">
@@ -6303,6 +6419,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   <div class="agent-drawer-ft">
     <div class="agent-chips">
       <button type="button" class="btn xs" data-ag-chip="Optimize llama.cpp for fastest speed">Fastest llama.cpp</button>
+      <button type="button" class="btn xs" data-ag-chip="Optimize Maya for fastest speed">Fastest Maya</button>
       <button type="button" class="btn xs" data-ag-chip="Longest context config for Avalon">Max ctx Avalon</button>
       <button type="button" class="btn xs" data-ag-chip="Diagnose last crash">Diagnose crash</button>
       <button type="button" class="btn xs" data-ag-chip="Show checkpoints">Checkpoints</button>
@@ -8472,8 +8589,8 @@ $('#pal-list').addEventListener('click',e=>{
 });
 
 /* ============================== optimization agent & sidebar ============================== */
-let AG_LAST_RESULT=null;
-function syncAgentModelOptions(){
+let AG_LAST_RESULT=null,AG_PROV_PRESETS={},AG_MAYA_CFGS=[];
+async function syncAgentModelOptions(){
   const sel=$('#ag-model');if(!sel)return;
   const eng=$('#ag-engine').value;
   if(eng==='llama'){
@@ -8481,12 +8598,95 @@ function syncAgentModelOptions(){
       +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+' ('+esc(m.quant)+(m.moe?' · MoE':'')+')</option>').join('');
   }else if(eng==='avalon'){
     sel.innerHTML='<option value="flagship">flagship</option><option value="prefast">prefast</option><option value="compact">compact</option>';
+  }else if(eng==='maya'){
+    try{const d=await api('/api/maya/configs');AG_MAYA_CFGS=d.configs||[];}catch(e){}
+    sel.innerHTML='<option value="">(auto-select best Maya config)</option>'
+      +AG_MAYA_CFGS.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.model_name)+' ('+esc(c.engine)+(c.quant?' · '+esc(c.quant):'')+(c.mtp?' · MTP':'')+')</option>').join('');
   }else{
     sel.innerHTML='<option value="">(Strata default / active)</option>'
       +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
   }
 }
 $('#ag-engine')?.addEventListener('change',syncAgentModelOptions);
+
+/* Agent LLM Provider (Hermes-style presets + Custom + Always-On Model Polling) */
+async function loadAgentProvider(){
+  try{
+    const d=await api('/api/agent/provider');
+    AG_PROV_PRESETS=d.presets||{};
+    const sel=$('#ag-prov-select');
+    if(sel&&!sel.options.length){
+      sel.innerHTML=Object.entries(AG_PROV_PRESETS).map(([k,v])=>'<option value="'+esc(k)+'">'+esc(v.label)+'</option>').join('');
+    }
+    if(sel)sel.value=d.provider||'custom';
+    if($('#ag-prov-url'))$('#ag-prov-url').value=d.url||(AG_PROV_PRESETS[d.provider]?.url||'');
+    if($('#ag-prov-model'))$('#ag-prov-model').value=d.model||'';
+    if($('#ag-prov-headers'))$('#ag-prov-headers').value=d.headers||'';
+    if($('#ag-prov-key'))$('#ag-prov-key').value='';
+    if($('#ag-prov-key-status'))$('#ag-prov-key-status').textContent=d.key_set?'saved ('+d.key_masked+')':'not set';
+    if($('#ag-prov-fallback'))$('#ag-prov-fallback').checked=d.fallback_local!==false;
+    pollAgentProviderModels(true);
+  }catch(e){}
+}
+async function pollAgentProviderModels(silent){
+  const chip=$('#ag-prov-models-chip'),msg=$('#ag-prov-msg');
+  if(chip)chip.textContent='polling models…';
+  try{
+    const prov=$('#ag-prov-select')?.value||'custom';
+    const url=($('#ag-prov-url')?.value||'').trim();
+    const api_key=($('#ag-prov-key')?.value||'').trim();
+    const r=await post('/api/agent/provider/models',{provider:prov,url,api_key});
+    const list=r.models||[];
+    if(chip){chip.textContent='models: '+list.length;chip.className='tag '+(list.length?'ok':'mut');}
+    const dl=$('#ag-prov-models-dl'),pk=$('#ag-prov-model-pick');
+    if(dl)dl.innerHTML=list.map(m=>'<option value="'+esc(m)+'"></option>').join('');
+    if(pk){
+      const cur=$('#ag-prov-model')?.value||'';
+      pk.innerHTML='<option value="">— '+(list.length?list.length+' polled models':'no models polled')+' —</option>'
+        +list.map(m=>'<option value="'+esc(m)+'"'+(m===cur?' selected':'')+'>'+esc(m)+'</option>').join('');
+    }
+    if(msg)msg.textContent=r.error?('Model poll note: '+r.error):(list.length?'Polled '+list.length+' model(s) from '+r.url:'');
+  }catch(e){
+    if(chip){chip.textContent='models: err';chip.className='tag warn';}
+    if(!silent)toast('Model poll failed: '+e.message,'warn');
+  }
+}
+$('#ag-prov-select')?.addEventListener('change',()=>{
+  const p=AG_PROV_PRESETS[$('#ag-prov-select').value];
+  if(p&&typeof p.url==='string')$('#ag-prov-url').value=p.url;
+  pollAgentProviderModels(true);
+});
+$('#ag-prov-url')?.addEventListener('blur',()=>pollAgentProviderModels(true));
+$('#ag-prov-key')?.addEventListener('blur',()=>pollAgentProviderModels(true));
+$('#ag-prov-model-pick')?.addEventListener('change',()=>{
+  const v=$('#ag-prov-model-pick').value;if(v)$('#ag-prov-model').value=v;
+});
+$('#ag-prov-poll')?.addEventListener('click',()=>pollAgentProviderModels(false));
+$('#ag-prov-save')?.addEventListener('click',async()=>{
+  const btn=$('#ag-prov-save');btn.disabled=true;
+  try{
+    await post('/api/agent/provider',{
+      provider:$('#ag-prov-select').value,
+      url:$('#ag-prov-url').value.trim(),
+      model:$('#ag-prov-model').value.trim(),
+      api_key:$('#ag-prov-key').value.trim(),
+      headers:$('#ag-prov-headers').value.trim(),
+      fallback_local:$('#ag-prov-fallback').checked
+    });
+    toast('Agent LLM provider saved','ok');
+    await Promise.all([loadAgentProvider(),loadAgentStatus()]);
+  }catch(e){toast('Save provider failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-prov-test')?.addEventListener('click',async()=>{
+  const btn=$('#ag-prov-test');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/provider/test',{});
+    if(r.ok){toast('Provider OK ('+r.latency_ms+'ms): '+r.reply,'ok');if($('#ag-prov-msg'))$('#ag-prov-msg').textContent='Connected ('+r.latency_ms+' ms): '+r.reply;}
+    else{toast('Provider test failed: '+(r.error||'check config'),'err');if($('#ag-prov-msg'))$('#ag-prov-msg').textContent=r.error||'Test failed';}
+  }catch(e){toast('Test failed: '+e.message,'err')}
+  btn.disabled=false;
+});
 
 function buildAgentPayload(){
   const eng=$('#ag-engine').value;
@@ -8608,7 +8808,7 @@ async function loadAgentAll(){
   syncAgentModelOptions();
   const sm=$('#ag-spec-model');
   if(sm)sm.innerHTML='<option value="">(auto-select active / pinned)</option>'+MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
-  await Promise.all([loadAgentStatus(),loadAgentCheckpoints(),loadAgentPresets(),loadAgentMemory(),loadThermalGuard()]);
+  await Promise.all([loadAgentStatus(),loadAgentProvider(),loadAgentCheckpoints(),loadAgentPresets(),loadAgentMemory(),loadThermalGuard()]);
 }
 
 /* Phase 2 UI: Thermal Guard */
@@ -8855,7 +9055,7 @@ async function sendAgentChat(text){
   $('#ag-sb-in').value='';
   appendAgentBubble('user',msg);
   try{
-    const eng=(tab==='strata'||tab==='avalon')?tab:($('#ag-engine')?.value||'llama');
+    const eng=(tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
     const r=await post('/api/agent/chat',{message:msg,engine:eng});
     appendAgentBubble('bot',r.reply,r.actions||[]);
   }catch(e){appendAgentBubble('bot','Error: '+e.message);}
