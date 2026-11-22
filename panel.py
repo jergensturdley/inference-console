@@ -51,6 +51,9 @@ DEFAULT_CONFIG = {
     "agent_llm_model": "",
     "agent_llm_fallback_local": True,
     "thermal_guard": {},         # graduated GPU thermal & VRAM pressure guard settings
+    # Project Maya (~/project-maya). Empty means use MAYA_DIR / MAYA_ROCM_PATH defaults.
+    "maya_dir": "",
+    "maya_rocm_path": "",
 }
 
 # ---------------------------------------------------------------- config
@@ -1042,6 +1045,9 @@ class ServerManager:
               fa="auto", ctk="", ctv="", parallel=None, batch=None, ubatch=None,
               ncmoe=None, mlock=False, no_mmap=False, draft="", draft_max=16, draft_min=0,
               ot="", tensor_split="", tbatch=None, keep=None, jinja="on", save_profile=True):
+        if preset not in ("cpu-only",) and not str(preset).startswith("igpu"):
+            if MAYA.status().get("running"):
+                raise HTTPException(409, "Stop Maya first — this model needs its GPU VRAM.")
         if self.status()["running"]:
             self.stop()
         mp = Path(model)
@@ -1228,12 +1234,6 @@ def _avalon_target() -> dict:
     if pinned:
         tgt["model"] = Path(pinned).expanduser()
         tgt["base"] = SPLIT_RE.sub("", tgt["model"].stem)
-        if CFG.get("avalon_draft"):
-            tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
-        else:
-            drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
-            if drafts:
-                tgt["draft"] = drafts[0]
     else:
         packs = _avalon_scan()
         if packs:
@@ -1242,6 +1242,13 @@ def _avalon_target() -> dict:
             tgt["base"] = p0["base"]
             tgt["draft"] = Path(p0["draft"]) if p0["draft"] else None
             tgt["mmproj"] = p0["mmproj"]
+    # avalon_draft is an override, so it wins in both modes; the pinned branch used to be the
+    # only one that honoured it, which silently ignored the setting whenever the tab was on auto.
+    if CFG.get("avalon_draft"):
+        tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
+    elif tgt["draft"] is None and tgt["model"]:
+        drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
+        tgt["draft"] = drafts[0] if drafts else None
     if tgt["model"] and not tgt.get("mmproj"):
         try:
             tgt["mmproj"] = find_mmproj(str(tgt["model"]))
@@ -1402,6 +1409,8 @@ class AvalonManager:
             raise HTTPException(503, "Avalon build not found — build ~/avalon first (cmake --build build --target llama-server).")
         if not tgt["model"] or not tgt["model"].exists():
             raise HTTPException(404, "no Flash-Next pack detected in the model dirs — finish a download first or set avalon_model in config.json.")
+        if p["exclusive"] and MAYA.status().get("running"):
+            raise HTTPException(409, "Stop Maya first — Avalon needs its GPU VRAM.")
         if p["exclusive"] and self._gpu_conflict():
             raise HTTPException(409, "Stop the llama.cpp server first — this profile needs its VRAM.")
         if self.status()["running"] or not self._port_free():
@@ -1516,6 +1525,664 @@ class AvalonManager:
         AVALON_STATE_PATH.write_text(json.dumps(self.info))
 
 SMGR = AvalonManager()
+
+# ---------------------------------------------------------------- maya (Project Maya)
+MAYA_DIR = HOME / "project-maya"
+MAYA_ROCM_PATH = HOME / "maya-rocm"
+MAYA_STATE_PATH = APP_DIR / "maya-state.json"
+MAYA_LOG_PATH = APP_DIR / "maya-runtime.log"
+_MAYA_STATUS_TTL = 2.0
+
+_MAYA_RE_LOAD = re.compile(r"\bloaded in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_WARMUP = re.compile(r"\bwarmed up in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_VRAM = re.compile(r"([\d.]+)\s*GB\s+of\s+VRAM", re.I)
+_MAYA_RE_CTX = re.compile(r"\bcontext\s+(\d+)\b", re.I)
+_MAYA_RE_EXPERTS = re.compile(r"(\d+)\s+of\s+(\d+)\s+routed experts in VRAM\s*\(([\d.]+)%\)", re.I)
+_MAYA_RE_READY = re.compile(r"\bready:\s*https?://", re.I)
+_MAYA_RE_HY4_SERVE = re.compile(
+    r"prompt\s+\d+\s+tokens[^()]*\(([\d.]+)\s*tok/s\)[^()]*?generated\s+in\s+[\d.]+\s*ms\s*\(([\d.]+)\s*tok/s\)",
+    re.I,
+)
+_MAYA_RE_ANSWERING = re.compile(r"\[maya\]\s+answering:\s*(\d+)\s+of\s+max\s+\d+\s+tokens,\s*([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_DONE = re.compile(r"\[maya\]\s+done:\s*(\d+)\s+tokens\s+in\s+[\d.]+\s*s\s*\(([\d.]+)\s*tok/s\)", re.I)
+_MAYA_RE_GLM_PREFILL = re.compile(r"glm\s+prefill:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_GLM_STAT = re.compile(r"glm\s+stat:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_QUANT = re.compile(r"(maya-xs|iq\d+_[a-z0-9]+|q\d+_[a-z0-9_]+|fp16|bf16|f16|mxfp4)", re.I)
+
+
+def _tail_file_lines(path: Path, max_lines: int = 250, max_bytes: int = 131072) -> list[str]:
+    """Read up to the last `max_lines` lines from `path` without loading huge logs."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        return lines[-max_lines:]
+    except OSError:
+        return []
+
+
+def _mask_secret(key: str) -> str:
+    if not key:
+        return ""
+    return (key[:4] + "…" + key[-4:]) if len(key) >= 8 else "(short key)"
+
+
+def parse_maya_log(lines: list[str]) -> dict:
+    """Extract live telemetry from Project Maya engine log lines (Hy4 and GLM)."""
+    out = {
+        "decode_tps": None,
+        "prefill_tps": None,
+        "vram_gb": None,
+        "experts_vram": None,
+        "experts_total": None,
+        "experts_vram_pct": None,
+        "context": None,
+        "load_s": None,
+        "warmup_s": None,
+        "ready_seen": False,
+        "active": False,
+        "last_tokens": None,
+    }
+    for ln in lines:
+        if not ln:
+            continue
+        m = _MAYA_RE_VRAM.search(ln)
+        if m:
+            out["vram_gb"] = float(m.group(1))
+        m = _MAYA_RE_CTX.search(ln)
+        if m:
+            out["context"] = int(m.group(1))
+        m = _MAYA_RE_LOAD.search(ln)
+        if m:
+            out["load_s"] = float(m.group(1))
+        m = _MAYA_RE_WARMUP.search(ln)
+        if m:
+            out["warmup_s"] = float(m.group(1))
+        m = _MAYA_RE_EXPERTS.search(ln)
+        if m:
+            out["experts_vram"] = int(m.group(1))
+            out["experts_total"] = int(m.group(2))
+            out["experts_vram_pct"] = float(m.group(3))
+        if _MAYA_RE_READY.search(ln):
+            out["ready_seen"] = True
+        m = _MAYA_RE_HY4_SERVE.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            continue
+        m = _MAYA_RE_ANSWERING.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = True
+            continue
+        m = _MAYA_RE_DONE.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = False
+            continue
+        m = _MAYA_RE_GLM_PREFILL.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            continue
+        m = _MAYA_RE_GLM_STAT.search(ln)
+        if m:
+            out["decode_tps"] = round(float(m.group(1)), 2)
+    return out
+
+
+class MayaMgr:
+    """Manages the local Project Maya server (Hy4-Flash, GLM-5.3-Flash, etc.)."""
+
+    def __init__(self):
+        self.proc = None
+        self.info = {}
+        self.logbuf = deque(maxlen=400)
+        self._cache = {"at": 0.0, "val": None}
+        self._load_state()
+
+    @staticmethod
+    def _maya_dir() -> Path:
+        raw = CFG.get("maya_dir") or ""
+        return Path(raw).expanduser() if raw else MAYA_DIR
+
+    @staticmethod
+    def _rocm_path() -> str:
+        raw = CFG.get("maya_rocm_path") or ""
+        return str(Path(raw).expanduser()) if raw else str(MAYA_ROCM_PATH)
+
+    def _invalidate(self):
+        self._cache["at"] = 0.0
+
+    def _load_state(self):
+        if not MAYA_STATE_PATH.exists():
+            return
+        try:
+            st = json.loads(MAYA_STATE_PATH.read_text())
+            pid = st.get("pid")
+            if pid and _pid_alive(pid):
+                self.proc = None
+                self.info = {**st, "adopted": True}
+                self.log(f"adopted running maya pid={pid} config={st.get('config_id')}")
+        except Exception:
+            pass
+
+    def log(self, line: str):
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
+
+    @staticmethod
+    def _read_config_raw(path: Path) -> dict | None:
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_ctx(raw: dict) -> int:
+        args = raw.get("args") or []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("--max-context", "--ctx-size", "-c") and i + 1 < len(args):
+                    try:
+                        return int(args[i + 1])
+                    except ValueError:
+                        pass
+                if s.startswith("--max-context="):
+                    try:
+                        return int(s.split("=", 1)[1])
+                    except ValueError:
+                        pass
+        for k in ("max_context", "ctx", "context"):
+            if raw.get(k):
+                try:
+                    return int(raw[k])
+                except (TypeError, ValueError):
+                    pass
+        return 131072
+
+    @staticmethod
+    def _extract_model_size(raw: dict, base_dir: Path) -> int:
+        """Compute total byte size of the model file or directory referenced in config args."""
+        args = raw.get("args") or []
+        candidates = []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("-m", "--model", "--model-dir") and i + 1 < len(args):
+                    candidates.append(str(args[i + 1]))
+                elif s.startswith("--model="):
+                    candidates.append(s.split("=", 1)[1])
+                elif not s.startswith("-") and ("/" in s or s.endswith((".gguf", ".safetensors", ".bin"))):
+                    candidates.append(s)
+        for cand in candidates:
+            p = Path(cand).expanduser()
+            if not p.is_absolute():
+                p = base_dir / p
+            if not p.exists():
+                continue
+            try:
+                if p.is_file():
+                    return p.stat().st_size
+                if p.is_dir():
+                    total = 0
+                    for f in p.rglob("*"):
+                        if f.is_file():
+                            try:
+                                total += f.stat().st_size
+                            except OSError:
+                                pass
+                    if total > 0:
+                        return total
+            except OSError:
+                continue
+        return 0
+
+    def _resolve_log_path(self, raw: dict, cfg_path: Path) -> Path:
+        base_dir = self._maya_dir()
+        lp = raw.get("log")
+        if lp:
+            p = Path(str(lp)).expanduser()
+            return p if p.is_absolute() else (base_dir / p)
+        return base_dir / f"{cfg_path.stem}.log"
+
+    def _public_config(self, cfg_path: Path, raw: dict) -> dict:
+        base_dir = self._maya_dir()
+        exe = str(raw.get("exe") or "")
+        exe_path = Path(exe).expanduser()
+        if exe and not exe_path.is_absolute():
+            exe_path = base_dir / exe_path
+        args = raw.get("args") or []
+        args_str = " ".join(str(a) for a in args) if isinstance(args, list) else str(args)
+        engine = "hy4" if "hy4" in exe.lower() or "hy4" in cfg_path.stem.lower() else "glm"
+        # Never default a Maya config to 8080 (latency-speedtest owns 8080).
+        port = int(raw.get("port") or 8098)
+        quant_m = _MAYA_RE_QUANT.search(cfg_path.stem) or _MAYA_RE_QUANT.search(args_str)
+        quant = quant_m.group(1) if quant_m else ""
+        size_b = self._extract_model_size(raw, base_dir)
+        key = str(raw.get("api_key") or "")
+        log_path = self._resolve_log_path(raw, cfg_path)
+        return {
+            "id": cfg_path.stem,
+            "filename": cfg_path.name,
+            "path": str(cfg_path),
+            "model_name": str(raw.get("model_name") or cfg_path.stem),
+            "engine": engine,
+            "exe": exe,
+            "quant": quant,
+            "ctx": self._extract_ctx(raw),
+            "mtp": "--mtp" in args if isinstance(args, list) else ("--mtp" in args_str),
+            "port": port,
+            "host": str(raw.get("host") or "127.0.0.1"),
+            "log": str(log_path),
+            "sampling": raw.get("sampling") if isinstance(raw.get("sampling"), dict) else {},
+            "reasoning_effort": raw.get("reasoning_effort"),
+            "key_set": bool(key),
+            "key_masked": _mask_secret(key),
+            "dir_size_bytes": size_b,
+            "dir_size_h": human_size(size_b) if size_b else "",
+            "available": bool(exe) and exe_path.exists(),
+            "concurrency_note": "1 request at a time" if engine == "hy4" else "",
+        }
+
+    def discover_configs(self) -> list[dict]:
+        """Discover Project Maya JSON configs in MAYA_DIR, excluding *.panel-orig.json backups."""
+        base_dir = self._maya_dir()
+        if not base_dir.is_dir():
+            return []
+        out = []
+        for p in sorted(base_dir.glob("*.json")):
+            name = p.name
+            if name.endswith(".panel-orig.json") or name.endswith(".orig.json") or name.endswith(".bak.json"):
+                continue
+            raw = self._read_config_raw(p)
+            if not raw:
+                continue
+            if not (raw.get("exe") or raw.get("model_name")):
+                continue
+            out.append(self._public_config(p, raw))
+        return out
+
+    def _find_config(self, ref: str) -> tuple[Path, dict, dict] | None:
+        """Resolve a config by full path, filename, or stem id. Returns (path, raw, public)."""
+        ref_s = str(ref or "").strip()
+        if not ref_s:
+            return None
+        base_dir = self._maya_dir()
+        for pub in self.discover_configs():
+            if ref_s in (pub["path"], pub["id"], pub["filename"]):
+                p = Path(pub["path"])
+                raw = self._read_config_raw(p)
+                if raw:
+                    return p, raw, pub
+        # Allow an explicit path inside base_dir if valid
+        cand = Path(ref_s).expanduser()
+        if not cand.is_absolute():
+            cand = base_dir / cand
+        if cand.is_file() and not cand.name.endswith(".panel-orig.json"):
+            raw = self._read_config_raw(cand)
+            if raw and (raw.get("exe") or raw.get("model_name")):
+                return cand, raw, self._public_config(cand, raw)
+        return None
+
+    @staticmethod
+    def _port_open(port: int, timeout: float = 0.15) -> bool:
+        try:
+            with socket.socket() as s:
+                s.settimeout(timeout)
+                return s.connect_ex(("127.0.0.1", int(port))) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _probe_models(port: int, api_key: str, timeout: float = 0.8) -> tuple[bool, str | None]:
+        """Key-authed GET /v1/models probe. Returns (ready, alias)."""
+        if not port or not MayaMgr._port_open(port):
+            return False, None
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            r = httpx.get(f"http://127.0.0.1:{port}/v1/models", headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                alias = None
+                try:
+                    data = r.json().get("data") or []
+                    if isinstance(data, list) and data and isinstance(data[0], dict):
+                        alias = data[0].get("id")
+                except Exception:
+                    pass
+                return True, alias
+            return False, None
+        except Exception:
+            return False, None
+
+    @staticmethod
+    def _find_proc_pid(port: int | None = None) -> int | None:
+        """Best-effort PID lookup on Linux /proc for adopted Maya processes."""
+        if not Path("/proc").is_dir():
+            return None
+        fallback = None
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                pid = int(d.name)
+                if port and str(port) in cmd:
+                    return pid
+                if fallback is None:
+                    fallback = pid
+        return fallback
+
+    def _status_now(self) -> dict:
+        st = self.info
+        if st:
+            pid = st.get("pid")
+            alive = (self.proc is not None and self.proc.poll() is None) or _pid_alive(pid)
+            port = int(st.get("port") or 0)
+            cfg_path = Path(st["config_path"]) if st.get("config_path") else None
+            raw = self._read_config_raw(cfg_path) if cfg_path and cfg_path.exists() else {}
+            raw = raw or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(port, key)
+            if alive or ready:
+                log_path = Path(st.get("log") or "") if st.get("log") else None
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if (log_path and log_path.exists()) else parse_maya_log([])
+                return {
+                    "running": True,
+                    "state": "ready" if ready else "loading",
+                    "pid": pid if alive else self._find_proc_pid(port),
+                    "config_id": st.get("config_id"),
+                    "config_path": st.get("config_path"),
+                    "model_name": st.get("model_name"),
+                    "alias": alias or st.get("model_name") or "maya",
+                    "engine": st.get("engine") or "hy4",
+                    "port": port,
+                    "ctx": int(st.get("ctx") or self._extract_ctx(raw)),
+                    "log": st.get("log") or "",
+                    "key_set": bool(key),
+                    "key_masked": _mask_secret(key),
+                    "uptime": int(time.time() - st.get("started_at", time.time())),
+                    "cmd": st.get("cmd", ""),
+                    "adopted": bool(st.get("adopted", False)),
+                    "telemetry": tel,
+                }
+            # Tracked process died and port is closed
+            self.proc = None
+            self.info = {}
+            MAYA_STATE_PATH.unlink(missing_ok=True)
+
+        # Port-probe adoption: check discovered configs for an already-running Maya server.
+        for pub in self.discover_configs():
+            cfg_path = Path(pub["path"])
+            raw = self._read_config_raw(cfg_path) or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(pub["port"], key)
+            if ready:
+                pid = self._find_proc_pid(pub["port"])
+                log_path = Path(pub["log"])
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if log_path.exists() else parse_maya_log([])
+                self.info = {
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "started_at": time.time(),
+                    "adopted": True,
+                    "cmd": "",
+                }
+                return {
+                    "running": True,
+                    "state": "ready",
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "alias": alias or pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "key_set": pub["key_set"],
+                    "key_masked": pub["key_masked"],
+                    "uptime": 0,
+                    "cmd": "",
+                    "adopted": True,
+                    "telemetry": tel,
+                }
+        return {"running": False, "state": "stopped", "telemetry": parse_maya_log([])}
+
+    def status(self, refresh: bool = False) -> dict:
+        now = time.time()
+        if not refresh and self._cache["val"] is not None and (now - self._cache["at"]) < _MAYA_STATUS_TTL:
+            return self._cache["val"]
+        val = self._status_now()
+        self._cache["val"] = val
+        self._cache["at"] = now
+        return val
+
+    def active_api_key(self, config_ref: str | None = None) -> str:
+        """Server-side only: return raw api_key for the active or specified Maya config."""
+        ref = config_ref or self.info.get("config_path")
+        if not ref:
+            st = self.status()
+            ref = st.get("config_path")
+        if not ref:
+            return ""
+        found = self._find_config(ref)
+        if not found:
+            return ""
+        return str(found[1].get("api_key") or "")
+
+    @staticmethod
+    def _gpu_conflict() -> bool:
+        return AvalonManager._gpu_conflict()
+
+    def build_start_spec(self, cfg_path: Path, pub: dict) -> tuple[list[str], dict, Path]:
+        base_dir = self._maya_dir()
+        venv_py = base_dir / ".venv/bin/python"
+        launcher = base_dir / "maya.py"
+        argv = [str(venv_py), str(launcher), "--config", str(cfg_path), "--port", str(pub["port"])]
+        env = dict(os.environ)
+        env["ROCM_PATH"] = self._rocm_path()
+        return argv, env, base_dir
+
+    def start(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        cfg_path, raw, pub = found
+        if pub["port"] == 8080:
+            raise HTTPException(400, "Refusing port 8080 — reserved by latency-speedtest. Edit the config port to 8098/8099.")
+
+        # Exclusivity: refuse a second Maya config while one serves.
+        cur = self.status(refresh=True)
+        if cur.get("running"):
+            raise HTTPException(
+                409,
+                f"Maya is already running ({cur.get('model_name')} on :{cur.get('port')}) — stop it or use Switch.",
+            )
+
+        # GPU-conflict guard against other engines & VRAM.
+        if MGR.status().get("running"):
+            raise HTTPException(409, "Stop the llama.cpp server first — Maya needs the GPU VRAM.")
+        if SMGR.status().get("running"):
+            raise HTTPException(409, "Stop Avalon first — Maya needs the GPU VRAM.")
+        if strata_status().get("running"):
+            raise HTTPException(409, "Stop Strata first — Maya needs the GPU VRAM.")
+        if self._gpu_conflict():
+            raise HTTPException(409, "Another engine is holding GPU VRAM — stop it first.")
+
+        argv, env, base_dir = self.build_start_spec(cfg_path, pub)
+        if not Path(argv[0]).exists():
+            raise HTTPException(503, f"Maya virtualenv python not found: {argv[0]}")
+        if not Path(argv[1]).exists():
+            raise HTTPException(503, f"Maya launcher not found: {argv[1]}")
+
+        cmd_str = _redact_cmd(" ".join(argv))
+        self.log(f"starting maya {pub['model_name']} ({pub['id']}) on :{pub['port']}: {cmd_str}")
+        MAYA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(MAYA_LOG_PATH, "a", encoding="utf-8", errors="replace")
+        try:
+            self.proc = subprocess.Popen(
+                argv,
+                cwd=str(base_dir),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+
+        self.info = {
+            "pid": self.proc.pid,
+            "config_id": pub["id"],
+            "config_path": str(cfg_path),
+            "model_name": pub["model_name"],
+            "engine": pub["engine"],
+            "port": pub["port"],
+            "ctx": pub["ctx"],
+            "log": pub["log"],
+            "started_at": time.time(),
+            "adopted": False,
+            "cmd": cmd_str,
+        }
+        self._save_state()
+        self._invalidate()
+        return self.status(refresh=True)
+
+    @staticmethod
+    def _kill_orphans(port: int | None = None) -> bool:
+        """Terminate any untracked Maya python/engine processes on Linux /proc."""
+        if not Path("/proc").is_dir():
+            return False
+        victims = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                victims.append(int(d.name))
+        for v in victims:
+            try:
+                os.killpg(os.getpgid(v), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(v, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(80):
+            port_free = (not port) or (not MayaMgr._port_open(port))
+            if port_free and not any(_pid_alive(v) for v in victims):
+                break
+            time.sleep(0.1)
+        for v in victims:
+            if _pid_alive(v):
+                try:
+                    os.kill(v, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(30):
+            if (not port) or (not MayaMgr._port_open(port)):
+                break
+            time.sleep(0.1)
+        return bool(victims)
+
+    def stop(self) -> dict:
+        cur = self.status(refresh=True)
+        st = self.info
+        pid = st.get("pid") or cur.get("pid")
+        port = st.get("port") or cur.get("port")
+        killed = False
+        if pid and _pid_alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for _ in range(100):
+                port_free = (not port) or (not self._port_open(port))
+                if not _pid_alive(pid) and port_free and not self._gpu_conflict():
+                    killed = True
+                    break
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            killed = True
+        if port and self._port_open(port):
+            if self._kill_orphans(port):
+                killed = True
+        self.proc = None
+        self.info = {}
+        MAYA_STATE_PATH.unlink(missing_ok=True)
+        self._invalidate()
+        stopped = (not port) or (not self._port_open(port))
+        self.log(f"stopped maya (pid {pid})" if killed else ("maya not running" if stopped else f"stop failed: port {port} still busy"))
+        return {"stopped": stopped}
+
+    def switch(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        if self.status(refresh=True).get("running"):
+            res = self.stop()
+            if not res.get("stopped"):
+                raise HTTPException(503, "Failed to stop running Maya server before switching.")
+        return self.start(str(found[0]))
+
+    def tail_log(self, max_lines: int = 250) -> dict:
+        st = self.status()
+        log_path_s = st.get("log") or self.info.get("log") or ""
+        lines: list[str] = []
+        source_path = ""
+        if log_path_s:
+            lp = Path(log_path_s)
+            if lp.exists():
+                lines = _tail_file_lines(lp, max_lines=max_lines)
+                source_path = str(lp)
+        if not lines and MAYA_LOG_PATH.exists():
+            lines = _tail_file_lines(MAYA_LOG_PATH, max_lines=max_lines)
+            source_path = str(MAYA_LOG_PATH)
+        if not lines and self.logbuf:
+            lines = list(self.logbuf)[-max_lines:]
+        key = self.active_api_key()
+        text = "\n".join(lines)
+        if key and len(key) >= 6:
+            text = text.replace(key, _mask_secret(key))
+        return {"log": _redact_cmd(text), "path": source_path}
+
+    def _save_state(self):
+        MAYA_STATE_PATH.write_text(json.dumps(self.info))
+
+
+MAYA = MayaMgr()
 
 # ---------------------------------------------------------------- vitals
 _prev_cpu = None
@@ -1705,6 +2372,35 @@ SESSION_TTL = 7 * 24 * 3600
 _sessions: dict = {}   # token -> expiry (unix time)
 _fails: dict = {}      # ip -> deque(failure unix times)
 
+SESSIONS_PATH = APP_DIR / "sessions.json"
+
+def _load_sessions():
+    """Sessions are memory-only, so an in-place restart would sign the operator out.
+    Mirror them to a 0600 file and reload on boot; expired tokens are dropped."""
+    now = time.time()
+    raw = _read_json(SESSIONS_PATH, {})
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for tok, exp in raw.items():
+        try:
+            if float(exp) > now:
+                out[str(tok)] = float(exp)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+def _save_sessions():
+    try:
+        tmp = SESSIONS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({k: v for k, v in _sessions.items() if v > time.time()}))
+        os.chmod(tmp, 0o600)
+        tmp.replace(SESSIONS_PATH)
+    except OSError:
+        pass  # a session mirror that cannot be written must not break sign-in
+
+_sessions.update(_load_sessions())
+
 LOGIN_HTML = r"""<!doctype html>
 <html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>Inference Console — Sign in</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -1845,6 +2541,7 @@ def api_login(b: LoginBody, request: Request):
     q.clear()
     tok = secrets.token_urlsafe(32)
     _sessions[tok] = now + SESSION_TTL
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
                     samesite="lax", path="/")
@@ -1853,6 +2550,7 @@ def api_login(b: LoginBody, request: Request):
 @app.post("/api/logout")
 def api_logout(request: Request):
     _sessions.pop(request.cookies.get(SESSION_COOKIE, ""), None)
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
@@ -2772,15 +3470,20 @@ AGENTS_STATE_PATH = APP_DIR / "agent-registry.json"
 PANEL_PROVIDER_ID = "inference-console"
 
 def _load_agents_state():
-    if AGENTS_STATE_PATH.exists():
-        try:
-            return json.loads(AGENTS_STATE_PATH.read_text())
-        except Exception:
-            pass
-    return {"agents": {}}
+    st = _read_json(AGENTS_STATE_PATH, {})
+    if not isinstance(st, dict):
+        st = {}
+    if not isinstance(st.get("agents"), dict):
+        st["agents"] = {}
+    return st
 
 def _save_agents_state(st):
-    AGENTS_STATE_PATH.write_text(json.dumps(st, indent=1))
+    """Atomic, and never fatal: the agent configs are already written by the time this runs,
+    so a read-only state dir must not turn a successful sync into a 500."""
+    try:
+        _write_json(AGENTS_STATE_PATH, st)
+    except OSError as e:
+        print(f"agent registry not saved: {e}", flush=True)
 
 def _proc_ctx(pid):
     try:
@@ -2790,6 +3493,32 @@ def _proc_ctx(pid):
     except Exception:
         pass
     return 8192
+
+def _server_facts(port, timeout: float = 1.5):
+    """(model id, n_ctx) as the running server reports them over HTTP. /proc only exists on
+    Linux, so the old cmdline probe told every agent `-c 8192` on macOS no matter what the
+    server was really loaded with; /props answers the same question on every platform."""
+    alias = nctx = None
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=timeout)
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data") or []
+            if data and isinstance(data[0], dict) and data[0].get("id"):
+                alias = str(data[0]["id"])
+    except Exception:
+        pass
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/props", timeout=timeout)
+        if r.status_code == 200:
+            j = r.json() or {}
+            nctx = (j.get("default_generation_settings") or {}).get("n_ctx") or j.get("n_ctx")
+            nctx = int(nctx) if nctx else None
+    except Exception:
+        nctx = None
+    if alias and ("/" in alias or "\\" in alias or alias.lower().endswith(".gguf")):
+        alias = Path(alias.replace("\\", "/")).name.removesuffix(".gguf")
+        alias = SPLIT_RE.sub("", alias) or None
+    return alias, nctx
 
 # ==================== STRATA (Niko1221/Strata) ====================
 # Strata is a separate inference engine (github.com/Niko1221/Strata) serving the same
@@ -3087,6 +3816,8 @@ def api_strata_update():
 def api_strata_launch(b: StrataLaunchBody):
     if not strata_bin():
         raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    if not b.plan and MAYA.status().get("running"):
+        raise HTTPException(409, "Stop Maya first — Strata needs its GPU VRAM.")
     args = strata_build_args(b, plan=b.plan)
     # A plan is read-only, so it is worth the long timeout; a real launch downloads and
     # loads a model and must not be cut off mid-download by a short client-side wait.
@@ -3167,6 +3898,43 @@ def api_strata_telemetry():
 def api_strata_log():
     return {"log": "\n".join(list(STRATA_LOG)[-120:])}
 
+# ---------------------------------------------------------------- maya api
+@app.get("/api/maya/status")
+def api_maya_status():
+    return MAYA.status()
+
+@app.get("/api/maya/configs")
+def api_maya_configs():
+    return {"configs": MAYA.discover_configs()}
+
+class MayaStartBody(BaseModel):
+    config: str
+    switch: bool = False
+
+@app.post("/api/maya/start")
+def api_maya_start(b: MayaStartBody):
+    return MAYA.switch(b.config) if b.switch else MAYA.start(b.config)
+
+@app.post("/api/maya/switch")
+def api_maya_switch(b: MayaStartBody):
+    return MAYA.switch(b.config)
+
+@app.post("/api/maya/stop")
+def api_maya_stop():
+    return MAYA.stop()
+
+@app.get("/api/maya/log")
+def api_maya_log():
+    return MAYA.tail_log(max_lines=250)
+
+@app.get("/api/maya/key")
+def api_maya_key(reveal: bool = False, config: str | None = None):
+    """Masked API key for the active (or specified) Maya config; reveal=1 returns the raw key."""
+    key = MAYA.active_api_key(config)
+    if not key:
+        return {"key_set": False, "masked": "", "key": ""}
+    return {"key_set": True, "masked": _mask_secret(key), "key": key if reveal else ""}
+
 def _strata_alias() -> str:
     last = CFG.get("strata_last") or {}
     return str(last.get("model") or CFG.get("strata_alias") or "strata")
@@ -3174,23 +3942,35 @@ def _strata_alias() -> str:
 def _current_llm(prefer: str | None = None):
     """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running.
     `prefer` pins the source: None/'auto' keeps the fallback order; a source name answers
-    only that server, so the sync endpoint can say "this tab's server isn't running"."""
+    only that server, so the sync endpoint can say "this tab's server isn't running".
+    Alias and context come from the server itself, falling back to manifest/panel state."""
     want = lambda s: prefer in (None, "auto", s)
+
+    def from_server(fallback_alias, port, pid, fallback_ctx, key, source):
+        alias, ctx = _server_facts(port)
+        return (alias or fallback_alias), port, (ctx or fallback_ctx), key, source
+
     m = MGR.status()
     if want("panel") and m.get("running") and m["port"] != AVALON_PORT:
-        return m.get("alias"), m["port"], _proc_ctx(m["pid"]), "", "panel"
+        return from_server(m.get("alias"), m["port"], m.get("pid"), _proc_ctx(m.get("pid")), "", "panel")
     a = SMGR.status()
     if want("avalon") and a.get("running"):
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           a.get("pid"), _proc_ctx(a.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     if want("avalon") and m.get("running"):  # discovery adopted the systemd avalon on 8086
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           m.get("pid"), _proc_ctx(m.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     s = strata_status()
     if want("strata") and s.get("running") and s.get("port"):
         # The key is only forwarded if the operator set strata_api_key deliberately. Strata
         # owns its own key (`strata launch --show-key`); auto-reading it would push a real
         # secret into every synced agent config and into panel state without being asked.
-        return _strata_alias(), s["port"], int(CFG.get("strata_ctx") or 8192), \
-            CFG.get("strata_api_key", ""), "strata"
+        return from_server(_strata_alias(), s["port"], None, int(CFG.get("strata_ctx") or 8192),
+                           CFG.get("strata_api_key", ""), "strata")
+    my = MAYA.status()
+    if want("maya") and my.get("running") and my.get("port"):
+        return (my.get("alias") or my.get("model_name") or "maya"), my["port"], \
+            int(my.get("ctx") or 131072), MAYA.active_api_key(), "maya"
     return None
 
 def _chat_target():
@@ -3206,6 +3986,9 @@ def _chat_target():
     s = strata_status()
     if s.get("running") and s.get("port") and s.get("health") == "ready":
         return s["port"], CFG.get("strata_api_key", "")
+    my = MAYA.status()
+    if my.get("running") and my.get("state") == "ready" and my.get("port"):
+        return my["port"], MAYA.active_api_key()
     return None
 
 def _yaml_merge(path, apply):
@@ -3218,49 +4001,161 @@ def _yaml_merge(path, apply):
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     return str(path)
 
+def _jsonc_load(text):
+    """json.loads that survives JSONC (// and /* */ comments, trailing commas) — Zed and
+    opencode both ship comment-bearing settings files, and a plain json.loads turns a
+    perfectly good settings file into a hard "Expecting value: line 1" failure."""
+    out, inner, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.extend(text[i:j]); inner.extend([True] * (j - i)); i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c); inner.append(False); i += 1
+    chars = []
+    for idx, ch in enumerate(out):
+        if ch == "," and not inner[idx]:
+            k = idx + 1
+            while k < len(out) and out[k] in " \t\r\n":
+                k += 1
+            if k < len(out) and out[k] in "}]":
+                continue  # trailing comma
+        chars.append(ch)
+    return json.loads("".join(chars))
+
 def _json_merge(path, apply):
     path = Path(path)
     cfg = {}
     if path.exists():
-        cfg = json.loads(path.read_text())
+        text = path.read_text()
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError:
+            cfg = _jsonc_load(text)  # raises with a usable message if it really is broken
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a JSON object")
     apply(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2))
     return str(path)
 
+def _yaml_upsert(path, parent, key, value):
+    """Set <parent>.<key> in a YAML file and leave every other byte alone. Round-tripping the
+    whole document through safe_load/safe_dump (the old approach) re-indented and stripped
+    the comments out of files like ~/.hermes/config.yaml on every single sync."""
+    path = Path(path)
+    text = path.read_text() if path.exists() else ""
+    try:
+        root = yaml.compose(text) if text.strip() else None
+    except yaml.YAMLError:
+        raise HTTPException(400, f"{path} is not valid YAML — fix it first")
+
+    def dump_block(val, col):
+        s = yaml.safe_dump(val, sort_keys=False, default_flow_style=False).rstrip("\n")
+        pad = " " * col
+        return "\n".join(pad + ln if ln.strip() else ln for ln in s.splitlines())
+
+    if isinstance(root, yaml.MappingNode):
+        tops = {k.value: v for k, v in root.value if isinstance(k, yaml.ScalarNode)}
+        pval = tops.get(parent)
+        if isinstance(pval, yaml.MappingNode) and not pval.flow_style:
+            pair = next(((kn, vn) for kn, vn in pval.value
+                         if isinstance(kn, yaml.ScalarNode) and kn.value == key), None)
+            if pair:
+                knode, old = pair
+                start, end = old.start_mark.index, old.end_mark.index
+                line_start = text.rfind("\n", 0, start) + 1
+                seg = text[start:end]
+                tail_nl = "\n" if seg.endswith("\n") else ""
+                if text[line_start:start].strip() == "":     # value sits on its own lines
+                    text = text[:line_start] + dump_block(value, start - line_start) + tail_nl + text[end:]
+                else:                                        # inline value after `key: `
+                    col = knode.start_mark.column + 2
+                    text = text[:start] + "\n" + dump_block(value, col) + "\n" + text[end:].lstrip("\n")
+            elif pval.value:
+                col = pval.value[0][0].start_mark.column
+                at = pval.value[-1][1].end_mark.index
+                tail = text[at:]
+                if tail.startswith("\n"):
+                    tail = tail[1:]
+                text = text[:at].rstrip("\n") + "\n" + dump_block({key: value}, col) + "\n" + tail
+            else:
+                root = None  # empty/flow-style parent: fall through to the full rewrite
+        elif parent not in tops:
+            text = (text.rstrip("\n") + "\n" if text.strip() else "") + \
+                f"{parent}:\n" + dump_block({key: value}, 2)
+        else:
+            root = None  # parent is a scalar/flow mapping: full rewrite below
+    else:
+        root = None
+    if root is None:
+        cfg = yaml.safe_load(text) or {}
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a YAML mapping — fix it first")
+        sub = cfg.setdefault(parent, {})
+        if not isinstance(sub, dict):
+            raise HTTPException(400, f"{path}: '{parent}' is not a mapping — fix it first")
+        sub[key] = value
+        text = yaml.safe_dump(cfg, sort_keys=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n")
+    return str(path)
+
 def _toml_strip_section(text, headers):
     out, skip = [], False
     for ln in text.splitlines():
-        if ln.startswith("[") and ln.endswith("]"):
-            skip = ln.strip() in headers
+        head = ln.split("#", 1)[0].strip()
+        if head.startswith("[") and head.endswith("]"):
+            skip = head in headers
         if not skip:
             out.append(ln)
     return "\n".join(out).rstrip() + "\n"
 
-def _w_omp(alias, base, ctx):
-    def apply(cfg):
-        prov = {"baseUrl": base + "/v1", "api": "openai-completions", "auth": "none",
-                "models": [{"id": alias, "name": alias, "api": "openai-completions",
-                            "reasoning": False, "input": ["text"],
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                            "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
-        cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = prov
-    return _yaml_merge(HOME / ".omp/agent/models.yml", apply) + " — omp: omp --model inference-console/" + alias
+def _w_omp(alias, base, ctx, key=""):
+    prov = {"baseUrl": base + "/v1", "api": "openai-completions",
+            "auth": "apiKey" if key else "none",
+            "models": [{"id": alias, "name": alias, "api": "openai-completions",
+                        "reasoning": False, "input": ["text"],
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
+    if key:
+        prov["apiKey"] = key
+    return _yaml_upsert(HOME / ".omp/agent/models.yml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — omp: omp --model inference-console/" + alias
 
-def _w_opencode(alias, base, ctx):
+def _w_opencode(alias, base, ctx, key=""):
     def apply(cfg):
+        opts = {"baseURL": base + "/v1"}
+        if key:
+            opts["apiKey"] = key
         cfg.setdefault("provider", {})[PANEL_PROVIDER_ID] = {
             "npm": "@ai-sdk/openai-compatible",
-            "options": {"baseURL": base + "/v1"},
+            "options": opts,
             "models": {alias: {"name": alias}}}
     return _json_merge(HOME / ".config/opencode/opencode.json", apply) + " — opencode: provider inference-console"
 
-def _w_codex(alias, base, ctx):
+def _w_codex(alias, base, ctx, key=""):
     path = Path(HOME / ".codex/config.toml")
     old = path.read_text() if path.exists() else ""
     old = _toml_strip_section(old, {"[model_providers." + PANEL_PROVIDER_ID + "]", "[profiles." + PANEL_PROVIDER_ID + "]"})
+    key_ln = f"experimental_bearer_token = \"{key}\"\n" if key else ""
     block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"Inference Console\"\n"
-             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n"
+             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n{key_ln}"
              f"\n[profiles.{PANEL_PROVIDER_ID}]\nmodel_provider = \"{PANEL_PROVIDER_ID}\"\nmodel = \"{alias}\"\n")
     import tomllib
     merged = old + block
@@ -3269,10 +4164,10 @@ def _w_codex(alias, base, ctx):
     path.write_text(merged)
     return str(path) + " — codex: codex --profile inference-console"
 
-def _w_aider(alias, base, ctx):
+def _w_aider(alias, base, ctx, key=""):
     def apply(cfg):
         cfg["openai-api-base"] = base + "/v1"
-        cfg["openai-api-key"] = "panel"
+        cfg["openai-api-key"] = key or "panel"
         cfg["model"] = "openai/" + alias
     return _yaml_merge(HOME / ".aider.conf.yml", apply) + " — aider: aider (model openai/" + alias + ")"
 
@@ -3280,32 +4175,40 @@ def _w_zed(alias, base, ctx):
     def apply(cfg):
         lm = cfg.setdefault("language_models", {}).setdefault("openai", {})
         lm["api_url"] = base + "/v1"
-        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}]
+        # Merge instead of replacing: available_models is the user's own list of models
+        # behind the openai provider, and wiping it unregisters everything else they had.
+        keep = [m for m in (lm.get("available_models") or []) if (m or {}).get("name") != alias]
+        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}] + keep
     return _json_merge(HOME / ".config/zed/settings.json", apply) + " — zed: openai provider model " + alias
 
-def _w_continue(alias, base, ctx):
+def _w_continue(alias, base, ctx, key=""):
     def apply(cfg):
         models = [m for m in cfg.get("models", []) if m.get("name") != alias]
         models.append({"name": alias, "provider": "openai", "model": alias,
-                       "apiBase": base + "/v1", "apiKey": "panel", "capabilities": ["tool_use"]})
+                       "apiBase": base + "/v1", "apiKey": key or "panel", "capabilities": ["tool_use"]})
         cfg["models"] = models
     return _yaml_merge(HOME / ".continue/config.yaml", apply) + " — continue: model " + alias
 
 def _w_claude(alias, base, ctx, key):
-    import httpx
+    tok = key or "panel"
     try:
-        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 8,
+        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]},
                        headers={"anthropic-version": "2023-06-01",
-                                "x-api-key": key or "panel"}, timeout=15)
-        if r.status_code == 404:
-            raise HTTPException(400, "this llama-server has no Anthropic-compat /v1/messages endpoint")
+                                "x-api-key": tok,
+                                "Authorization": f"Bearer {tok}"}, timeout=20)
     except httpx.HTTPError:
         raise HTTPException(400, "server unreachable for /v1/messages probe")
+    if r.status_code == 404:
+        raise HTTPException(400, "this server has no Anthropic-compat /v1/messages endpoint")
+    if r.status_code >= 400:
+        # 401/403 here almost always means a mismatched key; writing the env block anyway
+        # leaves Claude Code pointing at a server that will refuse every request.
+        raise HTTPException(400, f"/v1/messages returned {r.status_code}: {(r.text or '')[:200]}")
     def apply(cfg):
         cfg.setdefault("env", {}).update({
             "ANTHROPIC_BASE_URL": base,
-            "ANTHROPIC_AUTH_TOKEN": key or "panel",
+            "ANTHROPIC_AUTH_TOKEN": tok,
             "ANTHROPIC_MODEL": alias})
     return _json_merge(HOME / ".claude/settings.json", apply) + " — claude-code: env points at " + base
 
@@ -3323,12 +4226,13 @@ def _w_pi(alias, base, ctx, key):
     return str(path) + " — pi: provider inference-console"
 
 def _w_hermes(alias, base, ctx, key):
-    def apply(cfg):
-        prov = cfg.setdefault("providers", {}).setdefault(PANEL_PROVIDER_ID, {})
-        prov.update({"name": "Inference Console", "base_url": base + "/v1",
-                     "default_model": alias, "model": alias,
-                     "models": {alias: {}}, "models_discovered": True})
-    return _yaml_merge(HOME / ".hermes/config.yaml", apply) + " — hermes: pick /model custom:inference-console"
+    prov = {"name": "Inference Console", "base_url": base + "/v1",
+            "default_model": alias, "model": alias,
+            "models": {alias: {}}, "models_discovered": True}
+    if key:
+        prov["api_key"] = key
+    return _yaml_upsert(HOME / ".hermes/config.yaml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — hermes: pick /model custom:inference-console"
 
 def _w_kimi(alias, base, ctx, key):
     path = HOME / ".kimi-code/config.toml"
@@ -3345,16 +4249,16 @@ def _w_kimi(alias, base, ctx, key):
     return str(path) + " — kimi: model inference-console/" + alias
 
 AGENTS = {
-    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c),        "selector inference-console/<alias>"),
-    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),      "selector inference-console/<alias>"),
-    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c),   "provider inference-console"),
-    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c),      "codex --profile inference-console"),
-    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c),      "openai/<alias>"),
-    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),        "replaces Zed openai available_models"),
-    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c),   "adds model row"),
-    "claude-code": ("Claude Code",        _w_claude,                                 "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
-    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),  "then pick /model custom:inference-console"),
-    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),    "model inference-console/<alias>"),
+    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c, k),      "selector inference-console/<alias>"),
+    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),       "selector inference-console/<alias>"),
+    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c, k), "provider inference-console"),
+    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c, k),    "codex --profile inference-console"),
+    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c, k),    "openai/<alias>"),
+    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),         "merges into Zed openai available_models"),
+    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c, k), "adds model row"),
+    "claude-code": ("Claude Code",        _w_claude,                                  "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
+    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),   "then pick /model custom:inference-console"),
+    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),     "model inference-console/<alias>"),
 }
 
 @app.get("/api/agents")
@@ -3362,18 +4266,30 @@ def api_agents():
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
+    my = MAYA.status()
+    sources = {
+        "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
+        "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
+        "strata": bool(s.get("running") and s.get("port")),
+        "maya": bool(my.get("running") and my.get("port")),
+    }
+    targets = {}
+    for src_name, up in sources.items():
+        if not up:
+            targets[src_name] = None
+            continue
+        cur = _current_llm(src_name)
+        targets[src_name] = {"alias": cur[0], "port": cur[1], "ctx": cur[2], "source": cur[4]} if cur else None
+    running = _current_llm()
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
-            "running": _current_llm(),
-            "sources": {
-                "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
-                "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
-                "strata": bool(s.get("running") and s.get("port")),
-            }}
+            "running": [running[0], running[1], running[2], running[4]] if running else None,
+            "sources": sources,
+            "targets": targets}
 
 class AgentSyncBody(BaseModel):
     agents: list[str]
-    source: str | None = None  # auto | panel | avalon | strata
+    source: str | None = None  # auto | panel | avalon | strata | maya
 
 @app.post("/api/agents/sync")
 def api_agents_sync(b: AgentSyncBody):
@@ -3399,9 +4315,10 @@ def api_agents_sync(b: AgentSyncBody):
             out[aid] = {"ok": False, "detail": str(e.detail)}
         except Exception as e:
             out[aid] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
-    st.update(alias=alias, port=port, source=source, synced_at=time.time())
-    _save_agents_state(st)
-    return {"results": out, "alias": alias, "port": port}
+    if any(v["ok"] for v in out.values()):
+        st.update(alias=alias, port=port, source=source, synced_at=time.time())
+        _save_agents_state(st)
+    return {"results": out, "alias": alias, "port": port, "source": source}
 
 
 class StartBody(BaseModel):
@@ -3563,6 +4480,59 @@ def api_settings_set(b: SettingsBody):
         CFG["agent_llm_fallback_local"] = bool(b.agent_llm_fallback_local)
     _save_config_secure()
     return api_settings_get()
+
+# ---------------------------------------------------------------- panel process (restart)
+PANEL_STARTED_AT = time.time()
+
+def _self_argv() -> list:
+    """argv that re-launches this panel exactly as it was invoked, with a resolved
+    interpreter and script/shim path so execv works after a cd or a PATH change."""
+    argv = list(sys.argv) or [str(Path(__file__).resolve())]
+    first = Path(argv[0])
+    if first.exists():
+        argv[0] = str(first.resolve())
+    else:
+        found = shutil.which(argv[0])
+        if found:
+            argv[0] = found
+    return [sys.executable] + argv
+
+def _restart_self(argv: list, delay: float):
+    """Replace this process image in place. Nothing else is forked, so the PID stays the
+    same (systemd keeps tracking it) and the llama-server/Avalon/Strata children, which run
+    in their own sessions, keep serving; the panel re-adopts them from its state files."""
+    time.sleep(delay)
+    print(f"panel: restarting in place: {' '.join(argv)}", flush=True)
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.flush()
+        except Exception:
+            pass
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as e:
+        # Do not exit: a failed restart must leave the running panel serving.
+        print(f"panel: restart failed, still serving: {e}", flush=True)
+
+class RestartBody(BaseModel):
+    delay_ms: int = 600
+
+@app.get("/api/panel/ping")
+def api_panel_ping():
+    argv = _self_argv()
+    return {"ok": True, "pid": os.getpid(), "port": PORT,
+            "started_at": PANEL_STARTED_AT, "uptime_s": round(time.time() - PANEL_STARTED_AT, 1),
+            "argv": argv, "restartable": Path(argv[0]).exists()}
+
+@app.post("/api/panel/restart")
+def api_panel_restart(b: RestartBody | None = None):
+    argv = _self_argv()
+    if not Path(argv[0]).exists():
+        raise HTTPException(400, f"cannot restart: interpreter not found: {argv[0]}")
+    delay = max(0.0, min(5.0, (b.delay_ms if b else 600) / 1000))
+    _save_sessions()  # keep the tab signed in across the re-exec
+    threading.Thread(target=_restart_self, args=(argv, delay), daemon=True).start()
+    return {"ok": True, "pid": os.getpid(), "argv": argv, "delay_s": delay}
 
 # ---------------------------------------------------------------- engine setup (one-click installs)
 # One background job at a time: download/build runs stream log lines the UI polls.
@@ -4086,7 +5056,7 @@ def api_agent_hf_recommend(b: AgentHFRecommendBody):
 async def api_chat(req: Request):
     tgt = _chat_target()
     if not tgt:
-        raise HTTPException(409, "no model ready — load one in the Models, Strata, or Avalon tab")
+        raise HTTPException(409, "no model ready — load one in the Models, Strata, Avalon, or Maya tab")
     MGR.touch()
     port, key = tgt
     body = await req.json()
@@ -4134,30 +5104,31 @@ HTML = r"""<!doctype html>
 :root:has(> head > meta[name="color-scheme"][content="dark"]) { color-scheme: dark; }
 :root:has(> head > meta[name="color-scheme"][content="light"]) { color-scheme: light; }
 :root {
-  --bg:#090b10; --bg-2:#0d1118; --panel:#11161f; --panel-2:#151c27; --raise:#1a2230;
-  --bd:#1f2837; --bd-2:#2a3548;
-  --fg:#edf2f8; --fg-2:#c0cad8; --mut:#8493a8; --faint:#59667a;
+  --bg:#080a0f; --bg-2:#0d1118; --panel:#111620; --panel-2:#161c28; --raise:#1c2434;
+  --bd:#1f2838; --bd-2:#2c384e;
+  --fg:#edf2f8; --fg-2:#c4cedd; --mut:#8595ab; --faint:#5a687e;
   --acc:#22d3ee; --acc-2:#f59e0b; --acc-ink:#04131a;
   --ok:#34d399; --warn:#f59e0b; --err:#f87171;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(34,211,238,.09) 0%,rgba(245,158,11,.04) 44%,rgba(0,0,0,0) 70%);
+  --glow:radial-gradient(960px 440px at 88% -8%,rgba(34,211,238,.08) 0%,rgba(245,158,11,.03) 42%,rgba(0,0,0,0) 70%);
   --grad:linear-gradient(135deg,#22d3ee,#06b6d4);
-  --sh:0 2px 6px rgba(0,0,0,.28);
+  --sh:0 1px 3px rgba(0,0,0,.32);
   --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-  --r:12px;
+  --r:11px;
+  --rail:224px;
 }
 [data-theme=light] {
-  --bg:#f4f6fa; --bg-2:#eaeff5; --panel:#ffffff; --panel-2:#f9fbfd; --raise:#edf2f8;
-  --bd:#d9e1ec; --bd-2:#c2cedd;
+  --bg:#f4f6fa; --bg-2:#eaf0f6; --panel:#ffffff; --panel-2:#f9fbfd; --raise:#edf2f8;
+  --bd:#d9e1ec; --bd-2:#c0cddc;
   --fg:#0f1724; --fg-2:#334155; --mut:#5b6b82; --faint:#8594a8;
   --acc:#0284c7; --acc-2:#d97706; --acc-ink:#ffffff;
   --ok:#059669; --warn:#b45309; --err:#dc2626;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(2,132,199,.08) 0%,rgba(0,0,0,0) 68%);
-  --sh:0 2px 6px rgba(15,23,36,.07);
+  --glow:radial-gradient(960px 440px at 88% -8%,rgba(2,132,199,.07) 0%,rgba(0,0,0,0) 68%);
+  --sh:0 1px 3px rgba(15,23,36,.07);
 }
 *,*::before,*::after{box-sizing:border-box}
 html{-webkit-text-size-adjust:100%}
 body{margin:0;min-height:100vh;background-color:var(--bg);
-  background-image:var(--glow),radial-gradient(color-mix(in srgb,var(--bd-2) 45%,transparent) 1px,transparent 1px);
+  background-image:var(--glow),radial-gradient(color-mix(in srgb,var(--bd-2) 38%,transparent) 1px,transparent 1px);
   background-size:100% 100%,24px 24px;background-repeat:no-repeat,repeat;color:var(--fg);
   font:13.5px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;
   -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
@@ -4171,35 +5142,56 @@ code,pre,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
 .skip{position:absolute;left:-1px;top:-44px;background:var(--acc);color:var(--acc-ink);padding:8px 12px;border-radius:8px;z-index:99;font-weight:600}
 .skip:focus{top:8px;left:8px}
 :focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
-::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar{width:8px;height:8px}
 ::-webkit-scrollbar-thumb{background:var(--bd-2);border-radius:99px;border:2px solid transparent;background-clip:content-box}
 ::-webkit-scrollbar-track{background:transparent}
 
-/* ---------- header ---------- */
-header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px;padding:8px 16px;
-  background:color-mix(in srgb,var(--bg) 86%,transparent);
-  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
-  border-bottom:1px solid var(--bd)}
-.brand{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);display:grid;place-items:center;
-  color:var(--acc-ink);box-shadow:0 1px 3px rgba(0,0,0,.35)}
-.mark svg{width:16px;height:16px}
-.brand .nm{font-size:14.5px;font-weight:700;line-height:1.15;letter-spacing:-.02em}
-.brand .sub{display:block;font-size:11px;font-weight:500;color:var(--mut);font-family:var(--mono)}
-.nav{display:flex;gap:2px;padding:3px;background:var(--panel);border:1px solid var(--bd);border-radius:10px;
-  overflow-x:auto;scrollbar-width:none;min-width:0}
-.nav::-webkit-scrollbar{display:none}
-.nav button{display:flex;align-items:center;gap:6px;padding:6px 10px;border:0;border-radius:7px;background:transparent;
-  color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .14s,color .14s}
-.nav button svg{width:14px;height:14px;opacity:.82;flex-shrink:0}
+/* ---------- workbench shell (left rail + top command bar) ---------- */
+.shell{display:grid;grid-template-columns:var(--rail) minmax(0,1fr);min-height:100vh}
+.rail{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;background:var(--panel);
+  border-right:1px solid var(--bd);padding:12px 10px;gap:10px;overflow-y:auto;z-index:45}
+.rail-top{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:2px 4px 10px;border-bottom:1px solid var(--bd)}
+.brand{display:flex;align-items:center;gap:9px;min-width:0}
+.mark{width:28px;height:28px;border-radius:8px;background:var(--grad);display:grid;place-items:center;
+  color:var(--acc-ink);box-shadow:0 1px 3px rgba(0,0,0,.35);flex-shrink:0}
+.mark svg{width:15px;height:15px}
+.brand .nm{font-size:14px;font-weight:700;line-height:1.15;letter-spacing:-.02em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.brand .sub{display:block;font-size:12px;font-weight:500;color:var(--mut);font-family:var(--mono)}
+.nav{display:flex;flex-direction:column;gap:12px;flex:1;min-height:0}
+.nav-grp{display:flex;flex-direction:column;gap:2px}
+.nav-lbl{font-size:12px;font-weight:700;color:var(--mut);text-transform:uppercase;letter-spacing:.06em;padding:4px 9px 2px}
+.nav button{display:flex;align-items:center;gap:9px;padding:7px 9px;border:1px solid transparent;border-radius:8px;background:transparent;
+  color:var(--mut);font:inherit;font-size:13px;font-weight:600;cursor:pointer;white-space:nowrap;text-align:left;width:100%;
+  transition:background .12s,color .12s,border-color .12s}
+.nav button svg{width:15px;height:15px;opacity:.8;flex-shrink:0}
+.nav button .nl{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis}
+.nav button .nb{font-size:11px;font-family:var(--mono);color:var(--fg-2);background:var(--bg-2);border:1px solid var(--bd);
+  border-radius:999px;padding:0 6px;line-height:1.5;font-variant-numeric:tabular-nums}
+.nav button .ndot{width:7px;height:7px;border-radius:99px;background:var(--faint);flex-shrink:0}
+.nav button .ndot.ok{background:var(--ok)}
+.nav button .ndot.warn{background:var(--warn)}
 .nav button:hover{color:var(--fg);background:var(--raise)}
-.nav button.on{color:var(--fg);background:var(--raise);box-shadow:inset 0 0 0 1px var(--bd-2)}
+.nav button.on{color:var(--fg);background:var(--raise);border-color:var(--bd-2)}
 .nav button.on svg{color:var(--acc);opacity:1}
+.rail-foot{border-top:1px solid var(--bd);padding-top:10px;display:flex;flex-direction:column;gap:8px}
+.rail-vitals{padding:8px 9px;border-radius:8px;background:var(--bg-2);border:1px solid var(--bd);cursor:pointer;transition:border-color .14s}
+.rail-vitals:hover{border-color:var(--bd-2)}
+.rv-row{display:flex;justify-content:space-between;align-items:center;font-size:12px;font-family:var(--mono);color:var(--fg-2);font-variant-numeric:tabular-nums}
+.rv-row span:last-child{color:var(--mut)}
+
+.work{display:flex;flex-direction:column;min-width:0;min-height:100vh}
+header.topbar{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px;padding:9px 18px;
+  background:color-mix(in srgb,var(--bg) 88%,transparent);
+  backdrop-filter:blur(12px) saturate(140%);-webkit-backdrop-filter:blur(12px) saturate(140%);
+  border-bottom:1px solid var(--bd)}
+.mob-menu{display:none}
+.view-title{font-size:14.5px;font-weight:700;letter-spacing:-.015em;white-space:nowrap}
 .hgap{flex:1;min-width:4px}
-.tele-strip{display:flex;align-items:center;gap:6px;flex-wrap: nowrap;overflow:hidden}
+.tele-strip{display:flex;align-items:center;gap:6px;flex-wrap:nowrap;overflow:hidden}
 .pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;border:1px solid var(--bd-2);
-  background:var(--panel);color:var(--fg-2);font-size:12px;font-weight:600;white-space:nowrap;max-width:34vw;overflow:hidden;
-  font-variant-numeric:tabular-nums}
+  background:var(--panel);color:var(--fg-2);font-size:12px;font-weight:600;white-space:nowrap;max-width:32vw;overflow:hidden;
+  font-variant-numeric:tabular-nums;cursor:pointer;transition:border-color .14s,background .14s}
+.pill:hover{border-color:var(--mut);background:var(--raise)}
 .pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 36%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
 .pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 36%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
 .pill .dot{width:7px;height:7px;border-radius:99px;background:currentColor;flex-shrink:0}
@@ -4213,8 +5205,8 @@ header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px
 .cmdbtn svg{width:13px;height:13px}
 
 /* ---------- layout ---------- */
-main{padding:16px 16px 44px;max-width:1320px;margin:0 auto}
-section{animation:fade .18s ease-out}
+main{padding:18px 20px 36px;max-width:1360px;width:100%;margin:0 auto;flex:1}
+section{animation:fade .16s ease-out}
 @keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
 .hide{display:none !important}
 .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
@@ -4415,15 +5407,21 @@ dialog::backdrop{background:rgba(4,7,12,.68);backdrop-filter:blur(4px);-webkit-b
 @keyframes tout{to{opacity:0;transform:translateY(5px)}}
 
 /* ---------- footer ---------- */
-footer{max-width:1320px;margin:0 auto;padding:0 16px 26px;color:var(--faint);font-size:11.5px;
+footer{max-width:1360px;width:100%;margin:0 auto;padding:0 20px 22px;color:var(--faint);font-size:11.5px;
   display:flex;gap:14px;flex-wrap:wrap;align-items:center}
 kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border-radius:5px;
   padding:1px 5px;background:var(--bg-2);color:var(--fg-2)}
 
+/* ---------- responsive mobile rail ---------- */
+.rail-backdrop{display:none;position:fixed;inset:0;background:rgba(4,7,12,.6);z-index:44}
 @media (max-width:960px){
-  header{flex-wrap:wrap;gap:8px}
-  .brand .sub{display:none}
-  .nav{order:3;width:100%}
+  .shell{grid-template-columns:1fr}
+  .rail{position:fixed;left:0;top:0;bottom:0;width:250px;transform:translateX(-105%);transition:transform .2s ease;box-shadow:0 4px 12px rgba(0,0,0,.5)}
+  body.nav-open .rail{transform:translateX(0)}
+  body.nav-open .rail-backdrop{display:block}
+  .mob-menu{display:grid}
+  header.topbar{padding:8px 12px}
+  main{padding:14px 12px 32px}
   .two>.side{width:100%;flex:1 1 100%}
   .mrow{grid-template-columns:auto 1fr}
   .mrow .fitbox{grid-column:1 / -1}
@@ -4451,25 +5449,52 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 </style></head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header>
-  <div class="brand">
-    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
-    <span class="nm">Inference Console<span class="sub">local inference console</span></span>
+<div class="rail-backdrop" id="railbackdrop"></div>
+<div class="shell">
+<aside class="rail" id="rail" aria-label="Primary navigation">
+  <div class="rail-top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+      <span class="nm">Inference Console<span class="sub">local model workbench</span></span>
+    </div>
   </div>
   <nav class="nav" id="nav" aria-label="Sections">
-    <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
-    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>llama.cpp</button>
-    <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg>Strata</button>
-    <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Avalon</button>
-    <button data-t="agent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></svg>Agent</button>
-    <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>Vitals</button>
-    <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg>Chat</button>
-    <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>HF Pull</button>
-    <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>Settings</button>
+    <div class="nav-grp">
+      <div class="nav-lbl">Workspace</div>
+      <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nl">Models</span><span class="nb" id="nb-models">0</span></button>
+      <button data-t="agent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></svg><span class="nl">Agent</span></button>
+      <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg><span class="nl">Chat</span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">Engines</div>
+      <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="nl">llama.cpp</span><span class="ndot" id="nd-server" title="llama.cpp status"></span></button>
+      <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg><span class="nl">Strata</span><span class="ndot" id="nd-strata" title="Strata status"></span></button>
+      <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="nl">Avalon</span><span class="ndot" id="nd-avalon" title="Avalon status"></span></button>
+      <button data-t="maya"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2L4 7v10l8 5 8-5V7l-8-5z"/><circle cx="12" cy="12" r="3"/></svg><span class="nl">Maya</span><span class="ndot" id="nd-maya" title="Maya status"></span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">System</div>
+      <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg><span class="nl">Vitals</span></button>
+      <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="nl">HF Pull</span><span class="nb hide" id="nb-dl">0</span></button>
+      <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg><span class="nl">Settings</span></button>
+    </div>
   </nav>
+  <div class="rail-foot">
+    <div class="rail-vitals" id="railvitals" title="Click to open System Vitals">
+      <div class="rv-row"><span id="rv-mem-lbl">Memory</span><span id="rv-mem-val">…</span></div>
+      <div class="meter" id="rv-mem-bar" style="margin:4px 0 6px"><i style="width:0%"></i></div>
+      <div class="rv-row"><span>CPU</span><span id="rv-cpu-val">…</span></div>
+    </div>
+  </div>
+</aside>
+
+<div class="work">
+<header class="topbar">
+  <button class="icon mob-menu" id="mobmenu" aria-label="Toggle navigation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <span class="view-title" id="viewtitle">Models</span>
   <span class="hgap"></span>
   <div class="tele-strip">
-    <span class="pill" id="hdrstatus" title="Active inference server"><span class="dot"></span><span id="hdrtext">checking…</span></span>
+    <button type="button" class="pill" id="hdrstatus" title="Active inference server (click to inspect)"><span class="dot"></span><span id="hdrtext">checking…</span></button>
     <span class="tag acc hide" id="hdrtps" title="Live generation throughput"></span>
     <span class="tag mut hide" id="hdrkv" title="KV cache fill"></span>
     <span class="tag mut hide" id="hdridle" title="Idle auto-unload timer"></span>
@@ -4638,9 +5663,9 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 
   <div class="card hide" id="strataformcard" style="margin-top:14px">
-    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed — Strata defaults stay in charge</span></div>
+    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed, Strata defaults stay in charge</span></div>
     <div class="form-grid">
-      <div class="field"><label>Preset</label><select id="st-preset"><option value="">— none —</option></select></div>
+      <div class="field"><label>Preset</label><select id="st-preset"><option value="">(none)</option></select></div>
       <div class="field"><label>Family</label><select id="st-family"><option value="">auto</option><option value="qwen">qwen (Flash-Next)</option><option value="coder">coder</option><option value="unsloth">unsloth</option><option value="gyro">gyro</option><option value="swift">swift</option><option value="nvfp4">nvfp4</option><option value="qwen36">qwen36 (35B)</option></select></div>
       <div class="field"><label>Model / quant</label><input id="st-model" type="text" placeholder="e.g. iq3_xxs, q2_0, UD-Q4_K_XL"></div>
       <div class="field"><label>Model path (files I already have)</label><input id="st-modelpath" type="text" placeholder="/path/to/model folder or .gguf"></div>
@@ -4684,8 +5709,19 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div id="st-presets" class="kvs"></div>
   </div>
 
+  <div class="card hide" id="stratametricscard" style="margin-top:14px">
+    <div class="hd"><h2>Strata live metrics</h2><span class="tag acc" id="st-metrics-chip">polling</span></div>
+    <div id="st-metrics" class="kvs"></div>
+  </div>
+
   <div class="card" style="margin-top:14px">
-    <div class="hd"><h2>Strata log</h2></div>
+    <div class="hd"><h2>Strata log</h2><span class="tag mut" id="stlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="stlogfilter" type="search" placeholder="Filter Strata log…" aria-label="Filter Strata log"></div>
+      <label class="switch"><input type="checkbox" id="stlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="stlogcopy">Copy</button>
+    </div>
     <pre class="log" id="stratalog" style="max-height:280px"></pre>
   </div>
 </section>
@@ -4737,25 +5773,25 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <select id="av-np"><option value="0">Profile default (1)</option><option value="1">1 slot</option><option value="2">2 slots</option><option value="4">4 slots</option></select></div>
         <div class="field"><label>GPU device (--device)</label>
           <select id="av-device">
-            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB) — recommended</option>
+            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB, recommended)</option>
             <option value="ROCm1">ROCm1 · 780M iGPU (32 GB GTT, shares system RAM)</option>
             <option value="ROCm0,ROCm1">ROCm0 + ROCm1 split</option>
           </select>
-          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build — any launch that touches it dies with “invalid device function”.</div></div>
+          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build, so any launch that touches it dies with “invalid device function”.</div></div>
         <div class="field"><label>GPU layers (-ngl) · empty = auto-fit</label>
           <input id="av-ngl" type="number" placeholder="auto-fit (-fit on)" min="0" max="999">
-          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM — this 88 GiB pack (40 dense + 48 expert + ~10 KV at 262k) never does.</div></div>
+          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM.</div></div>
         <div class="field"><label>MoE experts in CPU RAM (--n-cpu-moe)</label>
           <input id="av-cmoe" type="number" placeholder="fork default (none forced)" min="0" max="999">
-          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM — forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
+          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM; forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
         <div class="field"><label>Flash Attention (-fa)</label>
-          <select id="av-fa"><option value="">default (on)</option><option value="on">on — recommended on ROCm0</option><option value="off">off</option></select>
+          <select id="av-fa"><option value="">default (on)</option><option value="on">on (recommended on ROCm0)</option><option value="off">off</option></select>
           <div class="hint">On cuts KV memory and speeds prefill on NAVI31. Only relevant if you force the iGPU, which lacks the kernels anyway.</div></div>
         <div class="field"><label>CPU threads (-t)</label>
           <input id="av-threads" type="number" placeholder="fork default (all cores)" min="1" max="256">
-          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box) — SMT threads add contention, not throughput.</div></div>
+          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box), since SMT threads add contention.</div></div>
         <div class="field"><label>Lock weights in RAM (--mlock)</label>
-          <select id="av-mlock"><option value="">off — recommended</option><option value="on">on</option></select>
+          <select id="av-mlock"><option value="">off (recommended)</option><option value="on">on</option></select>
           <div class="hint">With 48 GiB of experts, mlock would pin them resident and OOM this 61 GB machine. Leave off; the page cache does the job.</div></div>
       </div>
       <div style="margin-top:10px">
@@ -4778,7 +5814,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <input id="avsnapname" type="text" placeholder="name this launch…" style="width:220px">
         <button class="btn sm" id="avsnapsave">Save current</button>
       </div></div>
-    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile + every tuning field exactly as resolved right now, and relaunches with one click — same command line, no re-tuning.</div>
+    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile and every tuning field exactly as resolved right now, and relaunches with one click using the same command line.</div>
     <div id="avsnaps"></div>
   </div>
 
@@ -4787,7 +5823,69 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN</span></label></div>
     <div id="avalonaccess" class="kvs"></div>
   </div>
-  <div class="card"><div class="hd"><h2>Avalon log</h2></div><pre class="log" id="avalonlog" style="max-height:280px"></pre></div>
+  <div class="card">
+    <div class="hd"><h2>Avalon log</h2><span class="tag mut" id="avlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="avlogfilter" type="search" placeholder="Filter Avalon log…" aria-label="Filter Avalon log"></div>
+      <label class="switch"><input type="checkbox" id="avlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="avlogcopy">Copy</button>
+    </div>
+    <pre class="log" id="avalonlog" style="max-height:280px"></pre>
+  </div>
+</section>
+
+<!-- ==================== MAYA ==================== -->
+<section id="t-maya" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Project Maya</h2><span class="tag mut" id="mayachip">checking…</span></div>
+    <div id="mayadetail" class="kvs" style="margin-bottom:10px"></div>
+
+    <div class="grid g4" style="margin-bottom:12px">
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Decode speed</h2><span class="tag mut" id="m-state-tag">idle</span></div>
+        <div class="stat"><span id="m-dec-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-dec-sub">Waiting for log telemetry</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Prefill speed</h2></div>
+        <div class="stat"><span id="m-pre-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0">Prompt processing rate</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>VRAM &amp; Experts</h2></div>
+        <div class="stat"><span id="m-vram">—</span> <small>GB</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-exp-sub">Experts in VRAM: —</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Context &amp; Load</h2></div>
+        <div class="stat"><span id="m-ctx">—</span> <small>ctx</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-load-sub">Load / warmup: —</p>
+      </div>
+    </div>
+
+    <div id="mayaconfigs"></div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="mayastart">Start selected</button>
+      <button class="btn acc2" id="mayaswitch" title="Stop the running Maya config and start the selected one">Switch to selected</button>
+      <button class="btn danger" id="mayastop">Stop</button>
+      <button class="btn" id="mayaagentsbtn" title="Point coding agents at this Maya server">Register in coding agents…</button>
+      <button class="btn sm" id="mayakeybtn" title="Reveal masked API key for the active Maya config">Reveal API key</button>
+      <span class="hint">OpenAI &amp; Anthropic API · exclusive GPU · <code>ROCM_PATH</code> managed automatically</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2>Maya engine log</h2>
+      <div class="meta">
+        <span class="hint mono" id="mayalogpath"></span>
+        <button class="btn sm" id="mayalogref">Refresh</button>
+      </div>
+    </div>
+    <pre class="log" id="mayalog" style="max-height:300px"></pre>
+  </div>
 </section>
 
 <!-- ==================== AGENT / OPTIMIZER ==================== -->
@@ -5027,7 +6125,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       </div>
       <div id="sysbox" class="card sub hide">
         <div class="field" style="margin-bottom:10px">
-          <label>System Prompt</label>
+          <label>System Prompt <button type="button" class="btn xs" id="sp-reset">Reset defaults</button></label>
           <textarea id="sysprompt" rows="2" style="width:100%"></textarea>
         </div>
         <div class="form-grid">
@@ -5049,7 +6147,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <button class="btn danger" id="stopbtn" style="display:none">Stop</button>
         <button class="btn primary" id="sendbtn">Send</button>
       </div>
-      <p class="hint" style="margin:8px 2px 0" id="chatnote"></p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:7px 2px 0">
+        <span class="hint" id="chatnote"></span>
+        <span class="hint mono" id="chatcount"></span>
+      </div>
     </div>
   </div>
 </section>
@@ -5174,6 +6275,14 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn" id="set-reload">Reload</button>
       <button class="btn primary" id="set-save">Save settings</button>
+    </div>
+  </div>
+  <div class="card">
+    <div class="hd"><h2>Panel process</h2><span class="tag mut" id="panel-proc-chip">—</span></div>
+    <div class="hint" style="margin-bottom:10px">Restart re-execs the panel in place. Running llama-server, Avalon, and Strata processes keep serving, and this tab reconnects on its own.</div>
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+      <span class="hint mono" id="panel-proc-detail"></span>
+      <button class="btn danger" id="panelrestart">Restart panel</button>
     </div>
   </div>
 </section>
@@ -5403,13 +6512,33 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 </dialog>
 
+<dialog id="renamedlg" closedby="any" style="max-width:min(440px,94vw)">
+  <div class="dlg-hd">
+    <h2>Rename conversation</h2>
+    <button class="icon" data-close="renamedlg" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+  </div>
+  <form id="ren-form">
+    <div class="dlg-bd">
+      <div class="field">
+        <label for="ren-input">Conversation title</label>
+        <input id="ren-input" type="text" maxlength="120" required style="width:100%">
+      </div>
+    </div>
+    <div class="dlg-ft">
+      <button type="button" class="btn" data-close="renamedlg">Cancel</button>
+      <button type="submit" class="btn primary">Save title</button>
+    </div>
+  </form>
+</dialog>
+
 <footer>
   <span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd> command palette</span>
-  <span><kbd>1</kbd>–<kbd>7</kbd> switch tabs</span>
+  <span><kbd>1</kbd>–<kbd>8</kbd> switch tabs</span>
   <span><kbd>/</kbd> filter</span>
   <span><kbd>Esc</kbd> close</span>
   <span id="footnote"></span>
 </footer>
+</div></div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
@@ -5532,25 +6661,43 @@ $('#logout').addEventListener('click',async()=>{
   location.href='/login';
 });
 
-/* ============================== tabs ============================== */
-const TABS=['models','server','strata','avalon','agent','vitals','chat','hf','settings'];
+/* ============================== tabs & workbench rail ============================== */
+const TABS=['models','server','strata','avalon','maya','agent','vitals','chat','hf','settings'];
+const TAB_TITLES={models:'Model Library',server:'llama.cpp Server & Bench',strata:'Strata Engine',
+  avalon:'Avalon 125B MoE',maya:'Project Maya',agent:'Optimization Agent',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
 let tab='models';
+function closeNav(){document.body.classList.remove('nav-open')}
+$('#mobmenu').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
+$('#railbackdrop').addEventListener('click',closeNav);
+$('#railvitals').addEventListener('click',()=>setTab('vitals'));
 function setTab(t){
   if(TABS.indexOf(t)<0)t='models';
   tab=t;localStorage.setItem('ic.tab',t);
+  closeNav();
+  $('#viewtitle').textContent=TAB_TITLES[t]||t;
   $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
   $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
-  if(t==='strata'){loadStrata();loadStrataPresets();}
-  if(t==='avalon'){loadAvalon();loadAvalonAccess();}
+  if(t==='strata'){loadStrata();loadStrataPresets();loadStrataKey();pollStrataTelemetry();refreshStrataLog();}
+  if(t==='avalon'){loadAvalon(true);loadAvalonAccess();}
+  if(t==='maya'){loadMaya();refreshMayaLog();}
   if(t==='agent'){loadAgentAll();}
   if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
+$('#hdrstatus').addEventListener('click',()=>{
+  const ct=chatTarget();
+  if(ct)setTab(ct.src==='avalon'?'avalon':ct.src==='strata'?'strata':ct.src==='maya'?'maya':'server');
+  else if(ACTIVE)setTab('server');
+  else if(AV&&AV.running)setTab('avalon');
+  else if(STRATA&&STRATA.running)setTab('strata');
+  else if(MAYA&&MAYA.running)setTab('maya');
+  else setTab('models');
+});
 
 /* ============================== models & launch modal ============================== */
-let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
+let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,MAYA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
 const SHX=new Set(); // expanded multi-shard groups
 const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
@@ -5588,7 +6735,10 @@ function modelRow(m,i){
   if(m.saved_profile)tags.push('<span class="tag mut" title="Custom launch profile saved">tuned</span>');
   if(running)tags.push('<span class="tag ok">loaded</span>');
   const sh=m.shards&&m.shards.length>1;
-  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+(SHX.has(m.path)?'▾':'▸')+' '+m.shards.length+' shards</button>');
+  const chev=SHX.has(m.path)
+    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M6 9l6 6 6-6"/></svg>'
+    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 6l6 6-6 6"/></svg>';
+  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+chev+' '+m.shards.length+' shards</button>');
   return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'"'+(sh?' data-shards="'+m.shards.length+'"':'')+'">'
     +'<button class="pinbtn'+(m.pinned?' on':'')+'" data-act="pin" title="'+(m.pinned?'Unpin model':'Pin model to top')+'" aria-label="Pin '+esc(m.name)+'">'+(m.pinned?STAR_ON:STAR_OFF)+'</button>'
     +'<div style="min-width:0"><div class="nm" title="'+esc(m.path)+'"><span>'+esc(m.name)+'</span></div>'
@@ -5634,6 +6784,7 @@ function renderModels(){
   list=list.slice().sort(by);
   const bytes=MODELS.reduce((s,m)=>s+m.size,0);
   $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
+  if($('#nb-models'))$('#nb-models').textContent=String(MODELS.length);
   if(MODELS[0]&&MODELS[0].fit){
     const f=MODELS[0].fit;
     $('#vramchip').textContent=f.budget_source+': '+((f.usable_mb||f.budget_mb)/1024).toFixed(1)+' GB usable';
@@ -5754,13 +6905,6 @@ function applyLaunchForm(p){
   $('#ld-draft-wrap').classList.toggle('hide',!CAPS.draft);
   $('#ld-draftmax-wrap').classList.toggle('hide',!CAPS.draft);
 }
-function siblingDraft(m){
-  if(!m)return '';
-  const dir=m.path.replace(/\/[^/]+$/,'/');
-  const hit=MODELS.find(x=>x.path.startsWith(dir)&&x.path!==m.path
-            &&/mtp|draft/i.test(x.name)&&!/mmproj/i.test(x.name));
-  return hit?hit.path:'';
-}
 async function updateLaunchPreview(){
   if(!LD_MODEL)return;
   const f=getLaunchForm();
@@ -5850,6 +6994,7 @@ function chatTarget(){
   if(AV&&AV.running&&AV.state==='ready')return{alias:AV.model||'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.port===ap)return{alias:'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(STRATA&&STRATA.running&&STRATA.health==='ready'&&STRATA.port)return{alias:STRATA.model||'strata',port:STRATA.port,src:'strata'};
+  if(MAYA&&MAYA.running&&MAYA.state==='ready'&&MAYA.port)return{alias:MAYA.alias||MAYA.model_name||'maya',port:MAYA.port,src:'maya'};
   return null;
 }
 function drawHeader(){
@@ -5857,7 +7002,7 @@ function drawHeader(){
   const ct=chatTarget();
   if(ct){
     p.className='pill ok';
-    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':'');
+    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':ct.src==='maya'?' · maya':'');
     document.title='● '+ct.alias+' — Inference Console';
   }else if(ACTIVE){
     p.className='pill warn';
@@ -5871,11 +7016,21 @@ function drawHeader(){
     p.className='pill warn';
     t.textContent='strata · loading…';
     document.title='◌ Loading Strata — Inference Console';
+  }else if(MAYA&&MAYA.running){
+    p.className='pill warn';
+    t.textContent=(MAYA.model_name||'maya')+' · loading…';
+    document.title='◌ Loading Maya — Inference Console';
   }else{
     p.className='pill';
     t.textContent='no server running';
     document.title='Inference Console — Local Inference Manager';
   }
+  const setDot=(id,st)=>{const d=$(id);if(d)d.className='ndot'+(st==='ok'?' ok':st==='warn'?' warn':'');};
+  const ap=(AV&&AV.port)||8086;
+  setDot('#nd-server',(ACTIVE&&ACTIVE.port!==ap)?(ACTIVE.ready?'ok':'warn'):'');
+  setDot('#nd-avalon',(AV&&AV.running)?(AV.state==='ready'?'ok':'warn'):(ACTIVE&&ACTIVE.port===ap?(ACTIVE.ready?'ok':'warn'):''));
+  setDot('#nd-strata',(STRATA&&STRATA.running)?(STRATA.health==='ready'?'ok':'warn'):'');
+  setDot('#nd-maya',(MAYA&&MAYA.running)?(MAYA.state==='ready'?'ok':'warn'):'');
   const idleChip=$('#hdridle'),srvIdle=$('#srvidlechip');
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.idle_unload_min>0&&ACTIVE.idle_remaining_s!=null){
     const txt='idle unload '+fmtUp(ACTIVE.idle_remaining_s);
@@ -6073,6 +7228,20 @@ function drawVitals(){
   if(!out)out='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';
   $('#vitals').innerHTML=out;
   $('#vupdatetime').textContent='updated '+Math.max(0,Math.round((Date.now()-VT)/1000))+'s ago';
+  if(v.gpu&&v.gpu.total_mb){
+    const gp=Math.round(100*(v.gpu.used_mb||0)/v.gpu.total_mb);
+    $('#rv-mem-lbl').textContent='VRAM';
+    $('#rv-mem-val').textContent=(v.gpu.used_mb/1024).toFixed(1)+'/'+(v.gpu.total_mb/1024).toFixed(0)+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(gp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,gp)+'%"></i>';
+  }else if(v.mem&&v.mem.total_gb){
+    const mp=Math.round(100*v.mem.used_gb/v.mem.total_gb);
+    $('#rv-mem-lbl').textContent='RAM';
+    $('#rv-mem-val').textContent=v.mem.used_gb+'/'+v.mem.total_gb+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(mp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,mp)+'%"></i>';
+  }
+  if(v.cpu)$('#rv-cpu-val').textContent=v.cpu.percent+'%';
 }
 async function refreshVitals(){
   try{VIT=await api('/api/vitals');VT=Date.now();pushHist();drawVitals()}catch(e){drawVitals()}
@@ -6097,6 +7266,12 @@ function syncSamplingLabels(){
   $('#'+id).addEventListener('input',()=>{syncSamplingLabels();localStorage.setItem('ic.'+id,$('#'+id).value)});
 });
 syncSamplingLabels();
+$('#sp-reset').addEventListener('click',()=>{
+  $('#sysprompt').value=DEF_SYS;localStorage.setItem('ic.sys',DEF_SYS);
+  const defs={'sp-temp':'0.7','sp-topp':'0.95','sp-minp':'0.05','sp-rep':'1.05','sp-max':'0'};
+  Object.keys(defs).forEach(k=>{$('#'+k).value=defs[k];localStorage.removeItem('ic.'+k);});
+  syncSamplingLabels();toast('Sampling defaults restored','ok',1800);
+});
 $('#sysbtn').addEventListener('click',()=>{
   const box=$('#sysbox');box.classList.toggle('hide');
   if(box.classList.contains('hide'))localStorage.setItem('ic.sys',$('#sysprompt').value||DEF_SYS);
@@ -6109,7 +7284,7 @@ function drawChatTarget(){
   if(ct){t.className='tag ok';t.textContent=ct.alias+' · :'+ct.port}
   else{t.className='tag warn';t.textContent='no model loaded'}
   $('#sendbtn').disabled=BUSY||!ct;
-  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, or Avalon tab to chat.';
+  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, Avalon, or Maya tab to chat.';
 }
 function md(src){
   const blocks=[];
@@ -6198,15 +7373,25 @@ async function loadChatList(){
   try{CHATS_CACHE=await api('/api/chats');renderChatList();}catch(e){}
 }
 $('#csearch').addEventListener('input',renderChatList);
+let REN_CID=null;
+$('#ren-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const next=$('#ren-input').value.trim();
+  if(!next||!REN_CID)return;
+  try{
+    await post('/api/chats/'+REN_CID+'/rename',{title:next});
+    if(CID===REN_CID)$('#chattitle').textContent=next;
+    $('#renamedlg').close();loadChatList();toast('Conversation renamed','ok',2000);
+  }catch(err){toast('Rename failed: '+err.message,'err')}
+});
 $('#chatlist').addEventListener('click',async e=>{
   const ren=e.target.closest('[data-ren]');
   if(ren){
     e.stopPropagation();
-    const next=prompt('Rename conversation:',ren.dataset.title||'');
-    if(next&&next.trim()){
-      try{await post('/api/chats/'+ren.dataset.ren+'/rename',{title:next.trim()});loadChatList();}
-      catch(err){toast('Rename failed: '+err.message,'err')}
-    }
+    REN_CID=ren.dataset.ren;
+    $('#ren-input').value=ren.dataset.title||'';
+    $('#renamedlg').showModal();
+    $('#ren-input').focus();$('#ren-input').select();
     return;
   }
   const del=e.target.closest('[data-del]');
@@ -6237,17 +7422,23 @@ $('#newchat').addEventListener('click',newChat);
 $('#chatexportmd').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
   const mdOut=HIST.map(m=>'### '+(m.role==='user'?'User':'Assistant')+'\n\n'+(m.reasoning?'<think>\n'+m.reasoning+'\n</think>\n\n':'')+m.content).join('\n\n---\n\n');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
-  a.download='chat-'+(CID||'export')+'.md';a.click();
+  const url=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.md';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 $('#chatexportjson').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
-  a.download='chat-'+(CID||'export')+'.json';a.click();
+  const url=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.json';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 
 const ta=$('#prompt');
-function autosize(){ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px'}
+function autosize(){
+  ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px';
+  const len=ta.value.length;
+  $('#chatcount').textContent=len?(n0(len)+' chars · ~'+n0(Math.ceil(len/4))+' tok'):'';
+}
 ta.addEventListener('input',autosize);
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
 $('#sendbtn').addEventListener('click',send);
@@ -6257,18 +7448,20 @@ async function send(){
   const q=ta.value.trim();
   if(!q||BUSY)return;
   const ct=chatTarget();
-  if(!ct)return toast('Start a model first (Models or Avalon tab)','warn');
+  if(!ct)return toast('Start a model first (Models, Strata, or Avalon tab)','warn');
   ta.value='';autosize();
   const th=$('#chat');if(th.querySelector('.empty'))th.innerHTML='';
   const um={role:'user',content:q};HIST.push(um);addMsg(um,HIST.length-1);
-  post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q})
-    .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
+  try{
+    const r0=await post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q});
+    if(r0&&r0.id){CID=r0.id;localStorage.setItem('ic.cid',CID);loadChatList();}
+  }catch(e){}
   const asstIdx=HIST.length;
   const box=addMsg({role:'assistant',content:''},asstIdx);
   const ans=box.querySelector('.ans'),who=box.querySelector('.who');
-  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
   AC=new AbortController();
-  let buff='',bufa='',t0=0,toks=0,stopped=false;
+  let buff='',bufa='',t0=0,toks=0,stopped=false,hadErr=false;
   const payload={
     messages:[{role:'system',content:$('#sysprompt').value||DEF_SYS}].concat(HIST.map(m=>({role:m.role,content:m.content}))),
     temperature:Number($('#sp-temp').value),
@@ -6281,7 +7474,7 @@ async function send(){
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AC.signal,
       body:JSON.stringify(payload)});
-    if(!r.ok){const d=await r.text();ans.innerHTML=esc(d.indexOf('no model')>=0?'No model running — load one first.':'error: '+d)}
+    if(!r.ok){hadErr=true;const d=await r.text();ans.innerHTML='<span style="color:var(--err)">'+esc(d.indexOf('no model')>=0?'No model running. Load one first.':'error: '+d)+'</span>'}
     else{
       const rd=r.body.getReader(),dec=new TextDecoder();let sbuf='';
       for(;;){
@@ -6309,64 +7502,119 @@ async function send(){
     }
   }catch(e){
     if(e.name==='AbortError'){stopped=true;ans.innerHTML=md(bufa||buff||'(stopped)')}
-    else ans.textContent='error: '+e.message;
+    else{hadErr=true;ans.innerHTML='<span style="color:var(--err)">'+esc('error: '+e.message)+'</span>'}
   }
   const finalText=bufa||buff||'';
   const secs=Math.max(.001,(performance.now()-(t0||performance.now()))/1000);
   const tps=toks?(toks/secs).toFixed(1):Math.round((finalText.length/4)/secs);
-  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
-  if(finalText){
+  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':hadErr?'error · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
+  if(finalText&&!hadErr){
     box.insertAdjacentHTML('beforeend','<div class="bar"><button class="btn xs" data-regen="'+asstIdx+'">Regenerate</button><button class="btn xs" data-copy="'+esc(finalText)+'">Copy</button></div>');
     HIST.push({role:'assistant',content:finalText,reasoning:buff});
     post('/api/chats/append',{id:CID,model:ct.alias,role:'assistant',content:finalText,reasoning:buff})
-      .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+      .then(r=>{if(r&&r.id){CID=r.id;loadChatList()}}).catch(()=>{});
   }
   BUSY=false;AC=null;$('#stopbtn').style.display='none';drawChatTarget();ta.focus();
 }
 
 /* ============================== agents registry ============================== */
-let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
-async function openAgentsDlg(source){
+let AGSRC=null; // null = auto (panel first); 'panel' | 'avalon' | 'strata' | 'maya' pins the source
+let AGRES='';  // last Apply's per-agent result rows, kept across post-Apply re-render
+async function openAgentsDlg(source,keepResults){
   AGSRC=source||null;
+  if(!keepResults)AGRES='';
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
-  const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
-  const srcOk=!AGSRC||(d.sources&&d.sources[AGSRC]);
-  const srcLbl=AGSRC?('this tab’s server ('+AGSRC+')'):'any running server';
+  const srcs=d.sources||{};
+  const tgts=d.targets||{};
+  const selSrc=AGSRC||'auto';
+  const targetFor=s=>{
+    if(s==='auto')return d.running?{alias:d.running[0],port:d.running[1],source:d.running[3]||''}:null;
+    return tgts[s]||null;
+  };
+  const fmtTarget=t=>t?(esc(t.alias)+' @ :'+t.port+(t.source?' ('+esc(t.source)+')':'')):'nothing running';
+  const srcOpts=['auto','panel','avalon','strata','maya'].map(s=>{
+    const t=targetFor(s);
+    const up=Boolean(t||(s!=='auto'&&srcs[s]));
+    return '<option value="'+s+'"'+(s===selSrc?' selected':'')+'>'+s
+      +(s==='auto'?' (first running)':(up?(t?' · '+t.alias+' @ :'+t.port:' · running'):' · stopped'))+'</option>';
+  }).join('');
+  const curT=targetFor(selSrc);
+  const srcOk=selSrc==='auto'?Boolean(d.running):Boolean(srcs[selSrc]);
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
-    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'">'
+    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'"'+(r?' checked':'')+'>'
       +'<span style="flex:1;min-width:0"><b>'+esc(a.label)+'</b>'
       +(r?' <span class="tag ok">'+esc(r.alias)+'@'+r.port+' · '+esc(ago(r.synced_at))+'</span>':'')
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
-  $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>'
-    +(AGSRC?' <span class="tag">'+esc(srcLbl)+'</span>':'')+'.</p>'
-    +(!srcOk?'<p class="hint" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'')
-    +'<div style="max-height:46vh;overflow:auto">'+rows+'</div><div id="agres" style="margin-top:10px"></div>';
-  $('#agentsdlg').showModal();
+  const dlg=$('#agentsdlg');
+  $('#ag-body').innerHTML='<p style="margin:0 0 8px;color:var(--fg-2)">Writes each selected agent config to point at <b id="ag-target">'+fmtTarget(curT)+'</b>.</p>'
+    +'<div style="display:flex;gap:8px;align-items:center;margin:0 0 8px"><label class="hint" for="ag-src">Source</label>'
+    +'<select id="ag-src" style="flex:1">'+srcOpts+'</select>'
+    +'<button type="button" class="btn xs" id="ag-all">All</button>'
+    +'<button type="button" class="btn xs" id="ag-none">None</button></div>'
+    +'<p class="hint'+(srcOk?' hide':'')+'" id="ag-src-warn" style="margin:0 0 8px;color:var(--warn,#c80)">'
+    +(srcOk?'':(selSrc==='auto'?'No server is running — start an engine first.':'The '+esc(selSrc)+' server isn’t running — start it on its tab, or pick another source.'))+'</p>'
+    +'<div style="max-height:42vh;overflow:auto">'+rows+'</div>'
+    +'<div id="agres" style="margin-top:10px">'+AGRES+'</div>';
+  $('#ag-src').addEventListener('change',e=>{
+    const v=e.target.value;
+    AGSRC=v==='auto'?null:v;
+    const t=targetFor(v);
+    $('#ag-target').innerHTML=fmtTarget(t);
+    const w=$('#ag-src-warn');
+    const ok=v==='auto'?Boolean(d.running):Boolean(srcs[v]);
+    if(!ok){
+      w.textContent=v==='auto'?'No server is running — start an engine first.':'The '+v+' server isn’t running — start it on its tab, or pick another source.';
+      w.classList.remove('hide');
+    }else w.classList.add('hide');
+  });
+  $('#ag-all').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=true));
+  $('#ag-none').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=false));
+  if(!dlg.open)dlg.showModal();
+  if(keepResults&&AGRES){const ar=$('#agres');if(ar)ar.scrollIntoView({block:'nearest'});}
 }
-$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
-$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
-$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata'));
+$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null,false));
+$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon',false));
+$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata',false));
+$('#mayaagentsbtn').addEventListener('click',()=>openAgentsDlg('maya',false));
 $('#ag-apply').addEventListener('click',async()=>{
   const apply=$('#ag-apply');
   const picks=$$('.agchk',$('#agentsdlg')).filter(x=>x.checked).map(x=>x.value);
-  if(!picks.length)return toast('Pick at least one agent','warn');
+  if(!picks.length){
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag warn">select</span><span class="p">Pick at least one agent checkbox above, then click Apply.</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Pick at least one agent','warn');
+  }
   apply.disabled=true;apply.textContent='Applying…';
   let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
-  catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
-  $('#agres').innerHTML=Object.keys(r.results).map(k=>{const v=r.results[k];
+  catch(e){
+    apply.disabled=false;apply.textContent='Apply';
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag err">error</span><span class="p">'+esc(e.message)+'</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Sync failed: '+e.message,'err',12000);
+  }
+  const rs=Object.keys(r.results).map(k=>r.results[k]);
+  const okN=rs.filter(v=>v.ok).length;
+  AGRES='<div class="hint" style="margin-bottom:4px">Registered <b>'+okN+' of '+picks.length+'</b> for <b>'+esc(r.alias)+' @ :'+r.port+'</b></div>'
+    +Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
-  toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
+  toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':'warn', 8000);
+  openAgentsDlg(AGSRC,true);  // re-render so the registry tags show the new alias/port
   pollStatus();
 });
 
 /* ============================== strata ============================== */
+let STLOGTEXT='';
 async function loadStrata(){
-  try{const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget()}catch(e){}
+  try{
+    const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget();
+    if(s.running)loadStrataKey();
+    else $('#stratakeychip').classList.add('hide');
+  }catch(e){}
 }
 function drawStrata(s){
   const chip=$('#stratchip');
@@ -6381,7 +7629,22 @@ function drawStrata(s){
     +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>':'')
     :'<span class="hint">'+esc(s.note||'')+'</span>';
   $('#stratastopbtn').disabled=!(s.running);
-  $('#stratakeychip').classList.add('hide');
+}
+async function pollStrataTelemetry(){
+  const card=$('#stratametricscard');
+  if(!(STRATA&&STRATA.running)){card.classList.add('hide');return;}
+  try{
+    const d=await api('/api/strata/telemetry');
+    if(!d.ready||!d.metric_keys||!d.metric_keys.length){card.classList.add('hide');return;}
+    card.classList.remove('hide');
+    $('#st-metrics-chip').textContent=':'+d.port+' · '+d.metric_keys.length+' metrics';
+    const keys=d.metric_keys.slice(0,18);
+    $('#st-metrics').innerHTML=keys.map(k=>{
+      const v=d.metrics[k];
+      const fmt=Number.isInteger(v)?n0(v):Number(v).toFixed(2);
+      return '<span class="tag">'+esc(k)+' <b>'+esc(fmt)+'</b></span>';
+    }).join('');
+  }catch(e){card.classList.add('hide')}
 }
 function stForm(){
   const sets=$('#st-set').value.trim().split(/\s+/).filter(x=>x.includes('='));
@@ -6416,20 +7679,21 @@ function stPreview(){
 }
 $$('#strataformcard input,#strataformcard select').forEach(el=>el.addEventListener('input',stPreview));
 $('#st-toggleform').addEventListener('click',()=>{$('#strataformcard').classList.toggle('hide');stPreview()});
-$('#st-copycmd').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#st-cmd').textContent);toast('Command copied','ok')});
-$('#stratacopyinst').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#stratainstcmd').textContent);toast('Install command copied — run it in your own terminal','ok',6000)});
+$('#st-copycmd').addEventListener('click',()=>copy($('#st-cmd').textContent,'Strata command'));
+$('#stratacopyinst').addEventListener('click',()=>copy($('#stratainstcmd').textContent,'Install command'));
 async function loadStrataPresets(){
   if(!$('#st-presets'))return;
   try{
     const d=await api('/api/strata/presets');
     const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?{name:p.name,context:p.context,model:p.model}:null)).filter(Boolean);
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     $('#st-presets').innerHTML=ps.length?ps.map(p=>'<span class="tag">'+esc(p.name)
       +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
       +' <button class="btn xs" data-stp="'+esc(p.name)+'" data-act="use">Use</button>'
-      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset">×</button></span>').join('')
-      :'<span class="hint">No saved presets yet — name one in the launch form to save this exact configuration.</span>';
+      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset" aria-label="Delete preset">'+xSvg+'</button></span>').join('')
+      :'<span class="hint">No saved presets yet. Name one in the launch form to save this exact configuration.</span>';
     const sel=$('#st-preset'),cur=sel.value;
-    sel.innerHTML='<option value="">— none —</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
+    sel.innerHTML='<option value="">(none)</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     sel.value=cur;
   }catch(e){}
 }
@@ -6491,26 +7755,54 @@ $('#stratakeychip').addEventListener('click',async()=>{
   catch(e){toast('Could not read key: '+e.message,'err')}
 });
 async function loadStrataKey(){
-  try{const k=await api('/api/strata/key');
-    if(k.key_set){const c=$('#stratakeychip');c.dataset.masked=k.masked;c.textContent='key '+k.masked+' (click to reveal)';c.classList.remove('hide')}
+  try{
+    const k=await api('/api/strata/key');
+    const c=$('#stratakeychip');
+    if(k.key_set){
+      c.dataset.masked=k.masked;
+      if(c.dataset.revealed!=='1')c.textContent='key '+k.masked+' (click to reveal)';
+      c.classList.remove('hide');
+    }else c.classList.add('hide');
   }catch(e){}
 }
-async function refreshStrataLog(){try{const d=await api('/api/strata/log');paintInto($('#stratalog'),d.log)}catch(e){}}
+function paintFilteredLog(el,text,filterId,autoId,countId){
+  const f=($(filterId)&&$(filterId).value||'').trim().toLowerCase();
+  const lines=(text||'').split('\n');
+  const shown=lines.filter(l=>!f||l.toLowerCase().includes(f));
+  const html=shown.map(l=>{
+    const e=esc(l);
+    if(/error|failed|exception|abort|refused/i.test(l))return '<span class="e">'+e+'</span>';
+    if(/warn/i.test(l))return '<span class="w">'+e+'</span>';
+    return e;
+  }).join('\n');
+  if(el.innerHTML!==html){el.innerHTML=html;if(!autoId||$(autoId).checked)el.scrollTop=1e9;}
+  if(countId&&$(countId))$(countId).textContent=shown.length+' / '+lines.length+' lines';
+}
+async function refreshStrataLog(){
+  try{const d=await api('/api/strata/log');STLOGTEXT=d.log||'';paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn')}catch(e){}
+}
+$('#stlogfilter').addEventListener('input',()=>paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn'));
+$('#stlogauto').addEventListener('change',()=>{if($('#stlogauto').checked)$('#stratalog').scrollTop=1e9});
+$('#stlogcopy').addEventListener('click',()=>copy(STLOGTEXT,'Strata log'));
 
 /* ============================== avalon & optimizer ============================== */
-let ASEL=null,ALIST=[];
-async function loadAvalon(){
+let ASEL=null,ALIST=[],AVSNAPS=[],AVLOGTEXT='',AV_PROF_SIG='',AV_TGT_SIG='',AV_SNAP_SIG='';
+async function loadAvalon(forceAux){
   try{
     ALIST=await api('/api/avalon/profiles');AV=await api('/api/avalon/status');
     if(!ASEL||!ALIST.some(p=>p.key===ASEL))ASEL=(AV&&AV.running&&AV.profile)||'';
     if(!ASEL&&ALIST.length)ASEL=(ALIST.find(p=>p.available)||ALIST[0]).key;
-    $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
-      +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
-      +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
-      +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
-      +(p.available?'':' <span class="tag err">config missing</span>')
-      +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
-    $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    const pSig=JSON.stringify({s:ASEL,r:AV.running,p:AV.profile,a:ALIST.map(x=>[x.key,x.available,x.label])});
+    if(pSig!==AV_PROF_SIG){
+      AV_PROF_SIG=pSig;
+      $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+        +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
+        +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
+        +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
+        +(p.available?'':' <span class="tag err">config missing</span>')
+        +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
+      $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    }
     const c=$('#avalonchip');
     c.textContent=AV.running?(AV.state==='ready'?'avalon · ready':'avalon · loading'):'avalon · stopped';
     c.className='tag '+(AV.running?(AV.state==='ready'?'ok':'warn'):'mut');
@@ -6529,14 +7821,16 @@ async function loadAvalon(){
     }
     const selProf=ALIST.find(p=>p.key===ASEL);
     if(selProf&&selProf.cmd_preview&&!$('#avcmdpreview').textContent)$('#avcmdpreview').textContent=selProf.cmd_preview;
-    const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log);
     drawHeader();drawChatTarget();
-    loadAvalonSnaps();
-    loadAvalonTargets();
+    if(forceAux||!AV_SNAP_SIG)loadAvalonSnaps();
+    if(forceAux||!AV_TGT_SIG)loadAvalonTargets();
   }catch(e){}
 }
+function syncAvCtxLabel(){
+  const v=Number($('#av-ctx').value)||0;
+  $('#av-ctx-lbl').textContent=v?n0(v)+' tok':'default';
+}
 function getAvalonTuneForm(){
-  // Empty number box = unset (null); the two selects use 0 = "profile default".
   const num=v=>{const s=String(v).trim();if(s==='')return null;const n=Number(s);return isNaN(n)?null:n};
   return {
     profile:ASEL||'flagship',
@@ -6557,10 +7851,9 @@ function getAvalonTuneForm(){
   };
 }
 function setAvalonTuneForm(t){
-  // Number boxes: null/undefined = unset (blank), but a saved 0 must render as "0"
-  // (draft_n 0 means drafting off — blank would silently mean "profile default").
   const v=x=>(x==null||x==='')?'':String(x);
   $('#av-ctx').value=String(t.ctx||0);
+  syncAvCtxLabel();
   $('#av-batch').value=v(t.batch);
   $('#av-ubatch').value=v(t.ubatch);
   $('#av-ctk').value=t.ctk||'';
@@ -6576,6 +7869,7 @@ function setAvalonTuneForm(t){
   $('#av-mlock').value=t.mlock?'on':'';
 }
 async function previewAvalonTune(){
+  syncAvCtxLabel();
   try{
     const r=await post('/api/avalon/tune',Object.assign(getAvalonTuneForm(),{preview:true}));
     $('#avcmdpreview').textContent=r.cmd_preview||'';
@@ -6607,6 +7901,9 @@ $('#avapplystart').addEventListener('click',async()=>{
 async function loadAvalonTargets(){
   try{
     const d=await api('/api/avalon/targets');
+    const sig=JSON.stringify(d);
+    if(sig===AV_TGT_SIG||document.activeElement===$('#avtargetsel'))return;
+    AV_TGT_SIG=sig;
     const sel=$('#avtargetsel');
     sel.innerHTML=(d.targets||[]).map(t=>'<option value="'+esc(t.path)+'"'+(t.current?' selected':'')+'>'
       +esc(t.base)+(t.size_h?' · '+esc(t.size_h):'')+(t.shards>1?' · '+t.shards+' shards':'')+(t.draft?' · MTP':'')+'</option>').join('');
@@ -6618,27 +7915,32 @@ $('#avtargetsel').addEventListener('change',async()=>{
   try{
     const r=await post('/api/avalon/target',{model:v});
     toast('Avalon target: '+(r.base||'auto'),'ok');
-    loadAvalon();
-  }catch(e){toast('Target change failed: '+e.message,'err');loadAvalonTargets();}
+    AV_TGT_SIG='';loadAvalon(true);
+  }catch(e){toast('Target change failed: '+e.message,'err');AV_TGT_SIG='';loadAvalonTargets();}
 });
 /* ---- one-click snapshots ---- */
 async function loadAvalonSnaps(){
   try{
     const d=await api('/api/avalon/snapshots');
+    AVSNAPS=d.snapshots||[];
+    const sig=JSON.stringify(AVSNAPS);
+    if(sig===AV_SNAP_SIG)return;
+    AV_SNAP_SIG=sig;
     const el=$('#avsnaps');
-    if(!(d.snapshots||[]).length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
-    el.innerHTML=d.snapshots.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
+    if(!AVSNAPS.length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+    el.innerHTML=AVSNAPS.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
       +'<span style="flex:1;min-width:0"><b>'+esc(s.name)+'</b> <span class="tag mut">'+esc(s.profile)+'</span><br>'
-      +'<span class="hint">'+esc(s.cmd||'')+'</span></span>'
+      +'<span class="hint mono">'+esc(s.cmd||'')+'</span></span>'
       +'<button class="btn sm primary" data-snaplaunch="'+esc(s.id)+'">Launch</button>'
-      +'<button class="btn xs" data-snapdel="'+esc(s.id)+'">✕</button></div>').join('');
+      +'<button class="btn xs danger" data-snapdel="'+esc(s.id)+'" title="Delete snapshot" aria-label="Delete snapshot">'+xSvg+'</button></div>').join('');
     $$('[data-snaplaunch]').forEach(b=>b.addEventListener('click',async()=>{
       b.disabled=true;
-      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting — a 125B load takes a while','ok');loadAvalon();}
+      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting (125B load takes a while)','ok');loadAvalon();}
       catch(e){toast('Launch failed: '+e.message,'err',12000);b.disabled=false;}
     }));
     $$('[data-snapdel]').forEach(b=>b.addEventListener('click',async()=>{
-      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});loadAvalonSnaps();}
+      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});AV_SNAP_SIG='';loadAvalonSnaps();}
       catch(e){toast('Delete failed: '+e.message,'err')}
     }));
   }catch(e){}
@@ -6652,7 +7954,7 @@ $('#avsnapsave').addEventListener('click',async()=>{
     const r=await post('/api/avalon/snapshots',{name:name,profile:prof,tune:f});
     $('#avsnapname').value='';
     toast('Saved launch “'+(r.name||name)+'”','ok');
-    loadAvalonSnaps();
+    AV_SNAP_SIG='';loadAvalonSnaps();
   }catch(e){toast('Save failed: '+e.message,'err')}
 });
 function paintInto(el,text){
@@ -6664,6 +7966,9 @@ function paintInto(el,text){
     return e}).join('\n');
   el.scrollTop=1e9;
 }
+$('#avlogfilter').addEventListener('input',()=>paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn'));
+$('#avlogauto').addEventListener('change',()=>{if($('#avlogauto').checked)$('#avalonlog').scrollTop=1e9});
+$('#avlogcopy').addEventListener('click',()=>copy(AVLOGTEXT,'Avalon log'));
 $('#avalonstart').addEventListener('click',async()=>{
   $('#avalonstart').disabled=true;
   try{await post('/api/avalon/start',{profile:ASEL,tune:getAvalonTuneForm()});toast('Avalon starting — a 125B load takes a while','ok')}
@@ -6713,6 +8018,137 @@ $('#avalonlan').addEventListener('change',async e=>{
   e.target.disabled=false;loadAvalonAccess();loadAvalon();
 });
 
+/* ============================== maya ============================== */
+let MLIST=[],MSEL='';
+function drawMaya(s,list){
+  const chip=$('#mayachip');
+  chip.textContent=s.running?(s.state==='ready'?'maya · ready':'maya · loading'):'maya · stopped';
+  chip.className='tag '+(s.running?(s.state==='ready'?'ok':'warn'):'mut');
+  const tel=s.telemetry||{};
+  $('#m-state-tag').textContent=tel.active?'answering':(s.running?(s.state==='ready'?'ready':'loading'):'idle');
+  $('#m-state-tag').className='tag '+(tel.active?'ok':(s.running&&s.state==='ready'?'acc':'mut'));
+  $('#m-dec-tps').textContent=tel.decode_tps!=null?tel.decode_tps:'—';
+  $('#m-dec-sub').textContent=tel.last_tokens?n0(tel.last_tokens)+' tokens last turn':'Waiting for log telemetry';
+  $('#m-pre-tps').textContent=tel.prefill_tps!=null?tel.prefill_tps:'—';
+  $('#m-vram').textContent=tel.vram_gb!=null?tel.vram_gb:'—';
+  $('#m-exp-sub').textContent=tel.experts_vram!=null&&tel.experts_total
+    ?'Experts in VRAM: '+n0(tel.experts_vram)+' / '+n0(tel.experts_total)+' ('+tel.experts_vram_pct+'%)'
+    :'Experts in VRAM: —';
+  const ctxVal=tel.context||s.ctx;
+  $('#m-ctx').textContent=ctxVal?n0(ctxVal):'—';
+  const loadParts=[];
+  if(tel.load_s!=null)loadParts.push('loaded '+tel.load_s+'s');
+  if(tel.warmup_s!=null)loadParts.push('warmup '+tel.warmup_s+'s');
+  $('#m-load-sub').textContent=loadParts.length?loadParts.join(' · '):'Load / warmup: —';
+
+  if(s.running){
+    const kvs=[
+      ['alias',s.alias||s.model_name],
+      ['engine',s.engine||'maya'],
+      ['port',':'+s.port],
+      s.pid?['pid',s.pid]:null,
+      s.ctx?['ctx',n0(s.ctx)]:null,
+      s.adopted?['source','adopted']:['up',fmtUp(s.uptime||0)],
+      s.key_set?['key',s.key_masked]:null,
+    ].filter(Boolean);
+    $('#mayadetail').innerHTML=kvs.map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+      +(s.engine==='hy4'?'<span class="tag warn" title="Hy4 serves one request at a time">1 req/time</span>':'')
+      +'<button class="btn xs" data-copy="http://127.0.0.1:'+s.port+'/v1">Copy base URL</button>';
+  }else{
+    $('#mayadetail').innerHTML='<span class="hint">Maya is stopped. Choose a config below to start serving.</span>';
+  }
+
+  if(list){
+    if(!MSEL||!list.some(c=>c.path===MSEL))MSEL=(s.running&&s.config_path)||'';
+    if(!MSEL&&list.length)MSEL=(list.find(c=>c.available)||list[0]).path;
+    if(!list.length){
+      $('#mayaconfigs').innerHTML='<div class="empty"><b>No Project Maya configs found</b>Expected JSON configs in <code>~/project-maya/</code> (e.g. <code>maya-hy4-flash-maya-xs.json</code>).</div>';
+    }else{
+      $('#mayaconfigs').innerHTML=list.map(c=>{
+        const isRun=s.running&&(s.config_path===c.path||s.config_id===c.id);
+        const tags=[
+          '<span class="tag">'+esc(c.engine.toUpperCase())+'</span>',
+          c.quant?'<span class="tag acc">'+esc(c.quant)+'</span>':'',
+          '<span class="tag mut">'+n0(c.ctx)+' ctx</span>',
+          '<span class="tag mut">:'+esc(c.port)+'</span>',
+          c.dir_size_h?'<span class="tag mut">'+esc(c.dir_size_h)+'</span>':'',
+          c.mtp?'<span class="tag ok">MTP</span>':'',
+          c.reasoning_effort?'<span class="tag mut">think:'+esc(c.reasoning_effort)+'</span>':'',
+          c.key_set?'<span class="tag mut mono" title="API key set (server-side)">key '+esc(c.key_masked)+'</span>':'',
+          c.concurrency_note?'<span class="tag warn">'+esc(c.concurrency_note)+'</span>':'',
+          isRun?'<span class="tag ok">running</span>':'',
+          !c.available?'<span class="tag err">binary missing</span>':'',
+        ].filter(Boolean).join(' ');
+        return '<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+          +'<input type="radio" name="mcfg" value="'+esc(c.path)+'"'+(c.path===MSEL?' checked':'')+'>'
+          +'<span style="flex:1;min-width:0"><b>'+esc(c.model_name)+'</b> <span class="hint mono">'+esc(c.filename)+'</span>'
+          +'<div class="kvs" style="margin-top:4px">'+tags+'</div></span></label>';
+      }).join('');
+      $$('#mayaconfigs input[name=mcfg]').forEach(r=>r.addEventListener('change',()=>{MSEL=r.value;drawMaya(MAYA||s,MLIST)}));
+    }
+  }
+  const selObj=(MLIST||[]).find(c=>c.path===MSEL);
+  const selRunning=!!(s.running&&selObj&&(s.config_path===selObj.path||s.config_id===selObj.id));
+  $('#mayastart').disabled=!MSEL||!!s.running;
+  $('#mayaswitch').disabled=!MSEL||!s.running||selRunning;
+  $('#mayastop').disabled=!s.running;
+  $('#mayakeybtn').disabled=!s.key_set&&!(selObj&&selObj.key_set);
+}
+async function loadMaya(){
+  try{
+    const [cfgs,st]=await Promise.all([api('/api/maya/configs'),api('/api/maya/status')]);
+    MLIST=(cfgs&&cfgs.configs)||[];
+    MAYA=st;
+    drawMaya(st,MLIST);
+    drawHeader();drawChatTarget();
+  }catch(e){}
+}
+async function refreshMayaLog(){
+  try{
+    const d=await api('/api/maya/log');
+    if(d.path)$('#mayalogpath').textContent=d.path;
+    paintInto($('#mayalog'),d.log||'');
+  }catch(e){}
+}
+$('#mayadetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Base URL')});
+$('#mayalogref').addEventListener('click',refreshMayaLog);
+$('#mayastart').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  $('#mayastart').disabled=true;
+  try{
+    await post('/api/maya/start',{config:MSEL,switch:false});
+    toast('Maya starting — cold start takes 30–60 s','ok');
+  }catch(e){toast('Start failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayaswitch').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  if(!await confirmDlg('Switch Maya config','Stop the running Maya server and start the selected config?','Switch',true))return;
+  $('#mayaswitch').disabled=true;
+  try{
+    await post('/api/maya/switch',{config:MSEL,switch:true});
+    toast('Switching Maya config — cold start takes 30–60 s','ok');
+  }catch(e){toast('Switch failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayastop').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop Maya','Stop the running Project Maya server and release VRAM?','Stop',true))return;
+  $('#mayastop').disabled=true;
+  try{
+    const r=await post('/api/maya/stop');
+    toast(r.stopped?'Maya stopped & VRAM released':'Stop requested — check log',r.stopped?'ok':'warn');
+  }catch(e){toast('Stop failed: '+e.message,'err')}
+  loadMaya();refreshMayaLog();
+});
+$('#mayakeybtn').addEventListener('click',async()=>{
+  try{
+    const q=MSEL?('&config='+encodeURIComponent(MSEL)):'';
+    const d=await api('/api/maya/key?reveal=1'+q);
+    if(!d.key_set||!d.key)return toast('No API key configured','warn');
+    await copy(d.key,'Maya API key');
+  }catch(e){toast('Failed: '+e.message,'err')}
+});
+
 /* ============================== HF pull (resumable) ============================== */
 let HFREPO='',DLPREV={},DLTIMER=null;
 async function hfSearch(){
@@ -6753,9 +8189,11 @@ function totsize(){
 $('#hffiles').addEventListener('change',totsize);
 $('#hfnone').addEventListener('click',()=>{$$('#hffiles input').forEach(i=>i.checked=false);totsize()});
 $('#hfpull').addEventListener('click',async()=>{
-  const sel=$$('#hffiles input:checked').map(i=>i.value);
+  const checked=$$('#hffiles input:checked');
+  const sel=checked.map(i=>i.value);
+  const sizes={};checked.forEach(i=>{sizes[i.value]=Number(i.dataset.size)||0;});
   if(!sel.length)return toast('Select at least one file','warn');
-  try{await post('/api/hf/pull',{repo:HFREPO,files:sel});
+  try{await post('/api/hf/pull',{repo:HFREPO,files:sel,sizes});
     toast('Queued '+sel.length+' file'+(sel.length>1?'s':''),'ok');ensureDl(true);pollDownloads()}
   catch(e){toast('Pull failed: '+e.message,'err',10000)}
 });
@@ -6763,10 +8201,17 @@ function ensureDl(on){
   if(on&&!DLTIMER)DLTIMER=setInterval(pollDownloads,1200);
   if(!on&&DLTIMER){clearInterval(DLTIMER);DLTIMER=null}
 }
+let DL_DONE_IDS=new Set();
 async function pollDownloads(){
   let ds;try{ds=await api('/api/downloads')}catch(e){return}
+  const activeCount=ds.filter(d=>d.status==='downloading'||d.status==='queued').length;
+  const nb=$('#nb-dl');
+  if(nb){nb.textContent=String(activeCount);nb.classList.toggle('hide',activeCount===0);}
+  let newlyDone=false;
+  ds.forEach(d=>{if(d.status==='done'&&!DL_DONE_IDS.has(d.id)){DL_DONE_IDS.add(d.id);newlyDone=true;}});
+  if(newlyDone){loadModels();toast('Download finished · model library updated','ok',3200);}
   if(!ds.length){$('#downloads').innerHTML='<span class="hint">No downloads queued.</span>';$('#dlinfo').textContent='';ensureDl(false);return}
-  const live=ds.some(d=>d.status==='downloading'||d.status==='queued');
+  const live=activeCount>0;
   $('#dlinfo').textContent=ds.length+' job'+(ds.length>1?'s':'')+(live?' · active':'');
   $('#downloads').innerHTML=ds.map(d=>{
     const pct=d.total?Math.round(100*d.done/d.total):0;
@@ -6827,6 +8272,7 @@ function drawSetup(){
   if(J.log&&J.log.length){box.classList.remove('hide');paintInto(box,J.log.join('\n'))}
   const running=J.state==='running';
   $$('#t-settings button[id^="setup-"][id$="-btn"]').forEach(b=>b.disabled=running);
+  if(!A.source_exists)$('#setup-avalon-btn').disabled=true;
   if(running&&!SETUPTIMER)SETUPTIMER=setInterval(()=>{loadSetup();if(tab!=='settings'){clearInterval(SETUPTIMER);SETUPTIMER=null}},1500);
   if(!running&&SETUPTIMER){clearInterval(SETUPTIMER);SETUPTIMER=null}
   if(J.state==='done'&&!SETUP._told){SETUP._told=true;toast('Engine setup finished','ok');loadSettings();loadModels();pollStatus(true)}
@@ -6876,6 +8322,7 @@ async function loadSettings(){
     $('#set-bin-flags').innerHTML=['fa_value','ncmoe','metrics','fit','ctk','mlock','no_mmap','parallel','draft','draft_max','ot','tensor_split','tbatch','keep','jinja']
       .map(k=>'<span class="tag '+(c[k]?'ok':'mut')+'">'+k+(c[k]?' ✓':' –')+'</span>').join('');
     $('#set-disks').innerHTML=(s.disks||[]).map(d=>d.exists?d.path+': '+d.free_gb+' GB free':d.path+': missing').join(' · ');
+    loadPanelProc();
   }catch(e){toast('Failed to load settings: '+e.message,'err')}
 }
 $('#set-reload').addEventListener('click',loadSettings);
@@ -6905,6 +8352,43 @@ $('#set-save').addEventListener('click',async()=>{
   btn.disabled=false;
 });
 
+/* ============================== panel process ============================== */
+const panelPing=()=>api('/api/panel/ping');
+async function loadPanelProc(){
+  try{
+    const p=await panelPing();
+    $('#panel-proc-chip').textContent='pid '+p.pid;
+    $('#panel-proc-chip').className='tag ok';
+    $('#panel-proc-detail').textContent='up '+fmtUp(p.uptime_s)+' · port '+p.port+(p.restartable?'':' · restart unavailable');
+    $('#panelrestart').disabled=!p.restartable;
+  }catch(e){
+    $('#panel-proc-chip').textContent='unreachable';
+    $('#panel-proc-chip').className='tag err';
+  }
+}
+async function waitForPanelRestart(before){
+  // execv keeps the PID, so watch started_at instead; every poll during the swap fails.
+  for(let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,500));
+    try{
+      const p=await panelPing();
+      if(p.ok&&p.started_at!==before){location.reload();return}
+    }catch(e){}
+  }
+  toast('Panel never answered after restart. Check the service log.','err',15000);
+}
+$('#panelrestart').addEventListener('click',async()=>{
+  if(!await confirmDlg('Restart panel','Re-exec the panel process now? Running models are not stopped, and this tab reconnects automatically.','Restart',true))return;
+  const btn=$('#panelrestart');
+  let before=null;
+  try{before=(await panelPing()).started_at}catch(e){}
+  btn.disabled=true;btn.textContent='Restarting…';
+  try{await post('/api/panel/restart',{delay_ms:600})}
+  catch(e){btn.disabled=false;btn.textContent='Restart panel';return toast('Restart failed: '+e.message,'err')}
+  toast('Panel restarting…','warn',4000);
+  waitForPanelRestart(before);
+});
+
 /* ============================== command palette (Ctrl/Cmd+K) ============================== */
 let PAL_ITEMS=[],PAL_IDX=0;
 function buildPaletteItems(){
@@ -6914,11 +8398,26 @@ function buildPaletteItems(){
   if(ACTIVE&&ACTIVE.running){
     items.push({label:'Stop active llama-server ('+ACTIVE.alias+')',sub:':'+ACTIVE.port,run:()=>$('#srvstop').click()});
   }
+  if(AV&&AV.running){
+    items.push({label:'Stop Avalon ('+(AV.profile||'running')+')',sub:':'+(AV.port||8086),run:()=>$('#avalonstop').click()});
+  }else if(ALIST&&ALIST.some(p=>p.available)){
+    items.push({label:'Start Avalon ('+(ASEL||'flagship')+')',sub:'Avalon',run:()=>{setTab('avalon');$('#avalonstart').click()}});
+  }
+  (AVSNAPS||[]).forEach(s=>{
+    items.push({label:'Launch Avalon snapshot: '+s.name,sub:s.profile||'snapshot',run:async()=>{
+      try{await post('/api/avalon/snapshots/launch',{id:s.id});toast('Avalon starting: '+s.name,'ok');setTab('avalon');loadAvalon();}
+      catch(e){toast('Launch failed: '+e.message,'err',10000)}
+    }});
+  });
   if(STRATA&&STRATA.running){
     items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
   }
+  if(MAYA&&MAYA.running){
+    items.push({label:'Stop Maya ('+(MAYA.alias||MAYA.model_name||'maya')+')',sub:':'+(MAYA.port||''),run:()=>$('#mayastop').click()});
+  }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
+  items.push({label:'Restart the panel process',sub:'Panel',run:()=>{setTab('settings');loadPanelProc();$('#panelrestart').click()}});
   items.push({label:'Toggle light / dark theme',sub:'Appearance',run:()=>$('#theme').click()});
   items.push({label:'Rescan model directories',sub:'Models',run:()=>$('#rescan').click()});
   MODELS.forEach(m=>{
@@ -6948,6 +8447,8 @@ function renderPalette(){
     +'<span class="pi-main">'+esc(it.label)+'</span><span class="pi-sub">'+esc(it.sub)+'</span></button>'
   ).join(''):'<div class="empty">No matching commands or models</div>';
   $('#pal-list')._matched=matched;
+  const selEl=$('#pal-list .pal-item.sel');
+  if(selEl)selEl.scrollIntoView({block:'nearest'});
 }
 function openPalette(){
   PAL_ITEMS=buildPaletteItems();PAL_IDX=0;
@@ -7368,16 +8869,21 @@ function tick(){
   if(document.hidden)return;
   pollStatus();
   pollTelemetry();
-  if(tab==='strata')loadStrata();
+  if(tab==='strata'){loadStrata();pollStrataTelemetry();}
   if(tab==='avalon')loadAvalon();
   if(tab==='agent')loadAgentStatus();
+  if(tab==='maya')loadMaya();
 }
 setInterval(tick,2500);
+setInterval(()=>{if(!document.hidden)refreshVitals()},5000);
 setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
 setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='strata')refreshStrataLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
-async function refreshAvalonLog(){try{const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log)}catch(e){}}
+setInterval(()=>{if(!document.hidden&&tab==='maya')refreshMayaLog()},1500);
+async function refreshAvalonLog(){
+  try{const d=await api('/api/avalon/log');AVLOGTEXT=d.log||'';paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn')}catch(e){}
+}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollStatus();pollTelemetry();refreshVitals()}});
 document.addEventListener('keydown',e=>{
   if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){
@@ -7387,10 +8893,11 @@ document.addEventListener('keydown',e=>{
   }
   if(e.metaKey||e.ctrlKey||e.altKey)return;
   if($$('dialog[open]').length)return;
-  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.TagName==='SELECT'||t.isContentEditable);
+  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable);
+  if(e.key==='Escape'&&document.body.classList.contains('nav-open')){closeNav();return;}
   if(e.key==='/'&&!typing){
     e.preventDefault();
-    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
+    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='strata')$('#stlogfilter').focus();else if(tab==='avalon')$('#avlogfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
     return;
   }
   if(!typing&&TABS[Number(e.key)-1])setTab(TABS[Number(e.key)-1]);
@@ -7402,7 +8909,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""

@@ -85,6 +85,9 @@ builds never receive flags they'd reject.
 - **Setup**: Settings installs the latest official llama.cpp release for your
   platform (Metal / Vulkan / cpu / cuda), the Strata CLI, or builds Avalon
   from source, each behind an explicit confirm, with a streamed log
+- **Panel restart**: Settings > Panel process, or the command palette, re-execs
+  the panel in place. Same PID, engines keep serving, and the tab reconnects
+  itself
 - **⌘K / Ctrl+K** command palette
 
 ## Layout
@@ -93,8 +96,10 @@ builds never receive flags they'd reject.
 panel.py                          the whole app (UI is an inline HTML string)
 deploy/inference-console.service  systemd user unit
 tests/test_panel_metrics.py       stubbed unit tests
+tests/test_panel_agents.py        coding-agent config writers
+tests/test_panel_restart.py       panel restart, argv rebuild, session mirror
 ~/.config/inference-console/      config.json
-~/.local/share/inference-console/ runtime state (logs, benchmarks, chats)
+~/.local/share/inference-console/ runtime state (logs, benchmarks, chats, sessions.json)
 ```
 
 ## Tests
