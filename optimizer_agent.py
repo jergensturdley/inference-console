@@ -1008,11 +1008,16 @@ class OptimizerAgent:
         vit: dict[str, Any],
     ) -> dict[str, Any]:
         cfg: dict[str, Any] = {}
+        last_strata = self.host.cfg.get("strata_last") or {}
         if model:
             if "/" in model or model.endswith(".gguf"):
                 cfg["model_path"] = model
             else:
                 cfg["model"] = model
+        elif last_strata.get("preset"):
+            cfg["preset"] = str(last_strata["preset"])
+        elif last_strata.get("model"):
+            cfg["model"] = str(last_strata["model"])
 
         notes: list[str] = []
         if goal == "fastest":
@@ -1048,7 +1053,15 @@ class OptimizerAgent:
             cmd_preview = "strata " + " ".join(args)
             if self.host.strata_bin():
                 r = self.host.strata_run(args, timeout=20)
-                if r.returncode == 0 and r.stdout.strip():
+                if isinstance(r, dict):
+                    if r.get("ok") and r.get("json") is not None:
+                        plan_preview = r["json"]
+                        notes.append("Verified dry-run placement with `strata launch --plan --output json`.")
+                    elif r.get("ok") and (r.get("stdout") or "").strip():
+                        plan_preview = {"raw": str(r["stdout"])[:1000]}
+                    elif r.get("error") or r.get("stderr"):
+                        notes.append(f"Strata plan preview note: {str(r.get('error') or r.get('stderr'))[:240]}")
+                elif getattr(r, "returncode", 1) == 0 and (getattr(r, "stdout", "") or "").strip():
                     try:
                         plan_preview = json.loads(r.stdout)
                         notes.append("Verified dry-run placement with `strata launch --plan --output json`.")
@@ -1682,10 +1695,28 @@ class OptimizerAgent:
                 body_kwargs = {k: v for k, v in cfg.items() if k != "plan"}
                 body = self.host.strata_launch_body_cls(**body_kwargs, plan=False, restart=True)
                 args = self.host.strata_build_args(body, plan=False)
-                r = self.host.strata_run(args, timeout=120)
+                cmd_str = "strata " + " ".join(args)
+                self._tune_log(f"Running: {cmd_str}")
+                r = self.host.strata_run(args, timeout=300)
                 if isinstance(r, dict):
-                    return bool(r.get("ok")), str(r.get("error") or r.get("stderr") or r.get("stdout") or "")[-400:]
-                return (r.returncode == 0), (r.stderr or r.stdout or "")[-400:]
+                    if r.get("ok"):
+                        j = r.get("json") if isinstance(r.get("json"), dict) else {}
+                        if j:
+                            st_last = dict(self.host.cfg.get("strata_last") or {})
+                            for k in ("address", "port", "model", "profile", "preset"):
+                                if j.get(k) not in (None, ""):
+                                    st_last[k] = j[k]
+                            if st_last:
+                                self.host.cfg["strata_last"] = st_last
+                        return True, ""
+                    parts = [
+                        str(r.get("error") or "").strip(),
+                        str(r.get("stderr") or "").strip()[-300:],
+                        str(r.get("stdout") or "").strip()[-300:],
+                    ]
+                    msg = " | ".join(p for p in parts if p) or f"exit rc={r.get('rc')} ({cmd_str})"
+                    return False, msg[:500]
+                return (r.returncode == 0), (r.stderr or r.stdout or f"exit rc={r.returncode}")[-400:]
             if engine == "maya" and self.host.maya_mgr:
                 cid = self._patch_maya_json_config(cfg)
                 cur = self.host.maya_mgr.status()

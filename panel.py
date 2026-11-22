@@ -3568,9 +3568,21 @@ def _strata_run(args: list[str], timeout: int = 25) -> dict:
                 "install_cmd": STRATA_INSTALL_CMD}
     try:
         p = subprocess.run([b] + args, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
-                "stderr": "", "error": f"strata timed out after {timeout}s"}
+    except subprocess.TimeoutExpired as e:
+        raw_out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        raw_err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        out_s = raw_out.strip()
+        err_s = raw_err.strip()
+        tail_src = err_s or out_s
+        tail_lines = [ln.strip() for ln in tail_src.splitlines() if ln.strip()][-3:]
+        tail = " | ".join(tail_lines)[-300:] if tail_lines else ""
+        detail = (f"strata timed out after {timeout}s — last output: {tail}"
+                  if tail else f"strata timed out after {timeout}s (no output captured — still loading/downloading or blocked)")
+        strata_log(f"timeout ({timeout}s): strata {' '.join(args)}")
+        if tail:
+            strata_log(f"timeout tail: {tail}")
+        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": out_s[:6000],
+                "stderr": err_s[:2000], "error": detail}
     except OSError as e:
         return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
                 "stderr": "", "error": f"could not run strata: {e}"}
