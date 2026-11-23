@@ -915,6 +915,68 @@ def test_agent_chat_preserves_context_on_action_menu_followups(tmp_path, monkeyp
     assert agent._last_context == {}
 
 
+def test_autotune_waits_for_llama_readiness_and_detects_startup_crash(tmp_path, monkeypatch):
+    """Auto-tune must wait for llama-server /health readiness before benchmarking and fail fast on crash."""
+    import optimizer_agent as oa
+
+    monkeypatch.setattr(oa.time, "sleep", lambda _: None)
+
+    state = {"polls": 0, "ready": False, "running": False, "crash": False}
+
+    def bench_fn(prompt_key, max_tokens, last_call=None):
+        if not state["ready"]:
+            raise RuntimeError("409: No server ready — load a model or start Avalon first")
+        return {"tok_s": 55.0, "prompt_s": 420.0, "ttft_ms": 180.0, "vram_mb": 14000}
+
+    agent, _, _, host = _make_stub_agent(tmp_path, bench_fn=bench_fn)
+
+    class AsyncLlamaMgr:
+        logbuf = []
+
+        def status(self):
+            if not state["running"]:
+                return {"running": False}
+            state["polls"] += 1
+            if state["crash"]:
+                state["running"] = False
+                self.logbuf.append("CUDA error: out of memory")
+                return {"running": False}
+            if state["polls"] >= 3:
+                state["ready"] = True
+            return {"running": True, "ready": state["ready"], "port": 8830, "model": "m.gguf", "preset": "auto", "ctx": 8192}
+
+        def start(self, model_path, **kwargs):
+            state["polls"] = 0
+            state["ready"] = False
+            state["running"] = True
+            # Real ServerManager.start() returns status() immediately while ready=False
+            return {"running": True, "ready": False, "port": 8830, "model": model_path}
+
+        def stop(self):
+            state["running"] = False
+            state["ready"] = False
+            return {"ok": True}
+
+    host.mgr = AsyncLlamaMgr()
+
+    # 1. Slow-loading model: ready becomes True after 3 polls -> auto-tune succeeds without 409!
+    res = agent.start_tune(engine="llama", goal="max_context", max_trials=2, sync_run=True)
+    sess = res["session"]
+    assert sess["state"] == "done"
+    assert sess["best"] is not None
+    assert sess["best"]["ok"] is True
+    assert sess["best"]["metrics"]["tok_s"] == 55.0
+    assert any("llama-server ready" in line for line in sess["log"])
+
+    # 2. Premature crash during startup: fails fast with actual log tail error
+    state["crash"] = True
+    ok, err = agent._launch_for_trial("llama", {"model": str(tmp_path / "llama3-8b.gguf"), "ctx": 8192})
+    assert ok is False
+    assert "exited before becoming ready" in err
+    assert "out of memory" in err
+
+
+
 
 
 
