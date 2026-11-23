@@ -1938,6 +1938,90 @@ class OptimizerAgent:
                     self._tune_session["state"] = "failed"
                     self._tune_session["finished_ts"] = time.time()
 
+    def _wait_for_engine_ready(
+        self,
+        engine: str,
+        launch_res: dict[str, Any] | None = None,
+        timeout: float = 180.0,
+        poll_interval: float = 0.5,
+    ) -> tuple[bool, str]:
+        """Wait until a freshly launched engine passes its health check (or exits/times out)."""
+        t0 = time.time()
+        lr = launch_res if isinstance(launch_res, dict) else {}
+
+        if engine == "llama":
+            # Only poll when the manager exposes async readiness (real ServerManager returns 'ready')
+            if "ready" not in lr:
+                return True, ""
+            if lr.get("ready"):
+                return True, ""
+            self._tune_log("Waiting for llama-server to finish loading model…")
+            while (time.time() - t0) < timeout:
+                if self._tune_cancel.is_set():
+                    return False, "cancelled while waiting for llama-server"
+                st = self.host.mgr.status() or {}
+                if st.get("ready"):
+                    self._tune_log(f"llama-server ready in {round(time.time() - t0, 1)}s.")
+                    return True, ""
+                if not st.get("running"):
+                    tail = self._engine_log_tail("llama", lines=20)
+                    err_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+                    last_err = err_lines[-1][:240] if err_lines else ""
+                    return False, f"llama-server exited before becoming ready{f': {last_err}' if last_err else ''}"
+                time.sleep(poll_interval)
+            return False, f"llama-server did not become ready within {int(timeout)}s"
+
+        if engine == "avalon":
+            if "state" not in lr or lr.get("state") == "ready":
+                return True, ""
+            self._tune_log("Waiting for Avalon to become ready…")
+            while (time.time() - t0) < timeout:
+                if self._tune_cancel.is_set():
+                    return False, "cancelled while waiting for Avalon"
+                st = self.host.smgr.status() or {}
+                if st.get("state") == "ready":
+                    self._tune_log(f"Avalon ready in {round(time.time() - t0, 1)}s.")
+                    return True, ""
+                if st.get("state") == "failed" or (not st.get("running") and (time.time() - t0) > 3.0):
+                    return False, f"Avalon failed to become ready (state={st.get('state')})"
+                time.sleep(poll_interval)
+            return False, f"Avalon did not become ready within {int(timeout)}s"
+
+        if engine == "strata":
+            st0 = self.host.strata_status(refresh=True) or {}
+            if "health" not in st0 or st0.get("health") == "ready":
+                return True, ""
+            self._tune_log("Waiting for Strata to become ready…")
+            while (time.time() - t0) < timeout:
+                if self._tune_cancel.is_set():
+                    return False, "cancelled while waiting for Strata"
+                st = self.host.strata_status(refresh=True) or {}
+                if st.get("health") == "ready":
+                    self._tune_log(f"Strata ready in {round(time.time() - t0, 1)}s.")
+                    return True, ""
+                if not st.get("running") and (time.time() - t0) > 3.0:
+                    return False, "Strata exited before becoming ready"
+                time.sleep(poll_interval)
+            return False, f"Strata did not become ready within {int(timeout)}s"
+
+        if engine == "maya" and self.host.maya_mgr:
+            if "state" not in lr or lr.get("state") == "ready":
+                return True, ""
+            self._tune_log("Waiting for Maya to become ready…")
+            while (time.time() - t0) < timeout:
+                if self._tune_cancel.is_set():
+                    return False, "cancelled while waiting for Maya"
+                st = self.host.maya_mgr.status(refresh=True) or {}
+                if st.get("state") == "ready":
+                    self._tune_log(f"Maya ready in {round(time.time() - t0, 1)}s.")
+                    return True, ""
+                if not st.get("running") and (time.time() - t0) > 3.0:
+                    return False, f"Maya exited before becoming ready (state={st.get('state')})"
+                time.sleep(poll_interval)
+            return False, f"Maya did not become ready within {int(timeout)}s"
+
+        return True, ""
+
     def _launch_for_trial(self, engine: str, cfg: dict[str, Any]) -> tuple[bool, str]:
         try:
             if engine == "llama":
@@ -1959,12 +2043,23 @@ class OptimizerAgent:
                     draft_max=int(cfg.get("draft_max") or 16),
                     jinja=str(cfg.get("jinja") or "auto"),
                 )
-                return bool(res.get("ok", True)), str(res.get("error") or "")
+                if not isinstance(res, dict):
+                    return True, ""
+                if res.get("ok") is False:
+                    return False, str(res.get("error") or "llama launch failed")
+                if "running" in res and not res.get("running"):
+                    tail = self._engine_log_tail("llama", lines=20)
+                    err_lines = [ln.strip() for ln in tail.splitlines() if ln.strip()]
+                    last_err = err_lines[-1][:240] if err_lines else ""
+                    return False, f"llama-server exited immediately{f': {last_err}' if last_err else ''}"
+                return self._wait_for_engine_ready("llama", launch_res=res)
             if engine == "avalon":
                 profile = cfg.get("profile") or "flagship"
                 tune = {k: v for k, v in cfg.items() if k != "profile"}
                 res = self.host.smgr.start(profile, tune)
-                return bool(res.get("ok", True)), str(res.get("error") or "")
+                if isinstance(res, dict) and res.get("ok") is False:
+                    return False, str(res.get("error") or "avalon launch failed")
+                return self._wait_for_engine_ready("avalon", launch_res=res if isinstance(res, dict) else {})
             if engine == "strata":
                 body_kwargs = {k: v for k, v in cfg.items() if k != "plan"}
                 body = self.host.strata_launch_body_cls(**body_kwargs, plan=False, restart=True)
@@ -1982,7 +2077,7 @@ class OptimizerAgent:
                                     st_last[k] = j[k]
                             if st_last:
                                 self.host.cfg["strata_last"] = st_last
-                        return True, ""
+                        return self._wait_for_engine_ready("strata")
                     parts = [
                         str(r.get("error") or "").strip(),
                         str(r.get("stderr") or "").strip()[-300:],
@@ -1990,12 +2085,16 @@ class OptimizerAgent:
                     ]
                     msg = " | ".join(p for p in parts if p) or f"exit rc={r.get('rc')} ({cmd_str})"
                     return False, msg[:500]
-                return (r.returncode == 0), (r.stderr or r.stdout or f"exit rc={r.returncode}")[-400:]
+                if r.returncode != 0:
+                    return False, (r.stderr or r.stdout or f"exit rc={r.returncode}")[-400:]
+                return self._wait_for_engine_ready("strata")
             if engine == "maya" and self.host.maya_mgr:
                 cid = self._patch_maya_json_config(cfg)
                 cur = self.host.maya_mgr.status()
                 res = self.host.maya_mgr.switch(cid) if cur.get("running") else self.host.maya_mgr.start(cid)
-                return bool(res.get("running", True) or res.get("ok", True)), str(res.get("error") or "")
+                if isinstance(res, dict) and res.get("ok") is False:
+                    return False, str(res.get("error") or "maya launch failed")
+                return self._wait_for_engine_ready("maya", launch_res=res if isinstance(res, dict) else {})
         except Exception as e:
             return False, str(e)
         return False, "unknown engine"
