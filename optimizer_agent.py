@@ -204,6 +204,12 @@ ENGINE_GUIDES: dict[str, dict[str, str]] = {
             "(2) Enable `-fa on` and quantize KV cache to `-ctk q8_0 -ctv q4_0`; "
             "(3) Reduce `--parallel` to 1; (4) Halve `-c` context; (5) Reduce `-ngl` layer by layer."
         ),
+        "device_lost": (
+            "Vulkan device lost (`vk::DeviceLostError` / `ErrorDeviceLost` on `vk::Queue::submit`) means the driver "
+            "reset the GPU mid-kernel — the engine process is dead and must be relaunched; there is no in-process recovery. "
+            "Typical triggers on the iGPU: an oversized prefill dispatch (`-b`/`-ub`) or GPU memory pressure. "
+            "Hardened relaunch: `-fa on` with quantized KV, `--parallel 1`, and small batches (`-b 1024 -ub 256`)."
+        ),
     },
     "avalon": {
         "moe": (
@@ -272,6 +278,17 @@ ERROR_PATTERNS: list[dict[str, Any]] = [
         "severity": "error",
         "title": "KV Cache Allocation Failure",
         "cause": "Requested context window (`-c` / `--context`) and KV cache precision exceeded available memory.",
+    },
+    {
+        "id": "device_lost",
+        "regex": re.compile(r"(vk::DeviceLostError|ErrorDeviceLost|VK_ERROR_DEVICE_LOST)", re.I),
+        "severity": "error",
+        "title": "GPU Device Lost (Vulkan Reset)",
+        "cause": (
+            "The Vulkan driver reset the device mid-submission (queue submit returned ErrorDeviceLost) and the "
+            "engine process died — it cannot recover in place. Usually an oversized prefill dispatch or GPU "
+            "memory pressure hung the device."
+        ),
     },
     {
         "id": "unknown_flag",
@@ -1525,7 +1542,7 @@ class OptimizerAgent:
                 model_path = m["path"]
             # Save into launch_profiles.json
             profiles = self.host.read_json(self.host.launch_profiles_path, {})
-            profiles[model_path] = {k: v for k, v in config.items() if k != "model"}
+            profiles[model_path] = {**{k: v for k, v in config.items() if k != "model"}, "updated_at": time.time()}
             self.host.write_json(self.host.launch_profiles_path, profiles)
             if launch:
                 result["launch"] = self.host.mgr.start(
@@ -2119,6 +2136,36 @@ class OptimizerAgent:
                 pass
         return ""
 
+    def _last_known_config(self, engine: str) -> dict[str, Any]:
+        """Best-effort last launch config for an engine.
+
+        A crashed engine has already cleared its runtime state (status() reports
+        running=False and drops the model), so fall back to the persisted launch
+        profile — most recently updated wins — before giving up with {}.
+        """
+        try:
+            if engine == "llama":
+                profiles = self.host.read_json(self.host.launch_profiles_path, {}) or {}
+                if not isinstance(profiles, dict) or not profiles:
+                    return {}
+                model = str((self.host.mgr.status() or {}).get("model") or "")
+                if model not in profiles:
+                    model = max(profiles, key=lambda k: float((profiles[k] or {}).get("updated_at") or 0))
+                prof = dict(profiles.get(model) or {})
+                prof.setdefault("model", model)
+                return prof
+            if engine == "avalon":
+                st = self.host.smgr.status() or {}
+                profile = str(st.get("profile") or "flagship")
+                prof = dict((self.host.cfg.get("avalon_tune") or {}).get(profile) or {})
+                prof.setdefault("profile", profile)
+                return prof
+            if engine == "strata":
+                return dict(self.host.cfg.get("strata_last") or {})
+        except Exception:
+            pass
+        return {}
+
     def diagnose_failure(
         self,
         *,
@@ -2139,7 +2186,7 @@ class OptimizerAgent:
                 matched_line = m.group(0)
                 break
 
-        cfg = copy.deepcopy(last_config or {})
+        cfg = copy.deepcopy(last_config if last_config is not None else self._last_known_config(engine))
         fix_config = copy.deepcopy(cfg)
         steps: list[str] = []
         pattern_id = matched["id"] if matched else "unknown"
@@ -2196,6 +2243,22 @@ class OptimizerAgent:
             fix_config["fa"] = "on"
             steps.append("Enabled Flash Attention (`-fa on`) required by quantized V cache.")
 
+        elif pattern_id == "device_lost":
+            if engine == "llama":
+                fix_config["fa"] = "on"
+                fix_config["ctk"] = "q8_0"
+                fix_config["ctv"] = "q4_0"
+                fix_config["parallel"] = 1
+                fix_config["ubatch"] = min(int(fix_config.get("ubatch") or 512), 256)
+                fix_config["batch"] = min(int(fix_config.get("batch") or 2048), 1024)
+                steps.append("Relaunching on a fresh device — a Vulkan device-lost kills the process; there is no in-process recovery.")
+                steps.append("Enabled `-fa on` + quantized KV (`-ctk q8_0 -ctv q4_0`) and `--parallel 1` to cut GPU memory pressure.")
+                steps.append(f"Clamped dispatch to `-b {fix_config['batch']} -ub {fix_config['ubatch']}` so each `vk::Queue::submit` stays small (oversized prefill dispatches hang the iGPU).")
+            elif engine == "avalon":
+                fix_config["ubatch"] = min(int(fix_config.get("ubatch") or 512), 256)
+                fix_config["batch"] = min(int(fix_config.get("batch") or 2048), 1024)
+                steps.append(f"Clamped Avalon dispatch to `batch={fix_config['batch']}` / `ubatch={fix_config['ubatch']}` and relaunched on a fresh device.")
+
         elif pattern_id == "draft_mismatch":
             if engine == "llama":
                 fix_config["draft"] = ""
@@ -2235,7 +2298,11 @@ class OptimizerAgent:
         engine: str = "llama",
         last_config: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        diag = self.diagnose_failure(engine=engine, last_config=last_config, use_llm=False)
+        diag = self.diagnose_failure(
+            engine=engine,
+            last_config=last_config if last_config is not None else self._last_known_config(engine),
+            use_llm=False,
+        )
         if not diag.get("fix_config"):
             return {"ok": False, "diagnosis": diag, "error": "No automated fix available for this failure"}
         applied = self.apply_config(
@@ -2915,8 +2982,11 @@ class OptimizerAgent:
                 reply = "Strata doctor hook is not wired."
 
         elif action_id == "diagnose_engine":
-            diag = self.diagnose_failure(engine=eng, use_llm=True)
+            diag = self.diagnose_failure(engine=eng, last_config=self._last_known_config(eng), use_llm=True)
             reply = f"**{diag['title']}** ({eng})\n{diag['cause']}"
+            ml = str(diag.get("matched_line") or "").replace("\n", " ").strip()[:200]
+            if ml:
+                reply += f"\n\n`{ml}`"
             if diag.get("remediation_steps"):
                 reply += "\n\nProposed fix:\n" + "\n".join(f"- {s}" for s in diag["remediation_steps"])
                 actions.append({"label": f"Fix & Relaunch ({eng})", "type": "apply", "engine": eng, "config": diag["fix_config"]})
@@ -2924,13 +2994,13 @@ class OptimizerAgent:
                 reply += "\n\n" + diag["llm_diagnosis"]
 
         elif action_id == "heal_engine":
-            res = self.heal_failure(engine=eng)
+            res = self.heal_failure(engine=eng, last_config=self._last_known_config(eng))
             diag = res.get("diagnosis") or {}
             reply = f"**Auto-Heal ({eng})**: {diag.get('title', 'Completed')}\n"
-            if res.get("healed"):
+            if res.get("ok"):
                 reply += f"Applied fix and relaunched (checkpoint `{(res.get('applied') or {}).get('checkpoint_id', '')}`)."
             else:
-                reply += res.get("detail") or diag.get("cause") or "No automatic fix was required."
+                reply += res.get("error") or diag.get("cause") or "No automatic fix was required."
 
         elif action_id == "thermal_status":
             if self.host.thermal_status_fn:

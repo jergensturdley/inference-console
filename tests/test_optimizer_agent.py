@@ -331,6 +331,58 @@ def test_diagnose_draft_mismatch(tmp_path):
     assert diag["fix_config"]["draft"] == ""
 
 
+
+def test_diagnose_vulkan_device_lost_builds_hardened_relaunch(tmp_path):
+    """Real crash signature: vk::DeviceLostError on vk::Queue::submit must be classified
+    and produce a small-dispatch relaunch config, not 'No explicit crash signature found'."""
+    agent, _, _, _ = _make_stub_agent(tmp_path)
+    crash_log = "\n".join([
+        "terminate called after throwing an instance of 'vk::DeviceLostError'",
+        "  what():  vk::Queue::submit: ErrorDeviceLost",
+        "#0 ggml_vk_synchronize ggml-vulkan.so",
+        "#1 ggml_backend_sched_synchronize",
+        "#2 llama_context::synchronize",
+        "#3 server_context_impl::update_slots",
+    ])
+    diag = agent.diagnose_failure(
+        engine="llama",
+        log_text=crash_log,
+        last_config={"model": "Llama-3-8B-Q4_K_M", "preset": "igpu-full", "ctx": 131072,
+                     "batch": 2048, "ubatch": 512, "parallel": 2, "ctk": "f16", "ctv": "f16"},
+        use_llm=False,
+    )
+    assert diag["pattern_id"] == "device_lost"
+    assert "DeviceLost" in diag["title"] or "Device Lost" in diag["title"]
+    assert "devicelost" in diag["matched_line"].lower()
+    assert diag["llm_diagnosis"] is None  # deterministic fix, no LLM free-forming
+    fc = diag["fix_config"]
+    assert fc["fa"] == "on" and fc["ctk"] == "q8_0" and fc["ctv"] == "q4_0"
+    assert fc["parallel"] == 1 and fc["ubatch"] <= 256 and fc["batch"] <= 1024
+    assert "device_lost" in diag["docs_consulted"]
+
+
+def test_diagnose_and_heal_device_lost_recover_last_launch_profile(tmp_path):
+    """Engine state is gone after the crash; diagnosis must fall back to the persisted
+    launch profile so heal can relaunch the same model with hardened flags."""
+    agent, _, mgr_calls, host = _make_stub_agent(tmp_path)
+    host.write_json(host.launch_profiles_path, {
+        "/models/bonsai.gguf": {"preset": "igpu-full", "ctx": 131072, "ngl": 99, "fa": "auto",
+                                 "batch": 2048, "ubatch": 512, "updated_at": 42.0},
+    })
+    host.mgr.logbuf = ["what():  vk::Queue::submit: ErrorDeviceLost"]
+
+    diag = agent.diagnose_failure(engine="llama", use_llm=False)  # no last_config passed
+    assert diag["pattern_id"] == "device_lost"
+    assert diag["fix_config"]["model"] == "/models/bonsai.gguf"
+    assert diag["fix_config"]["ubatch"] == 256
+
+    res = agent.heal_failure(engine="llama")
+    assert res["ok"] is True
+    ll = [c for c in mgr_calls if c[0] == "llama"]
+    assert ll and ll[-1][1] == "/models/bonsai.gguf"
+    assert ll[-1][2]["fa"] == "on" and ll[-1][2]["ubatch"] == 256
+
+
 # ---------------------------------------------------------------- Docs & Sidebar Chat
 def test_docs_oracle_and_deterministic_sidebar_chat(tmp_path):
     agent, _, _, _ = _make_stub_agent(tmp_path)
