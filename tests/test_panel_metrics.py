@@ -535,8 +535,9 @@ def test_truncate_accepts_keep_and_drops_turns():
 def test_avalon_tune_preview_does_not_persist():
     draft = Path(HOME_TMP) / "draft.gguf"
     draft.write_bytes(b"x" * 16)
-    ov = (panel.AVALON_DRAFT, panel.CFG.get("avalon_tune"), panel.SMGR.info)
-    panel.AVALON_DRAFT = draft
+    ov = (panel.CFG.get("avalon_draft"), panel.CFG.get("avalon_tune"), panel.SMGR.info)
+    panel.CFG["avalon_draft"] = str(draft)
+    panel._avalon_target_invalidate()
     panel.SMGR.info = {}
     try:
         panel.CFG["avalon_tune"] = {}
@@ -557,8 +558,9 @@ def test_avalon_tune_preview_does_not_persist():
         args = " ".join(panel.SMGR.build_args("flagship"))
         assert f"-c {panel.AVALON_PROFILES['flagship']['defaults']['ctx']}" in args
     finally:
-        panel.AVALON_DRAFT, panel.SMGR.info = ov[0], ov[2]
+        panel.CFG["avalon_draft"], panel.SMGR.info = ov[0], ov[2]
         panel.CFG["avalon_tune"] = ov[1]
+        panel._avalon_target_invalidate()
 
 
 def test_profiles_expose_saved_tune():
@@ -1082,6 +1084,54 @@ def test_agent_toml_invalid_leaves_file_untouched():
         panel.HOME = real_home
 
 
+def test_agent_zed_jsonc_comments_and_trailing_commas():
+    """Zed settings.json is JSONC (// comments, /* */ comments, trailing commas)."""
+    real_home = panel.HOME
+    h = Path(tempfile.mkdtemp(prefix="inference-console-zed-"))
+    panel.HOME = h
+    try:
+        p = h / ".config" / "zed" / "settings.json"
+        p.parent.mkdir(parents=True)
+        p.write_text(
+            "// Zed settings\n"
+            "{\n"
+            "  /* block comment */\n"
+            "  \"theme\": \"One Dark\",\n"
+            "  \"docs_url\": \"https://zed.dev/docs\", // inline comment after URL\n"
+            "  \"tab_size\": 2,\n"
+            "}\n"
+        )
+        panel._w_zed("model-z", "http://127.0.0.1:8830", 32768)
+        data = json.loads(p.read_text())
+        assert data["theme"] == "One Dark"
+        assert data["docs_url"] == "https://zed.dev/docs"
+        assert data["tab_size"] == 2
+        lm = data["language_models"]["openai"]
+        assert lm["api_url"] == "http://127.0.0.1:8830/v1"
+        assert lm["available_models"][0]["name"] == "model-z"
+        assert lm["available_models"][0]["max_tokens"] == 32768
+    finally:
+        panel.HOME = real_home
+
+
+def test_api_agents_source_pinning():
+    """GET /api/agents?source=strata must report running=None when only llama.cpp is up."""
+    ov = (panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx)
+    panel.MGR.status = lambda: {"running": True, "alias": "local-m", "port": 8830, "pid": 1234}
+    panel.SMGR.status = lambda: {"running": False}
+    panel.strata_status = lambda refresh=False: {"installed": False, "running": False, "port": None}
+    panel.MAYA.status = lambda: {"running": False}
+    panel._proc_ctx = lambda pid: 16384
+    try:
+        auto = panel.api_agents()
+        assert auto["running"] is not None and auto["running"][0] == "local-m"
+        assert auto["sources"] == {"panel": True, "avalon": False, "strata": False, "maya": False}
+        pinned = panel.api_agents(source="strata")
+        assert pinned["running"] is None
+    finally:
+        panel.MGR.status, panel.SMGR.status, panel.strata_status, panel.MAYA.status, panel._proc_ctx = ov
+
+
 # ---------------------------------------------------------------- llama.cpp extra knobs
 _FULL_CAPS = {"exists": True, "metrics": True, "fa_value": True, "ctk": True, "mlock": True,
               "no_mmap": True, "parallel": True, "ncmoe": True, "draft": True, "draft_max": True,
@@ -1240,21 +1290,17 @@ def test_parse_ctx_words():
 
 
 def test_strata_status_without_cli_is_not_installed():
-    ov = panel.CFG.get("strata_bin")
-    ov_env = os.environ.get("STRATA_BIN")
+    ov = panel.strata_bin
     try:
-        panel.CFG["strata_bin"] = str(Path(HOME_TMP) / "definitely-missing-strata")
-        os.environ["STRATA_BIN"] = panel.CFG["strata_bin"]
+        # Stub the resolver itself: pointing CFG at a missing path is not enough on
+        # hosts that have a real strata on PATH or in a fallback location.
+        panel.strata_bin = lambda: None
         st = panel.strata_status()
         assert st["installed"] is False
         assert "install.sh" in st["install_cmd"]
         assert st["running"] is False
     finally:
-        panel.CFG["strata_bin"] = ov
-        if ov_env is None:
-            os.environ.pop("STRATA_BIN", None)
-        else:
-            os.environ["STRATA_BIN"] = ov_env
+        panel.strata_bin = ov
 
 
 def test_strata_key_endpoint_masks_by_default():
@@ -1356,24 +1402,19 @@ def test_setup_job_records_failure_state():
 
 
 def test_setup_status_shape_without_binaries():
-    ov_bin, ov_sbin = panel.CFG.get("server_binary"), panel.CFG.get("strata_bin")
-    ov_env = os.environ.get("STRATA_BIN")
+    ov_bin = panel.CFG.get("server_binary")
+    ov_strata_bin = panel.strata_bin
     try:
         missing = str(Path(HOME_TMP) / "no-llama-server")
         panel.CFG["server_binary"] = missing
-        panel.CFG["strata_bin"] = missing
-        os.environ["STRATA_BIN"] = missing
+        panel.strata_bin = lambda: None  # strata: stub the resolver (PATH/fallbacks)
         st = panel.api_setup_status()
         assert st["llama"]["installed"] is False
         assert st["strata"]["installed"] is False
         assert "avalon" in st and "job" in st
     finally:
         panel.CFG["server_binary"] = ov_bin
-        panel.CFG["strata_bin"] = ov_sbin
-        if ov_env is None:
-            os.environ.pop("STRATA_BIN", None)
-        else:
-            os.environ["STRATA_BIN"] = ov_env
+        panel.strata_bin = ov_strata_bin
 
 
 def test_legacy_path_migration_moves_once_and_never_clobbers():
@@ -1441,11 +1482,13 @@ def test_model_server_host_toggle_across_engines():
     ov_strata = panel.strata_status
     ov_mgr_st = panel.MGR.status
     ov_smgr_st = panel.SMGR.status
+    ov_maya_st = panel.MAYA.status
     panel.bin_caps = lambda b: {"exists": True, "metrics": True, "jinja": True}
     panel._avalon_target = lambda: {"model": mp, "mmproj": None, "draft": None, "base": "test"}
     panel.strata_status = lambda refresh=False: {"installed": False, "running": False}
     panel.MGR.status = lambda: {"running": False, "configured_host": panel.model_server_host()}
     panel.SMGR.status = lambda: {"running": False}
+    panel.MAYA.status = lambda refresh=False: {"running": False}
     try:
         # Default is 127.0.0.1
         st0 = panel.api_server_host_set(panel.ModelServerHostBody(lan=False))
@@ -1490,6 +1533,7 @@ def test_model_server_host_toggle_across_engines():
         panel.strata_status = ov_strata
         panel.MGR.status = ov_mgr_st
         panel.SMGR.status = ov_smgr_st
+        panel.MAYA.status = ov_maya_st
 
 
 def test_model_server_host_restart_mismatch():
@@ -1499,6 +1543,7 @@ def test_model_server_host_restart_mismatch():
     ov_mgr_st = panel.MGR.status
     ov_mgr_restart = panel.MGR.restart
     ov_smgr_st = panel.SMGR.status
+    ov_maya_st = panel.MAYA.status
     cur = {"host": "127.0.0.1", "restarts": 0}
 
     def fake_mgr_status():
@@ -1514,6 +1559,7 @@ def test_model_server_host_restart_mismatch():
     panel.MGR.status = fake_mgr_status
     panel.MGR.restart = fake_mgr_restart
     panel.SMGR.status = lambda: {"running": False}
+    panel.MAYA.status = lambda refresh=False: {"running": False}
     try:
         panel.CFG["model_server_host"] = "127.0.0.1"
         panel.CFG["avalon_lan"] = False
@@ -1539,6 +1585,7 @@ def test_model_server_host_restart_mismatch():
         panel.MGR.status = ov_mgr_st
         panel.MGR.restart = ov_mgr_restart
         panel.SMGR.status = ov_smgr_st
+        panel.MAYA.status = ov_maya_st
 
 
 def test_settings_model_server_host_sync():

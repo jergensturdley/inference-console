@@ -46,6 +46,17 @@ DEFAULT_CONFIG = {
     "strata_ctx": 8192,
     "strata_api_key": "",
     "strata_last": {},           # address/model reported by the last successful launch
+    # Optional LLM provider for the Optimization Agent (empty = deterministic + local fallback)
+    "agent_llm_provider": "custom",
+    "agent_llm_url": "",
+    "agent_llm_key": "",
+    "agent_llm_model": "",
+    "agent_llm_headers": "",
+    "agent_llm_fallback_local": True,
+    "thermal_guard": {},         # graduated GPU thermal & VRAM pressure guard settings
+    # Project Maya (~/project-maya). Empty means use MAYA_DIR / MAYA_ROCM_PATH defaults.
+    "maya_dir": "",
+    "maya_rocm_path": "",
 }
 
 # ---------------------------------------------------------------- config
@@ -1062,6 +1073,9 @@ class ServerManager:
               fa="auto", ctk="", ctv="", parallel=None, batch=None, ubatch=None,
               ncmoe=None, mlock=False, no_mmap=False, draft="", draft_max=16, draft_min=0,
               ot="", tensor_split="", tbatch=None, keep=None, jinja="on", save_profile=True):
+        if preset not in ("cpu-only",) and not str(preset).startswith("igpu"):
+            if MAYA.status().get("running"):
+                raise HTTPException(409, "Stop Maya first — this model needs its GPU VRAM.")
         if self.status()["running"]:
             self.stop()
         mp = Path(model)
@@ -1280,12 +1294,6 @@ def _avalon_target() -> dict:
     if pinned:
         tgt["model"] = Path(pinned).expanduser()
         tgt["base"] = SPLIT_RE.sub("", tgt["model"].stem)
-        if CFG.get("avalon_draft"):
-            tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
-        else:
-            drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
-            if drafts:
-                tgt["draft"] = drafts[0]
     else:
         packs = _avalon_scan()
         if packs:
@@ -1294,6 +1302,13 @@ def _avalon_target() -> dict:
             tgt["base"] = p0["base"]
             tgt["draft"] = Path(p0["draft"]) if p0["draft"] else None
             tgt["mmproj"] = p0["mmproj"]
+    # avalon_draft is an override, so it wins in both modes; the pinned branch used to be the
+    # only one that honoured it, which silently ignored the setting whenever the tab was on auto.
+    if CFG.get("avalon_draft"):
+        tgt["draft"] = Path(CFG["avalon_draft"]).expanduser()
+    elif tgt["draft"] is None and tgt["model"]:
+        drafts = sorted(d for d in tgt["model"].parent.glob("mtp-*.gguf") if d.is_file())
+        tgt["draft"] = drafts[0] if drafts else None
     if tgt["model"] and not tgt.get("mmproj"):
         try:
             tgt["mmproj"] = find_mmproj(str(tgt["model"]))
@@ -1455,6 +1470,8 @@ class AvalonManager:
             raise HTTPException(503, "Avalon build not found — build ~/avalon first (cmake --build build --target llama-server).")
         if not tgt["model"] or not tgt["model"].exists():
             raise HTTPException(404, "no Flash-Next pack detected in the model dirs — finish a download first or set avalon_model in config.json.")
+        if p["exclusive"] and MAYA.status().get("running"):
+            raise HTTPException(409, "Stop Maya first — Avalon needs its GPU VRAM.")
         if p["exclusive"] and self._gpu_conflict():
             raise HTTPException(409, "Stop the llama.cpp server first — this profile needs its VRAM.")
         if self.status()["running"] or not self._port_free():
@@ -1570,6 +1587,668 @@ class AvalonManager:
         AVALON_STATE_PATH.write_text(json.dumps(self.info))
 
 SMGR = AvalonManager()
+
+# ---------------------------------------------------------------- maya (Project Maya)
+MAYA_DIR = HOME / "project-maya"
+MAYA_ROCM_PATH = HOME / "maya-rocm"
+MAYA_STATE_PATH = APP_DIR / "maya-state.json"
+MAYA_LOG_PATH = APP_DIR / "maya-runtime.log"
+_MAYA_STATUS_TTL = 2.0
+
+_MAYA_RE_LOAD = re.compile(r"\bloaded in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_WARMUP = re.compile(r"\bwarmed up in\s+([\d.]+)\s*s\b", re.I)
+_MAYA_RE_VRAM = re.compile(r"([\d.]+)\s*GB\s+of\s+VRAM", re.I)
+_MAYA_RE_CTX = re.compile(r"\bcontext\s+(\d+)\b", re.I)
+_MAYA_RE_EXPERTS = re.compile(r"(\d+)\s+of\s+(\d+)\s+routed experts in VRAM\s*\(([\d.]+)%\)", re.I)
+_MAYA_RE_READY = re.compile(r"\bready:\s*https?://", re.I)
+_MAYA_RE_HY4_SERVE = re.compile(
+    r"prompt\s+\d+\s+tokens[^()]*\(([\d.]+)\s*tok/s\)[^()]*?generated\s+in\s+[\d.]+\s*ms\s*\(([\d.]+)\s*tok/s\)",
+    re.I,
+)
+_MAYA_RE_ANSWERING = re.compile(r"\[maya\]\s+answering:\s*(\d+)\s+of\s+max\s+\d+\s+tokens,\s*([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_DONE = re.compile(r"\[maya\]\s+done:\s*(\d+)\s+tokens\s+in\s+[\d.]+\s*s\s*\(([\d.]+)\s*tok/s\)", re.I)
+_MAYA_RE_GLM_PREFILL = re.compile(r"glm\s+prefill:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_GLM_STAT = re.compile(r"glm\s+stat:.*?([\d.]+)\s*tok/s", re.I)
+_MAYA_RE_QUANT = re.compile(r"(maya-xs|iq\d+_[a-z0-9]+|q\d+_[a-z0-9_]+|fp16|bf16|f16|mxfp4)", re.I)
+
+
+def _tail_file_lines(path: Path, max_lines: int = 250, max_bytes: int = 131072) -> list[str]:
+    """Read up to the last `max_lines` lines from `path` without loading huge logs."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            size = fh.tell()
+            fh.seek(max(0, size - max_bytes))
+            data = fh.read().decode("utf-8", errors="replace")
+        lines = data.splitlines()
+        return lines[-max_lines:]
+    except OSError:
+        return []
+
+
+def _mask_secret(key: str) -> str:
+    if not key:
+        return ""
+    return (key[:4] + "…" + key[-4:]) if len(key) >= 8 else "(short key)"
+
+
+def parse_maya_log(lines: list[str]) -> dict:
+    """Extract live telemetry from Project Maya engine log lines (Hy4 and GLM)."""
+    out = {
+        "decode_tps": None,
+        "prefill_tps": None,
+        "vram_gb": None,
+        "experts_vram": None,
+        "experts_total": None,
+        "experts_vram_pct": None,
+        "context": None,
+        "load_s": None,
+        "warmup_s": None,
+        "ready_seen": False,
+        "active": False,
+        "last_tokens": None,
+    }
+    for ln in lines:
+        if not ln:
+            continue
+        m = _MAYA_RE_VRAM.search(ln)
+        if m:
+            out["vram_gb"] = float(m.group(1))
+        m = _MAYA_RE_CTX.search(ln)
+        if m:
+            out["context"] = int(m.group(1))
+        m = _MAYA_RE_LOAD.search(ln)
+        if m:
+            out["load_s"] = float(m.group(1))
+        m = _MAYA_RE_WARMUP.search(ln)
+        if m:
+            out["warmup_s"] = float(m.group(1))
+        m = _MAYA_RE_EXPERTS.search(ln)
+        if m:
+            out["experts_vram"] = int(m.group(1))
+            out["experts_total"] = int(m.group(2))
+            out["experts_vram_pct"] = float(m.group(3))
+        if _MAYA_RE_READY.search(ln):
+            out["ready_seen"] = True
+        m = _MAYA_RE_HY4_SERVE.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            continue
+        m = _MAYA_RE_ANSWERING.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = True
+            continue
+        m = _MAYA_RE_DONE.search(ln)
+        if m:
+            out["last_tokens"] = int(m.group(1))
+            out["decode_tps"] = round(float(m.group(2)), 2)
+            out["active"] = False
+            continue
+        m = _MAYA_RE_GLM_PREFILL.search(ln)
+        if m:
+            out["prefill_tps"] = round(float(m.group(1)), 2)
+            continue
+        m = _MAYA_RE_GLM_STAT.search(ln)
+        if m:
+            out["decode_tps"] = round(float(m.group(1)), 2)
+    return out
+
+
+class MayaMgr:
+    """Manages the local Project Maya server (Hy4-Flash, GLM-5.3-Flash, etc.)."""
+
+    def __init__(self):
+        self.proc = None
+        self.info = {}
+        self.logbuf = deque(maxlen=400)
+        self._cache = {"at": 0.0, "val": None}
+        self._load_state()
+
+    @staticmethod
+    def _maya_dir() -> Path:
+        raw = CFG.get("maya_dir") or ""
+        return Path(raw).expanduser() if raw else MAYA_DIR
+
+    @staticmethod
+    def _rocm_path() -> str:
+        raw = CFG.get("maya_rocm_path") or ""
+        return str(Path(raw).expanduser()) if raw else str(MAYA_ROCM_PATH)
+
+    def _invalidate(self):
+        self._cache["at"] = 0.0
+
+    def _load_state(self):
+        if not MAYA_STATE_PATH.exists():
+            return
+        try:
+            st = json.loads(MAYA_STATE_PATH.read_text())
+            pid = st.get("pid")
+            if pid and _pid_alive(pid):
+                self.proc = None
+                self.info = {**st, "adopted": True}
+                self.log(f"adopted running maya pid={pid} config={st.get('config_id')}")
+        except Exception:
+            pass
+
+    def log(self, line: str):
+        self.logbuf.append(f"[{time.strftime('%H:%M:%S')}] {_redact_cmd(line)}")
+
+    @staticmethod
+    def _read_config_raw(path: Path) -> dict | None:
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    @staticmethod
+    def _extract_ctx(raw: dict) -> int:
+        args = raw.get("args") or []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("--max-context", "--ctx-size", "-c") and i + 1 < len(args):
+                    try:
+                        return int(args[i + 1])
+                    except ValueError:
+                        pass
+                if s.startswith("--max-context="):
+                    try:
+                        return int(s.split("=", 1)[1])
+                    except ValueError:
+                        pass
+        for k in ("max_context", "ctx", "context"):
+            if raw.get(k):
+                try:
+                    return int(raw[k])
+                except (TypeError, ValueError):
+                    pass
+        return 131072
+
+    @staticmethod
+    def _extract_model_size(raw: dict, base_dir: Path) -> int:
+        """Compute total byte size of the model file or directory referenced in config args."""
+        args = raw.get("args") or []
+        candidates = []
+        if isinstance(args, list):
+            for i, tok in enumerate(args):
+                s = str(tok)
+                if s in ("-m", "--model", "--model-dir") and i + 1 < len(args):
+                    candidates.append(str(args[i + 1]))
+                elif s.startswith("--model="):
+                    candidates.append(s.split("=", 1)[1])
+                elif not s.startswith("-") and ("/" in s or s.endswith((".gguf", ".safetensors", ".bin"))):
+                    candidates.append(s)
+        for cand in candidates:
+            p = Path(cand).expanduser()
+            if not p.is_absolute():
+                p = base_dir / p
+            if not p.exists():
+                continue
+            try:
+                if p.is_file():
+                    return p.stat().st_size
+                if p.is_dir():
+                    total = 0
+                    for f in p.rglob("*"):
+                        if f.is_file():
+                            try:
+                                total += f.stat().st_size
+                            except OSError:
+                                pass
+                    if total > 0:
+                        return total
+            except OSError:
+                continue
+        return 0
+
+    def _resolve_log_path(self, raw: dict, cfg_path: Path) -> Path:
+        base_dir = self._maya_dir()
+        lp = raw.get("log")
+        if lp:
+            p = Path(str(lp)).expanduser()
+            return p if p.is_absolute() else (base_dir / p)
+        return base_dir / f"{cfg_path.stem}.log"
+
+    def _public_config(self, cfg_path: Path, raw: dict) -> dict:
+        base_dir = self._maya_dir()
+        exe = str(raw.get("exe") or "")
+        exe_path = Path(exe).expanduser()
+        if exe and not exe_path.is_absolute():
+            exe_path = base_dir / exe_path
+        args = raw.get("args") or []
+        args_str = " ".join(str(a) for a in args) if isinstance(args, list) else str(args)
+        engine = "hy4" if "hy4" in exe.lower() or "hy4" in cfg_path.stem.lower() else "glm"
+        # Never default a Maya config to 8080 (latency-speedtest owns 8080).
+        port = int(raw.get("port") or 8098)
+        quant_m = _MAYA_RE_QUANT.search(cfg_path.stem) or _MAYA_RE_QUANT.search(args_str)
+        quant = quant_m.group(1) if quant_m else ""
+        size_b = self._extract_model_size(raw, base_dir)
+        key = str(raw.get("api_key") or "")
+        log_path = self._resolve_log_path(raw, cfg_path)
+        return {
+            "id": cfg_path.stem,
+            "filename": cfg_path.name,
+            "path": str(cfg_path),
+            "model_name": str(raw.get("model_name") or cfg_path.stem),
+            "engine": engine,
+            "exe": exe,
+            "quant": quant,
+            "ctx": self._extract_ctx(raw),
+            "mtp": "--mtp" in args if isinstance(args, list) else ("--mtp" in args_str),
+            "port": port,
+            "host": str(raw.get("host") or "127.0.0.1"),
+            "log": str(log_path),
+            "sampling": raw.get("sampling") if isinstance(raw.get("sampling"), dict) else {},
+            "reasoning_effort": raw.get("reasoning_effort"),
+            "key_set": bool(key),
+            "key_masked": _mask_secret(key),
+            "dir_size_bytes": size_b,
+            "dir_size_h": human_size(size_b) if size_b else "",
+            "available": bool(exe) and exe_path.exists(),
+            "concurrency_note": "1 request at a time" if engine == "hy4" else "",
+        }
+
+    def discover_configs(self) -> list[dict]:
+        """Discover Project Maya JSON configs in MAYA_DIR, excluding *.panel-orig.json backups."""
+        base_dir = self._maya_dir()
+        if not base_dir.is_dir():
+            return []
+        out = []
+        for p in sorted(base_dir.glob("*.json")):
+            name = p.name
+            if name.endswith(".panel-orig.json") or name.endswith(".orig.json") or name.endswith(".bak.json"):
+                continue
+            raw = self._read_config_raw(p)
+            if not raw:
+                continue
+            if not (raw.get("exe") or raw.get("model_name")):
+                continue
+            out.append(self._public_config(p, raw))
+        return out
+
+    def _find_config(self, ref: str) -> tuple[Path, dict, dict] | None:
+        """Resolve a config by full path, filename, or stem id. Returns (path, raw, public)."""
+        ref_s = str(ref or "").strip()
+        if not ref_s:
+            return None
+        base_dir = self._maya_dir()
+        for pub in self.discover_configs():
+            if ref_s in (pub["path"], pub["id"], pub["filename"]):
+                p = Path(pub["path"])
+                raw = self._read_config_raw(p)
+                if raw:
+                    return p, raw, pub
+        # Allow an explicit path inside base_dir if valid
+        cand = Path(ref_s).expanduser()
+        if not cand.is_absolute():
+            cand = base_dir / cand
+        if cand.is_file() and not cand.name.endswith(".panel-orig.json"):
+            raw = self._read_config_raw(cand)
+            if raw and (raw.get("exe") or raw.get("model_name")):
+                return cand, raw, self._public_config(cand, raw)
+        return None
+
+    @staticmethod
+    def _port_open(port: int, timeout: float = 0.15) -> bool:
+        try:
+            with socket.socket() as s:
+                s.settimeout(timeout)
+                return s.connect_ex(("127.0.0.1", int(port))) == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _probe_models(port: int, api_key: str, timeout: float = 0.8) -> tuple[bool, str | None]:
+        """Key-authed GET /v1/models probe. Returns (ready, alias)."""
+        if not port or not MayaMgr._port_open(port):
+            return False, None
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
+        try:
+            r = httpx.get(f"http://127.0.0.1:{port}/v1/models", headers=headers, timeout=timeout)
+            if r.status_code == 200:
+                alias = None
+                try:
+                    data = r.json().get("data") or []
+                    if isinstance(data, list) and data and isinstance(data[0], dict):
+                        alias = data[0].get("id")
+                except Exception:
+                    pass
+                return True, alias
+            return False, None
+        except Exception:
+            return False, None
+
+    @staticmethod
+    def _find_proc_pid(port: int | None = None) -> int | None:
+        """Best-effort PID lookup on Linux /proc for adopted Maya processes."""
+        if not Path("/proc").is_dir():
+            return None
+        fallback = None
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                pid = int(d.name)
+                if port and str(port) in cmd:
+                    return pid
+                if fallback is None:
+                    fallback = pid
+        return fallback
+
+    def _status_now(self) -> dict:
+        st = self.info
+        if st:
+            pid = st.get("pid")
+            alive = (self.proc is not None and self.proc.poll() is None) or _pid_alive(pid)
+            port = int(st.get("port") or 0)
+            cfg_path = Path(st["config_path"]) if st.get("config_path") else None
+            raw = self._read_config_raw(cfg_path) if cfg_path and cfg_path.exists() else {}
+            raw = raw or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(port, key)
+            if alive or ready:
+                log_path = Path(st.get("log") or "") if st.get("log") else None
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if (log_path and log_path.exists()) else parse_maya_log([])
+                return {
+                    "running": True,
+                    "state": "ready" if ready else "loading",
+                    "pid": pid if alive else self._find_proc_pid(port),
+                    "config_id": st.get("config_id"),
+                    "config_path": st.get("config_path"),
+                    "model_name": st.get("model_name"),
+                    "alias": alias or st.get("model_name") or "maya",
+                    "engine": st.get("engine") or "hy4",
+                    "port": port,
+                    "host": str(raw.get("host") or st.get("host") or "127.0.0.1"),
+                    "ctx": int(st.get("ctx") or self._extract_ctx(raw)),
+                    "log": st.get("log") or "",
+                    "key_set": bool(key),
+                    "key_masked": _mask_secret(key),
+                    "uptime": int(time.time() - st.get("started_at", time.time())),
+                    "cmd": st.get("cmd", ""),
+                    "adopted": bool(st.get("adopted", False)),
+                    "telemetry": tel,
+                }
+            # Tracked process died and port is closed
+            self.proc = None
+            self.info = {}
+            MAYA_STATE_PATH.unlink(missing_ok=True)
+
+        # Port-probe adoption: check discovered configs for an already-running Maya server.
+        for pub in self.discover_configs():
+            cfg_path = Path(pub["path"])
+            raw = self._read_config_raw(cfg_path) or {}
+            key = str(raw.get("api_key") or "")
+            ready, alias = self._probe_models(pub["port"], key)
+            if ready:
+                pid = self._find_proc_pid(pub["port"])
+                log_path = Path(pub["log"])
+                tel = parse_maya_log(_tail_file_lines(log_path, 200)) if log_path.exists() else parse_maya_log([])
+                self.info = {
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "host": pub["host"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "started_at": time.time(),
+                    "adopted": True,
+                    "cmd": "",
+                }
+                return {
+                    "running": True,
+                    "state": "ready",
+                    "pid": pid,
+                    "config_id": pub["id"],
+                    "config_path": pub["path"],
+                    "model_name": pub["model_name"],
+                    "alias": alias or pub["model_name"],
+                    "engine": pub["engine"],
+                    "port": pub["port"],
+                    "host": pub["host"],
+                    "ctx": pub["ctx"],
+                    "log": pub["log"],
+                    "key_set": pub["key_set"],
+                    "key_masked": pub["key_masked"],
+                    "uptime": 0,
+                    "cmd": "",
+                    "adopted": True,
+                    "telemetry": tel,
+                }
+        return {"running": False, "state": "stopped", "telemetry": parse_maya_log([])}
+
+    def status(self, refresh: bool = False) -> dict:
+        now = time.time()
+        if not refresh and self._cache["val"] is not None and (now - self._cache["at"]) < _MAYA_STATUS_TTL:
+            return self._cache["val"]
+        val = self._status_now()
+        self._cache["val"] = val
+        self._cache["at"] = now
+        return val
+
+    def active_api_key(self, config_ref: str | None = None) -> str:
+        """Server-side only: return raw api_key for the active or specified Maya config."""
+        ref = config_ref or self.info.get("config_path")
+        if not ref:
+            st = self.status()
+            ref = st.get("config_path")
+        if not ref:
+            return ""
+        found = self._find_config(ref)
+        if not found:
+            return ""
+        return str(found[1].get("api_key") or "")
+
+    @staticmethod
+    def _gpu_conflict() -> bool:
+        return AvalonManager._gpu_conflict()
+
+    def build_start_spec(self, cfg_path: Path, pub: dict) -> tuple[list[str], dict, Path]:
+        base_dir = self._maya_dir()
+        venv_py = base_dir / ".venv/bin/python"
+        launcher = base_dir / "maya.py"
+        argv = [str(venv_py), str(launcher), "--config", str(cfg_path), "--port", str(pub["port"])]
+        env = dict(os.environ)
+        env["ROCM_PATH"] = self._rocm_path()
+        return argv, env, base_dir
+
+    def start(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        cfg_path, raw, pub = found
+        if pub["port"] == 8080:
+            raise HTTPException(400, "Refusing port 8080 — reserved by latency-speedtest. Edit the config port to 8098/8099.")
+
+        # Exclusivity: refuse a second Maya config while one serves.
+        cur = self.status(refresh=True)
+        if cur.get("running"):
+            raise HTTPException(
+                409,
+                f"Maya is already running ({cur.get('model_name')} on :{cur.get('port')}) — stop it or use Switch.",
+            )
+
+        # GPU-conflict guard against other engines & VRAM.
+        if MGR.status().get("running"):
+            raise HTTPException(409, "Stop the llama.cpp server first — Maya needs the GPU VRAM.")
+        if SMGR.status().get("running"):
+            raise HTTPException(409, "Stop Avalon first — Maya needs the GPU VRAM.")
+        if strata_status().get("running"):
+            raise HTTPException(409, "Stop Strata first — Maya needs the GPU VRAM.")
+        if self._gpu_conflict():
+            raise HTTPException(409, "Another engine is holding GPU VRAM — stop it first.")
+
+        argv, env, base_dir = self.build_start_spec(cfg_path, pub)
+        if not Path(argv[0]).exists():
+            raise HTTPException(503, f"Maya virtualenv python not found: {argv[0]}")
+        if not Path(argv[1]).exists():
+            raise HTTPException(503, f"Maya launcher not found: {argv[1]}")
+
+        cmd_str = _redact_cmd(" ".join(argv))
+        self.log(f"starting maya {pub['model_name']} ({pub['id']}) on :{pub['port']}: {cmd_str}")
+        MAYA_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_fh = open(MAYA_LOG_PATH, "a", encoding="utf-8", errors="replace")
+        try:
+            self.proc = subprocess.Popen(
+                argv,
+                cwd=str(base_dir),
+                env=env,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        finally:
+            log_fh.close()
+
+        self.info = {
+            "pid": self.proc.pid,
+            "config_id": pub["id"],
+            "config_path": str(cfg_path),
+            "model_name": pub["model_name"],
+            "engine": pub["engine"],
+            "port": pub["port"],
+            "host": pub["host"],
+            "ctx": pub["ctx"],
+            "log": pub["log"],
+            "started_at": time.time(),
+            "adopted": False,
+            "cmd": cmd_str,
+        }
+        self._save_state()
+        self._invalidate()
+        return self.status(refresh=True)
+
+    @staticmethod
+    def _kill_orphans(port: int | None = None) -> bool:
+        """Terminate any untracked Maya python/engine processes on Linux /proc."""
+        if not Path("/proc").is_dir():
+            return False
+        victims = []
+        for d in Path("/proc").iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+            except Exception:
+                continue
+            if "inference-console" in cmd or "panel.py" in cmd:
+                continue
+            if "maya.py" in cmd or "build-hip/maya" in cmd:
+                victims.append(int(d.name))
+        for v in victims:
+            try:
+                os.killpg(os.getpgid(v), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(v, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(80):
+            port_free = (not port) or (not MayaMgr._port_open(port))
+            if port_free and not any(_pid_alive(v) for v in victims):
+                break
+            time.sleep(0.1)
+        for v in victims:
+            if _pid_alive(v):
+                try:
+                    os.kill(v, signal.SIGKILL)
+                except (ProcessLookupError, PermissionError):
+                    pass
+        for _ in range(30):
+            if (not port) or (not MayaMgr._port_open(port)):
+                break
+            time.sleep(0.1)
+        return bool(victims)
+
+    def stop(self) -> dict:
+        cur = self.status(refresh=True)
+        st = self.info
+        pid = st.get("pid") or cur.get("pid")
+        port = st.get("port") or cur.get("port")
+        killed = False
+        if pid and _pid_alive(pid):
+            try:
+                os.killpg(os.getpgid(pid), signal.SIGTERM)
+            except (ProcessLookupError, PermissionError, OSError):
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            for _ in range(100):
+                port_free = (not port) or (not self._port_open(port))
+                if not _pid_alive(pid) and port_free and not self._gpu_conflict():
+                    killed = True
+                    break
+                time.sleep(0.1)
+            if _pid_alive(pid):
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, PermissionError, OSError):
+                    try:
+                        os.kill(pid, signal.SIGKILL)
+                    except (ProcessLookupError, PermissionError):
+                        pass
+            killed = True
+        if port and self._port_open(port):
+            if self._kill_orphans(port):
+                killed = True
+        self.proc = None
+        self.info = {}
+        MAYA_STATE_PATH.unlink(missing_ok=True)
+        self._invalidate()
+        stopped = (not port) or (not self._port_open(port))
+        self.log(f"stopped maya (pid {pid})" if killed else ("maya not running" if stopped else f"stop failed: port {port} still busy"))
+        return {"stopped": stopped}
+
+    def switch(self, config_ref: str) -> dict:
+        found = self._find_config(config_ref)
+        if not found:
+            raise HTTPException(404, f"Maya config not found: {config_ref}")
+        if self.status(refresh=True).get("running"):
+            res = self.stop()
+            if not res.get("stopped"):
+                raise HTTPException(503, "Failed to stop running Maya server before switching.")
+        return self.start(str(found[0]))
+
+    def tail_log(self, max_lines: int = 250) -> dict:
+        st = self.status()
+        log_path_s = st.get("log") or self.info.get("log") or ""
+        lines: list[str] = []
+        source_path = ""
+        if log_path_s:
+            lp = Path(log_path_s)
+            if lp.exists():
+                lines = _tail_file_lines(lp, max_lines=max_lines)
+                source_path = str(lp)
+        if not lines and MAYA_LOG_PATH.exists():
+            lines = _tail_file_lines(MAYA_LOG_PATH, max_lines=max_lines)
+            source_path = str(MAYA_LOG_PATH)
+        if not lines and self.logbuf:
+            lines = list(self.logbuf)[-max_lines:]
+        key = self.active_api_key()
+        text = "\n".join(lines)
+        if key and len(key) >= 6:
+            text = text.replace(key, _mask_secret(key))
+        return {"log": _redact_cmd(text), "path": source_path}
+
+    def _save_state(self):
+        MAYA_STATE_PATH.write_text(json.dumps(self.info))
+
+
+MAYA = MayaMgr()
 
 # ---------------------------------------------------------------- vitals
 _prev_cpu = None
@@ -1759,64 +2438,147 @@ SESSION_TTL = 7 * 24 * 3600
 _sessions: dict = {}   # token -> expiry (unix time)
 _fails: dict = {}      # ip -> deque(failure unix times)
 
+SESSIONS_PATH = APP_DIR / "sessions.json"
+
+def _load_sessions():
+    """Sessions are memory-only, so an in-place restart would sign the operator out.
+    Mirror them to a 0600 file and reload on boot; expired tokens are dropped."""
+    now = time.time()
+    raw = _read_json(SESSIONS_PATH, {})
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for tok, exp in raw.items():
+        try:
+            if float(exp) > now:
+                out[str(tok)] = float(exp)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+def _save_sessions():
+    try:
+        tmp = SESSIONS_PATH.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps({k: v for k, v in _sessions.items() if v > time.time()}))
+        os.chmod(tmp, 0o600)
+        tmp.replace(SESSIONS_PATH)
+    except OSError:
+        pass  # a session mirror that cannot be written must not break sign-in
+
+_sessions.update(_load_sessions())
+
 LOGIN_HTML = r"""<!doctype html>
-<html lang="en" data-theme="dark"><head><meta charset="utf-8"><title>Inference Console — Sign in</title>
+<html lang="en"><head><meta charset="utf-8"><title>Inference Console — Sign in</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta name="color-scheme" content="light dark">
-<script>try{const t=localStorage.getItem('ic.theme');if(t==='light'||t==='dark'){document.documentElement.dataset.theme=t;document.querySelector('meta[name="color-scheme"]').content=t}}catch(_){}</script>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2311161f'/><path d='M8 9h16M8 16h10M8 23h13' stroke='%2322d3ee' stroke-width='2.6' stroke-linecap='round'/><circle cx='23' cy='16' r='2.6' fill='%23f59e0b'/></svg>">
+<script>try{const s=localStorage.getItem('ic.theme');const m=document.querySelector('meta[name="color-scheme"]');if(s==='light'||s==='dark'){if(m)m.content=s;document.documentElement.dataset.theme=s;}else{document.documentElement.dataset.theme=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';}}catch(_){document.documentElement.dataset.theme='dark';}</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Source+Code+Pro:wght@400;500;600;700&family=Wix+Madefor+Display:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23B8C4FF'/><path d='M17.5 5l-8.5 13h5.2l-1.2 9 8.5-13h-5.2z' fill='%231E2C64'/></svg>">
 <style>
 :root{
   color-scheme:light dark;
-  --bg:#090b10;--bg-2:#0d1017;--panel:#11161f;--panel-2:#161c27;--raise:#1c2432;
-  --bd:#222b3a;--bd-2:#2e3a4e;
-  --fg:#edf2f8;--fg-2:#c4cfde;--mut:#8695aa;--faint:#59677a;
-  --acc:#22d3ee;--acc-2:#f59e0b;--acc-ink:#041318;
-  --err:#f87171;--ok:#34d399;
+  --font-display:"Wix Madefor Display",ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --font-sans:"Instrument Sans",ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;
+  --font-mono:"Source Code Pro",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  --dur-state:100ms;--ease-state:ease-out;
+  --l-surface:#F9F9FF;--d-surface:#111318;
+  --l-lowest:#FFFFFF;--d-lowest:#0C0E13;
+  --l-low:#F3F3FA;--d-low:#1A1C21;
+  --l-container:#EDEDF4;--d-container:#1E2025;
+  --l-high:#E8E7EF;--d-high:#282A2F;
+  --l-on-surface:#1A1C21;--d-on-surface:#E2E2E9;
+  --l-on-var:#454650;--d-on-var:#C6C5D1;
+  --l-outline:#767681;--d-outline:#90909B;
+  --l-outline-var:#C6C5D1;--d-outline-var:#454650;
+  --l-primary:#4E5B95;--d-primary:#B8C4FF;
+  --l-on-primary:#FFFFFF;--d-on-primary:#1E2C64;
+  --l-error:#BA1A1A;--d-error:#FFB4AB;
+
+  --surface:var(--d-surface);--lowest:var(--d-lowest);--low:var(--d-low);
+  --container:var(--d-container);--high:var(--d-high);
+  --on-surface:var(--d-on-surface);--on-var:var(--d-on-var);
+  --outline:var(--d-outline);--outline-var:var(--d-outline-var);
+  --primary:var(--d-primary);--on-primary:var(--d-on-primary);
+  --error:var(--d-error);
 }
 :root:has(> head > meta[name="color-scheme"][content="dark"]){color-scheme:dark}
 :root:has(> head > meta[name="color-scheme"][content="light"]){color-scheme:light}
+@media (prefers-color-scheme:light){
+  :root:not([data-theme=dark]){
+    --surface:var(--l-surface);--lowest:var(--l-lowest);--low:var(--l-low);
+    --container:var(--l-container);--high:var(--l-high);
+    --on-surface:var(--l-on-surface);--on-var:var(--l-on-var);
+    --outline:var(--l-outline);--outline-var:var(--l-outline-var);
+    --primary:var(--l-primary);--on-primary:var(--l-on-primary);
+    --error:var(--l-error);
+  }
+}
 [data-theme=light]{
-  --bg:#f4f6f9;--bg-2:#eaeef4;--panel:#ffffff;--panel-2:#f9fafc;--raise:#edf1f7;
-  --bd:#d9e1ec;--bd-2:#c2cedd;
-  --fg:#0f172a;--fg-2:#334155;--mut:#5b6b82;--faint:#8796ab;
-  --acc:#0284c7;--acc-2:#d97706;--acc-ink:#ffffff;
-  --err:#dc2626;--ok:#059669;
+  --surface:var(--l-surface);--lowest:var(--l-lowest);--low:var(--l-low);
+  --container:var(--l-container);--high:var(--l-high);
+  --on-surface:var(--l-on-surface);--on-var:var(--l-on-var);
+  --outline:var(--l-outline);--outline-var:var(--l-outline-var);
+  --primary:var(--l-primary);--on-primary:var(--l-on-primary);
+  --error:var(--l-error);
+}
+@supports (color:light-dark(white,black)){
+  :root{
+    --surface:light-dark(var(--l-surface),var(--d-surface));
+    --lowest:light-dark(var(--l-lowest),var(--d-lowest));
+    --low:light-dark(var(--l-low),var(--d-low));
+    --container:light-dark(var(--l-container),var(--d-container));
+    --high:light-dark(var(--l-high),var(--d-high));
+    --on-surface:light-dark(var(--l-on-surface),var(--d-on-surface));
+    --on-var:light-dark(var(--l-on-var),var(--d-on-var));
+    --outline:light-dark(var(--l-outline),var(--d-outline));
+    --outline-var:light-dark(var(--l-outline-var),var(--d-outline-var));
+    --primary:light-dark(var(--l-primary),var(--d-primary));
+    --on-primary:light-dark(var(--l-on-primary),var(--d-on-primary));
+    --error:light-dark(var(--l-error),var(--d-error));
+  }
 }
 *,*::before,*::after{box-sizing:border-box}
-body{margin:0;min-height:100vh;display:grid;place-items:center;padding:20px;
-  background-color:var(--bg);
-  background-image:radial-gradient(rgba(34,211,238,.07) 1px,transparent 1px),radial-gradient(900px 420px at 80% -10%,rgba(34,211,238,.09),transparent 65%);
-  background-size:24px 24px,100% 100%;
-  color:var(--fg);font:14px/1.55 -apple-system,BlinkMacSystemFont,"Inter","Segoe UI",Roboto,sans-serif;-webkit-font-smoothing:antialiased}
-:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
-.card{width:min(380px,94vw);background:var(--panel);border:1px solid var(--bd-2);
-  border-radius:12px;padding:26px;box-shadow:0 4px 12px rgba(0,0,0,.35)}
-.brand{display:flex;align-items:center;gap:12px;margin-bottom:22px;padding-bottom:16px;border-bottom:1px solid var(--bd)}
-.mark{width:34px;height:34px;border-radius:9px;background:var(--bg-2);border:1px solid var(--bd-2);display:grid;place-items:center;color:var(--acc)}
-.mark svg{width:19px;height:19px}
-.brand b{font-size:16px;letter-spacing:-.02em;display:block}
-.brand span.sub{display:block;font-size:12px;color:var(--mut)}
-label{display:block;color:var(--fg-2);font-size:12.5px;font-weight:600;margin-bottom:6px}
-input{width:100%;padding:10px 12px;border-radius:8px;border:1px solid var(--bd-2);background:var(--bg-2);color:var(--fg);
-  font:inherit;font-size:14px;transition:border-color .15s}
-input:focus{border-color:var(--acc);outline:2px solid var(--acc);outline-offset:1px}
-button.sub{width:100%;margin-top:14px;padding:10px 14px;border:1px solid color-mix(in srgb,var(--acc) 55%,transparent);border-radius:8px;
-  background:var(--acc);color:var(--acc-ink);font:inherit;font-weight:650;font-size:14px;cursor:pointer;transition:filter .15s,opacity .15s}
-button.sub:hover{filter:brightness(1.06)}button.sub:active{transform:translateY(1px)}button.sub[disabled]{opacity:.55;cursor:progress}
-#msg{color:var(--err);font-size:12.5px;min-height:18px;margin-top:10px}
-.hint{color:var(--mut);font-size:12px;margin:14px 0 0;text-align:center}
-.theme{position:fixed;top:14px;right:14px;width:34px;height:34px;display:grid;place-items:center;border-radius:8px;
-  border:1px solid var(--bd);background:var(--panel);color:var(--mut);cursor:pointer;margin:0;padding:0}
-.theme:hover{color:var(--fg);background:var(--raise)}
+body{margin:0;min-height:100vh;display:grid;place-items:center;padding:24px;
+  background-color:var(--surface);color:var(--on-surface);
+  font:400 14px/20px var(--font-sans);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+:focus-visible{outline:2px solid var(--primary);outline-offset:2px;border-radius:8px}
+.card{width:min(400px,94vw);background:var(--low);border:1px solid var(--outline-var);
+  border-radius:12px;padding:24px}
+.brand{display:flex;align-items:center;gap:12px;margin-bottom:20px;padding-bottom:16px;border-bottom:1px solid var(--outline-var)}
+.mark{width:32px;height:32px;border-radius:8px;background:var(--primary);display:grid;place-items:center;color:var(--on-primary);flex-shrink:0}
+.mark svg{width:17px;height:17px}
+.brand b{font-family:var(--font-display);font-size:18px;font-weight:600;line-height:24px;letter-spacing:-.15px;display:block}
+.brand span.sub{display:block;font-family:var(--font-mono);font-size:12px;line-height:16px;color:var(--on-var);margin-top:2px}
+label{display:block;color:var(--on-surface);font-size:13px;font-weight:600;line-height:18px;letter-spacing:.1px;margin-bottom:6px}
+input{width:100%;padding:9px 12px;border-radius:8px;border:1px solid var(--outline-var);background:var(--lowest);color:var(--on-surface);
+  font:500 13px/18px var(--font-mono);transition:border-color var(--dur-state) var(--ease-state)}
+input::placeholder{color:var(--outline);font-family:var(--font-sans);font-weight:400}
+input:focus{border-color:var(--primary);outline:2px solid var(--primary);outline-offset:1px}
+button.sub{width:100%;margin-top:16px;padding:9px 16px;border:1px solid transparent;border-radius:8px;
+  background:var(--primary);color:var(--on-primary);font:600 13px/18px var(--font-sans);letter-spacing:.1px;cursor:pointer;
+  transition:opacity var(--dur-state) var(--ease-state)}
+button.sub:hover{opacity:.9}
+@media (prefers-reduced-motion:no-preference){button.sub:active{transform:translateY(1px)}}
+button.sub[disabled]{opacity:.55;cursor:progress}
+#msg{color:var(--error);font-size:12px;line-height:17px;min-height:18px;margin-top:10px}
+.hint{color:var(--outline);font-family:var(--font-mono);font-size:11px;line-height:15px;margin:14px 0 0;text-align:center}
+.theme{position:fixed;top:16px;right:16px;width:36px;height:36px;display:grid;place-items:center;border-radius:8px;
+  border:1px solid var(--outline-var);background:var(--container);color:var(--on-var);cursor:pointer;margin:0;padding:0;
+  transition:color var(--dur-state) var(--ease-state),border-color var(--dur-state) var(--ease-state),background-color var(--dur-state) var(--ease-state)}
+.theme:hover{color:var(--on-surface);border-color:var(--primary);background:var(--high)}
 .theme svg{width:16px;height:16px}
-@media (prefers-reduced-motion:reduce){*{transition-duration:.01ms !important}}
+@media (forced-colors:active){
+  .card,input,.theme{border:1px solid CanvasText}
+  button.sub{border:1px solid ButtonText}
+}
 </style></head><body>
 <button class="theme" id="theme" aria-label="Toggle color theme"></button>
 <div class="card">
  <div class="brand">
-  <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M5 7h14M5 12h9M5 17h11"/><circle cx="18" cy="12" r="2" fill="currentColor"/></svg></span>
-  <div><b>Inference Console</b><span class="sub">Local inference &amp; telemetry console</span></div>
+  <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+  <div><b>Inference Console</b><span class="sub">local ai inference workbench</span></div>
  </div>
  <form>
   <label for="pw">Host sudo password</label>
@@ -1824,25 +2586,34 @@ button.sub:hover{filter:brightness(1.06)}button.sub:active{transform:translateY(
   <button type="submit" class="sub" id="go">Unlock console</button>
   <div id="msg" role="alert"></div>
  </form>
- <p class="hint">Authenticated via PAM sudo · 5 attempts per 5 minutes</p>
+ <p class="hint">PAM sudo auth · 5 attempts / 5 min</p>
 </div>
 <script>
 const SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
 const MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 14a8 8 0 01-9.5-9.5A8 8 0 1020 14z"/></svg>';
 function $(s){return document.querySelector(s)}
-function sysScheme(){return matchMedia('(prefers-color-scheme: light)').matches?'light':'dark'}
-function applyTheme(t){
- document.documentElement.dataset.theme=t;
- $('meta[name="color-scheme"]').content=localStorage.getItem('ic.theme')||'light dark';
- $('#theme').innerHTML=t==='dark'?SUN:MOON;
+const sysMQ=matchMedia('(prefers-color-scheme: light)');
+function sysScheme(){return sysMQ.matches?'light':'dark'}
+function syncTheme(){
+ const stored=(()=>{try{return localStorage.getItem('ic.theme')}catch(_){return null}})();
+ const eff=(stored==='light'||stored==='dark')?stored:sysScheme();
+ document.documentElement.dataset.theme=eff;
+ const meta=$('meta[name="color-scheme"]');
+ if(meta)meta.content=(stored==='light'||stored==='dark')?stored:'light dark';
+ $('#theme').innerHTML=eff==='dark'?SUN:MOON;
+ $('#theme').title=eff==='dark'?'Switch to light theme':'Switch to dark theme';
 }
-applyTheme(localStorage.getItem('ic.theme')||sysScheme());
+syncTheme();
+sysMQ.addEventListener('change',syncTheme);
+window.addEventListener('storage',e=>{if(e.key==='ic.theme')syncTheme()});
 $('#theme').onclick=()=>{
- const cur=document.documentElement.dataset.theme;
+ const cur=document.documentElement.dataset.theme||sysScheme();
  const next=cur==='dark'?'light':'dark';
- if(next===sysScheme())localStorage.removeItem('ic.theme');
- else localStorage.setItem('ic.theme',next);
- applyTheme(next);
+ try{
+  if(next===sysScheme())localStorage.removeItem('ic.theme');
+  else localStorage.setItem('ic.theme',next);
+ }catch(_){}
+ syncTheme();
 };
 async function go(ev){ev.preventDefault();
  const m=$('#msg'),b=$('#go'),pw=$('#pw');m.textContent='';
@@ -1899,6 +2670,7 @@ def api_login(b: LoginBody, request: Request):
     q.clear()
     tok = secrets.token_urlsafe(32)
     _sessions[tok] = now + SESSION_TTL
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.set_cookie(SESSION_COOKIE, tok, max_age=SESSION_TTL, httponly=True,
                     samesite="lax", path="/")
@@ -1907,6 +2679,7 @@ def api_login(b: LoginBody, request: Request):
 @app.post("/api/logout")
 def api_logout(request: Request):
     _sessions.pop(request.cookies.get(SESSION_COOKIE, ""), None)
+    _save_sessions()
     resp = JSONResponse({"ok": True})
     resp.delete_cookie(SESSION_COOKIE, path="/")
     return resp
@@ -2812,12 +3585,15 @@ def _model_host_state():
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
+    my = MAYA.status()
     llama_running = bool(m.get("running") and m.get("port") != AVALON_PORT)
     llama_host = m.get("host", "127.0.0.1") if llama_running else host
     avalon_running = bool(a.get("running"))
     want_av_host = "0.0.0.0" if CFG.get("avalon_lan") else "127.0.0.1"
     avalon_host = a.get("host", "127.0.0.1") if avalon_running else want_av_host
     strata_running = bool(s.get("running"))
+    maya_running = bool(my.get("running"))
+    maya_host = my.get("host", "127.0.0.1") if maya_running else None
     needs_restart = []
     if llama_running and llama_host != host:
         needs_restart.append("llama.cpp")
@@ -2836,6 +3612,8 @@ def _model_host_state():
                        "port": AVALON_PORT if avalon_running else None,
                        "mismatch": avalon_running and avalon_host != want_av_host},
             "strata": {"running": strata_running, "port": s.get("port") if strata_running else None},
+            "maya": {"running": maya_running, "host": maya_host,
+                     "port": my.get("port") if maya_running else None},
         },
         "needs_restart": needs_restart,
     }
@@ -2931,15 +3709,20 @@ AGENTS_STATE_PATH = APP_DIR / "agent-registry.json"
 PANEL_PROVIDER_ID = "inference-console"
 
 def _load_agents_state():
-    if AGENTS_STATE_PATH.exists():
-        try:
-            return json.loads(AGENTS_STATE_PATH.read_text())
-        except Exception:
-            pass
-    return {"agents": {}}
+    st = _read_json(AGENTS_STATE_PATH, {})
+    if not isinstance(st, dict):
+        st = {}
+    if not isinstance(st.get("agents"), dict):
+        st["agents"] = {}
+    return st
 
 def _save_agents_state(st):
-    AGENTS_STATE_PATH.write_text(json.dumps(st, indent=1))
+    """Atomic, and never fatal: the agent configs are already written by the time this runs,
+    so a read-only state dir must not turn a successful sync into a 500."""
+    try:
+        _write_json(AGENTS_STATE_PATH, st)
+    except OSError as e:
+        print(f"agent registry not saved: {e}", flush=True)
 
 def _proc_ctx(pid):
     try:
@@ -2949,6 +3732,32 @@ def _proc_ctx(pid):
     except Exception:
         pass
     return 8192
+
+def _server_facts(port, timeout: float = 1.5):
+    """(model id, n_ctx) as the running server reports them over HTTP. /proc only exists on
+    Linux, so the old cmdline probe told every agent `-c 8192` on macOS no matter what the
+    server was really loaded with; /props answers the same question on every platform."""
+    alias = nctx = None
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/v1/models", timeout=timeout)
+        if r.status_code == 200:
+            data = (r.json() or {}).get("data") or []
+            if data and isinstance(data[0], dict) and data[0].get("id"):
+                alias = str(data[0]["id"])
+    except Exception:
+        pass
+    try:
+        r = httpx.get(f"http://127.0.0.1:{port}/props", timeout=timeout)
+        if r.status_code == 200:
+            j = r.json() or {}
+            nctx = (j.get("default_generation_settings") or {}).get("n_ctx") or j.get("n_ctx")
+            nctx = int(nctx) if nctx else None
+    except Exception:
+        nctx = None
+    if alias and ("/" in alias or "\\" in alias or alias.lower().endswith(".gguf")):
+        alias = Path(alias.replace("\\", "/")).name.removesuffix(".gguf")
+        alias = SPLIT_RE.sub("", alias) or None
+    return alias, nctx
 
 # ==================== STRATA (Niko1221/Strata) ====================
 # Strata is a separate inference engine (github.com/Niko1221/Strata) serving the same
@@ -2996,18 +3805,40 @@ def _strata_run(args: list[str], timeout: int = 25) -> dict:
                 "install_cmd": STRATA_INSTALL_CMD}
     try:
         p = subprocess.run([b] + args, capture_output=True, text=True, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
-                "stderr": "", "error": f"strata timed out after {timeout}s"}
+    except subprocess.TimeoutExpired as e:
+        raw_out = e.stdout.decode(errors="replace") if isinstance(e.stdout, bytes) else (e.stdout or "")
+        raw_err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else (e.stderr or "")
+        out_s = raw_out.strip()
+        err_s = raw_err.strip()
+        tail_src = err_s or out_s
+        tail_lines = [ln.strip() for ln in tail_src.splitlines() if ln.strip()][-3:]
+        tail = " | ".join(tail_lines)[-300:] if tail_lines else ""
+        detail = (f"strata timed out after {timeout}s — last output: {tail}"
+                  if tail else f"strata timed out after {timeout}s (no output captured — still loading/downloading or blocked)")
+        strata_log(f"timeout ({timeout}s): strata {' '.join(args)}")
+        if tail:
+            strata_log(f"timeout tail: {tail}")
+        return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": out_s[:6000],
+                "stderr": err_s[:2000], "error": detail}
     except OSError as e:
         return {"ok": False, "rc": None, "installed": True, "json": None, "stdout": "",
                 "stderr": "", "error": f"could not run strata: {e}"}
     out = (p.stdout or "").strip()
     err = (p.stderr or "").strip()
-    try:
-        parsed = json.loads(out)
-    except Exception:
-        parsed = None
+    parsed = None
+    # Strata can append a human-readable summary line after the JSON payload, which
+    # breaks json.loads on the whole stdout. Decode the first JSON value instead;
+    # raw_decode stops at the end of that value and ignores the trailing text.
+    dec = json.JSONDecoder()
+    for idx, ch in enumerate(out):
+        if ch in "{[":
+            try:
+                val, _ = dec.raw_decode(out[idx:])
+            except Exception:
+                continue
+            if isinstance(val, (dict, list)):
+                parsed = val
+                break
     return {"ok": p.returncode == 0, "rc": p.returncode, "installed": True,
             "json": parsed if isinstance(parsed, (dict, list)) else None,
             "stdout": out[:6000], "stderr": err[:2000], "error": None}
@@ -3174,6 +4005,27 @@ def _strata_status_now() -> dict:
                 out["health"] = strata_health(out["port"])
         except (TypeError, ValueError):
             pass
+        runs = j.get("running")
+        if isinstance(runs, list) and runs and isinstance(runs[0], dict):
+            # Strata >= 0.1.62 `--status --output json` shape: {"ok": true, "running":
+            # [{name, profile, state, port, url, ...}]} instead of the older flat
+            # serving/address shape. Same trust level: only lift keys we can name.
+            r0 = runs[0]
+            if out.get("model") in (None, "") and r0.get("name"):
+                out["model"] = r0["name"]
+            if out.get("preset") in (None, "") and r0.get("profile"):
+                out["preset"] = r0["profile"]
+            if out.get("address") in (None, "") and r0.get("url"):
+                out["address"] = r0["url"]
+            try:
+                rp = int(r0.get("port") or 0)
+                if rp > 0:
+                    out["port"] = rp
+                    out["health"] = strata_health(rp)
+            except (TypeError, ValueError):
+                pass
+            if r0.get("state") in ("ready", "loading"):
+                out["running"] = True
         serving = j.get("serving")
         if isinstance(serving, bool):
             out["running"] = serving
@@ -3247,6 +4099,8 @@ def api_strata_update():
 def api_strata_launch(b: StrataLaunchBody):
     if not strata_bin():
         raise HTTPException(503, f"Strata CLI not found. Install it: {STRATA_INSTALL_CMD}")
+    if not b.plan and MAYA.status().get("running"):
+        raise HTTPException(409, "Stop Maya first — Strata needs its GPU VRAM.")
     args = strata_build_args(b, plan=b.plan)
     # A plan is read-only, so it is worth the long timeout; a real launch downloads and
     # loads a model and must not be cut off mid-download by a short client-side wait.
@@ -3327,6 +4181,43 @@ def api_strata_telemetry():
 def api_strata_log():
     return {"log": "\n".join(list(STRATA_LOG)[-120:])}
 
+# ---------------------------------------------------------------- maya api
+@app.get("/api/maya/status")
+def api_maya_status():
+    return MAYA.status()
+
+@app.get("/api/maya/configs")
+def api_maya_configs():
+    return {"configs": MAYA.discover_configs()}
+
+class MayaStartBody(BaseModel):
+    config: str
+    switch: bool = False
+
+@app.post("/api/maya/start")
+def api_maya_start(b: MayaStartBody):
+    return MAYA.switch(b.config) if b.switch else MAYA.start(b.config)
+
+@app.post("/api/maya/switch")
+def api_maya_switch(b: MayaStartBody):
+    return MAYA.switch(b.config)
+
+@app.post("/api/maya/stop")
+def api_maya_stop():
+    return MAYA.stop()
+
+@app.get("/api/maya/log")
+def api_maya_log():
+    return MAYA.tail_log(max_lines=250)
+
+@app.get("/api/maya/key")
+def api_maya_key(reveal: bool = False, config: str | None = None):
+    """Masked API key for the active (or specified) Maya config; reveal=1 returns the raw key."""
+    key = MAYA.active_api_key(config)
+    if not key:
+        return {"key_set": False, "masked": "", "key": ""}
+    return {"key_set": True, "masked": _mask_secret(key), "key": key if reveal else ""}
+
 def _strata_alias() -> str:
     last = CFG.get("strata_last") or {}
     return str(last.get("model") or CFG.get("strata_alias") or "strata")
@@ -3334,23 +4225,35 @@ def _strata_alias() -> str:
 def _current_llm(prefer: str | None = None):
     """(alias, port, ctx, api_key, source) for whichever llama-server the panel manages is running.
     `prefer` pins the source: None/'auto' keeps the fallback order; a source name answers
-    only that server, so the sync endpoint can say "this tab's server isn't running"."""
+    only that server, so the sync endpoint can say "this tab's server isn't running".
+    Alias and context come from the server itself, falling back to manifest/panel state."""
     want = lambda s: prefer in (None, "auto", s)
+
+    def from_server(fallback_alias, port, pid, fallback_ctx, key, source):
+        alias, ctx = _server_facts(port)
+        return (alias or fallback_alias), port, (ctx or fallback_ctx), key, source
+
     m = MGR.status()
     if want("panel") and m.get("running") and m["port"] != AVALON_PORT:
-        return m.get("alias"), m["port"], _proc_ctx(m["pid"]), "", "panel"
+        return from_server(m.get("alias"), m["port"], m.get("pid"), _proc_ctx(m.get("pid")), "", "panel")
     a = SMGR.status()
     if want("avalon") and a.get("running"):
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(a["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           a.get("pid"), _proc_ctx(a.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     if want("avalon") and m.get("running"):  # discovery adopted the systemd avalon on 8086
-        return (_avalon_target()["base"].lower() or "qwen3.8-flash-next"), AVALON_PORT, _proc_ctx(m["pid"]), CFG.get("avalon_api_key", ""), "avalon"
+        return from_server(_avalon_target()["base"].lower() or "qwen3.8-flash-next", AVALON_PORT,
+                           m.get("pid"), _proc_ctx(m.get("pid")), CFG.get("avalon_api_key", ""), "avalon")
     s = strata_status()
     if want("strata") and s.get("running") and s.get("port"):
         # The key is only forwarded if the operator set strata_api_key deliberately. Strata
         # owns its own key (`strata launch --show-key`); auto-reading it would push a real
         # secret into every synced agent config and into panel state without being asked.
-        return _strata_alias(), s["port"], int(CFG.get("strata_ctx") or 8192), \
-            CFG.get("strata_api_key", ""), "strata"
+        return from_server(_strata_alias(), s["port"], None, int(CFG.get("strata_ctx") or 8192),
+                           CFG.get("strata_api_key", ""), "strata")
+    my = MAYA.status()
+    if want("maya") and my.get("running") and my.get("port"):
+        return (my.get("alias") or my.get("model_name") or "maya"), my["port"], \
+            int(my.get("ctx") or 131072), MAYA.active_api_key(), "maya"
     return None
 
 def _chat_target():
@@ -3366,6 +4269,9 @@ def _chat_target():
     s = strata_status()
     if s.get("running") and s.get("port") and s.get("health") == "ready":
         return s["port"], CFG.get("strata_api_key", "")
+    my = MAYA.status()
+    if my.get("running") and my.get("state") == "ready" and my.get("port"):
+        return my["port"], MAYA.active_api_key()
     return None
 
 def _yaml_merge(path, apply):
@@ -3378,49 +4284,161 @@ def _yaml_merge(path, apply):
     path.write_text(yaml.safe_dump(cfg, sort_keys=False))
     return str(path)
 
+def _jsonc_load(text):
+    """json.loads that survives JSONC (// and /* */ comments, trailing commas) — Zed and
+    opencode both ship comment-bearing settings files, and a plain json.loads turns a
+    perfectly good settings file into a hard "Expecting value: line 1" failure."""
+    out, inner, i, n = [], [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"':
+            j = i + 1
+            while j < n:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == '"':
+                    j += 1
+                    break
+                j += 1
+            out.extend(text[i:j]); inner.extend([True] * (j - i)); i = j
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c); inner.append(False); i += 1
+    chars = []
+    for idx, ch in enumerate(out):
+        if ch == "," and not inner[idx]:
+            k = idx + 1
+            while k < len(out) and out[k] in " \t\r\n":
+                k += 1
+            if k < len(out) and out[k] in "}]":
+                continue  # trailing comma
+        chars.append(ch)
+    return json.loads("".join(chars))
+
 def _json_merge(path, apply):
     path = Path(path)
     cfg = {}
     if path.exists():
-        cfg = json.loads(path.read_text())
+        text = path.read_text()
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError:
+            cfg = _jsonc_load(text)  # raises with a usable message if it really is broken
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a JSON object")
     apply(cfg)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(cfg, indent=2))
     return str(path)
 
+def _yaml_upsert(path, parent, key, value):
+    """Set <parent>.<key> in a YAML file and leave every other byte alone. Round-tripping the
+    whole document through safe_load/safe_dump (the old approach) re-indented and stripped
+    the comments out of files like ~/.hermes/config.yaml on every single sync."""
+    path = Path(path)
+    text = path.read_text() if path.exists() else ""
+    try:
+        root = yaml.compose(text) if text.strip() else None
+    except yaml.YAMLError:
+        raise HTTPException(400, f"{path} is not valid YAML — fix it first")
+
+    def dump_block(val, col):
+        s = yaml.safe_dump(val, sort_keys=False, default_flow_style=False).rstrip("\n")
+        pad = " " * col
+        return "\n".join(pad + ln if ln.strip() else ln for ln in s.splitlines())
+
+    if isinstance(root, yaml.MappingNode):
+        tops = {k.value: v for k, v in root.value if isinstance(k, yaml.ScalarNode)}
+        pval = tops.get(parent)
+        if isinstance(pval, yaml.MappingNode) and not pval.flow_style:
+            pair = next(((kn, vn) for kn, vn in pval.value
+                         if isinstance(kn, yaml.ScalarNode) and kn.value == key), None)
+            if pair:
+                knode, old = pair
+                start, end = old.start_mark.index, old.end_mark.index
+                line_start = text.rfind("\n", 0, start) + 1
+                seg = text[start:end]
+                tail_nl = "\n" if seg.endswith("\n") else ""
+                if text[line_start:start].strip() == "":     # value sits on its own lines
+                    text = text[:line_start] + dump_block(value, start - line_start) + tail_nl + text[end:]
+                else:                                        # inline value after `key: `
+                    col = knode.start_mark.column + 2
+                    text = text[:start] + "\n" + dump_block(value, col) + "\n" + text[end:].lstrip("\n")
+            elif pval.value:
+                col = pval.value[0][0].start_mark.column
+                at = pval.value[-1][1].end_mark.index
+                tail = text[at:]
+                if tail.startswith("\n"):
+                    tail = tail[1:]
+                text = text[:at].rstrip("\n") + "\n" + dump_block({key: value}, col) + "\n" + tail
+            else:
+                root = None  # empty/flow-style parent: fall through to the full rewrite
+        elif parent not in tops:
+            text = (text.rstrip("\n") + "\n" if text.strip() else "") + \
+                f"{parent}:\n" + dump_block({key: value}, 2)
+        else:
+            root = None  # parent is a scalar/flow mapping: full rewrite below
+    else:
+        root = None
+    if root is None:
+        cfg = yaml.safe_load(text) or {}
+        if not isinstance(cfg, dict):
+            raise HTTPException(400, f"{path} is not a YAML mapping — fix it first")
+        sub = cfg.setdefault(parent, {})
+        if not isinstance(sub, dict):
+            raise HTTPException(400, f"{path}: '{parent}' is not a mapping — fix it first")
+        sub[key] = value
+        text = yaml.safe_dump(cfg, sort_keys=False)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text if text.endswith("\n") else text + "\n")
+    return str(path)
+
 def _toml_strip_section(text, headers):
     out, skip = [], False
     for ln in text.splitlines():
-        if ln.startswith("[") and ln.endswith("]"):
-            skip = ln.strip() in headers
+        head = ln.split("#", 1)[0].strip()
+        if head.startswith("[") and head.endswith("]"):
+            skip = head in headers
         if not skip:
             out.append(ln)
     return "\n".join(out).rstrip() + "\n"
 
-def _w_omp(alias, base, ctx):
-    def apply(cfg):
-        prov = {"baseUrl": base + "/v1", "api": "openai-completions", "auth": "none",
-                "models": [{"id": alias, "name": alias, "api": "openai-completions",
-                            "reasoning": False, "input": ["text"],
-                            "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
-                            "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
-        cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = prov
-    return _yaml_merge(HOME / ".omp/agent/models.yml", apply) + " — omp: omp --model inference-console/" + alias
+def _w_omp(alias, base, ctx, key=""):
+    prov = {"baseUrl": base + "/v1", "api": "openai-completions",
+            "auth": "apiKey" if key else "none",
+            "models": [{"id": alias, "name": alias, "api": "openai-completions",
+                        "reasoning": False, "input": ["text"],
+                        "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+                        "contextWindow": max(ctx, 8192), "maxTokens": min(8192, max(ctx, 8192))}]}
+    if key:
+        prov["apiKey"] = key
+    return _yaml_upsert(HOME / ".omp/agent/models.yml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — omp: omp --model inference-console/" + alias
 
-def _w_opencode(alias, base, ctx):
+def _w_opencode(alias, base, ctx, key=""):
     def apply(cfg):
+        opts = {"baseURL": base + "/v1"}
+        if key:
+            opts["apiKey"] = key
         cfg.setdefault("provider", {})[PANEL_PROVIDER_ID] = {
             "npm": "@ai-sdk/openai-compatible",
-            "options": {"baseURL": base + "/v1"},
+            "options": opts,
             "models": {alias: {"name": alias}}}
     return _json_merge(HOME / ".config/opencode/opencode.json", apply) + " — opencode: provider inference-console"
 
-def _w_codex(alias, base, ctx):
+def _w_codex(alias, base, ctx, key=""):
     path = Path(HOME / ".codex/config.toml")
     old = path.read_text() if path.exists() else ""
     old = _toml_strip_section(old, {"[model_providers." + PANEL_PROVIDER_ID + "]", "[profiles." + PANEL_PROVIDER_ID + "]"})
+    key_ln = f"experimental_bearer_token = \"{key}\"\n" if key else ""
     block = (f"\n[model_providers.{PANEL_PROVIDER_ID}]\nname = \"Inference Console\"\n"
-             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n"
+             f"base_url = \"{base}/v1\"\nwire_api = \"chat\"\n{key_ln}"
              f"\n[profiles.{PANEL_PROVIDER_ID}]\nmodel_provider = \"{PANEL_PROVIDER_ID}\"\nmodel = \"{alias}\"\n")
     import tomllib
     merged = old + block
@@ -3429,10 +4447,10 @@ def _w_codex(alias, base, ctx):
     path.write_text(merged)
     return str(path) + " — codex: codex --profile inference-console"
 
-def _w_aider(alias, base, ctx):
+def _w_aider(alias, base, ctx, key=""):
     def apply(cfg):
         cfg["openai-api-base"] = base + "/v1"
-        cfg["openai-api-key"] = "panel"
+        cfg["openai-api-key"] = key or "panel"
         cfg["model"] = "openai/" + alias
     return _yaml_merge(HOME / ".aider.conf.yml", apply) + " — aider: aider (model openai/" + alias + ")"
 
@@ -3440,39 +4458,53 @@ def _w_zed(alias, base, ctx):
     def apply(cfg):
         lm = cfg.setdefault("language_models", {}).setdefault("openai", {})
         lm["api_url"] = base + "/v1"
-        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}]
+        # Merge instead of replacing: available_models is the user's own list of models
+        # behind the openai provider, and wiping it unregisters everything else they had.
+        keep = [m for m in (lm.get("available_models") or []) if (m or {}).get("name") != alias]
+        lm["available_models"] = [{"name": alias, "max_tokens": max(ctx, 8192), "tool_call": True}] + keep
     return _json_merge(HOME / ".config/zed/settings.json", apply) + " — zed: openai provider model " + alias
 
-def _w_continue(alias, base, ctx):
+def _w_continue(alias, base, ctx, key=""):
     def apply(cfg):
         models = [m for m in cfg.get("models", []) if m.get("name") != alias]
         models.append({"name": alias, "provider": "openai", "model": alias,
-                       "apiBase": base + "/v1", "apiKey": "panel", "capabilities": ["tool_use"]})
+                       "apiBase": base + "/v1", "apiKey": key or "panel", "capabilities": ["tool_use"]})
         cfg["models"] = models
     return _yaml_merge(HOME / ".continue/config.yaml", apply) + " — continue: model " + alias
 
 def _w_claude(alias, base, ctx, key):
-    import httpx
+    tok = key or "panel"
     try:
-        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 8,
+        r = httpx.post(base + "/v1/messages", json={"model": alias, "max_tokens": 1,
                        "messages": [{"role": "user", "content": "hi"}]},
                        headers={"anthropic-version": "2023-06-01",
-                                "x-api-key": key or "panel"}, timeout=15)
-        if r.status_code == 404:
-            raise HTTPException(400, "this llama-server has no Anthropic-compat /v1/messages endpoint")
+                                "x-api-key": tok,
+                                "Authorization": f"Bearer {tok}"}, timeout=20)
     except httpx.HTTPError:
         raise HTTPException(400, "server unreachable for /v1/messages probe")
+    if r.status_code == 404:
+        raise HTTPException(400, "this server has no Anthropic-compat /v1/messages endpoint")
+    if r.status_code >= 400:
+        # 401/403 here almost always means a mismatched key; writing the env block anyway
+        # leaves Claude Code pointing at a server that will refuse every request.
+        raise HTTPException(400, f"/v1/messages returned {r.status_code}: {(r.text or '')[:200]}")
     def apply(cfg):
         cfg.setdefault("env", {}).update({
             "ANTHROPIC_BASE_URL": base,
-            "ANTHROPIC_AUTH_TOKEN": key or "panel",
+            "ANTHROPIC_AUTH_TOKEN": tok,
             "ANTHROPIC_MODEL": alias})
     return _json_merge(HOME / ".claude/settings.json", apply) + " — claude-code: env points at " + base
 
 def _w_pi(alias, base, ctx, key):
     path = HOME / ".pi/agent/models.json"
-    cfg = json.loads(path.read_text()) if path.exists() else {
-        "$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}}
+    if path.exists():
+        text = path.read_text()
+        try:
+            cfg = json.loads(text)
+        except json.JSONDecodeError:
+            cfg = _jsonc_load(text)
+    else:
+        cfg = {"$schema": "https://pi.dev/schemas/models.schema.json", "providers": {}}
     cfg.setdefault("providers", {})[PANEL_PROVIDER_ID] = {
         "baseUrl": base + "/v1", "api": "openai-completions", "apiKey": key or "none",
         "models": [{"id": alias, "name": alias, "api": "openai-completions",
@@ -3483,12 +4515,13 @@ def _w_pi(alias, base, ctx, key):
     return str(path) + " — pi: provider inference-console"
 
 def _w_hermes(alias, base, ctx, key):
-    def apply(cfg):
-        prov = cfg.setdefault("providers", {}).setdefault(PANEL_PROVIDER_ID, {})
-        prov.update({"name": "Inference Console", "base_url": base + "/v1",
-                     "default_model": alias, "model": alias,
-                     "models": {alias: {}}, "models_discovered": True})
-    return _yaml_merge(HOME / ".hermes/config.yaml", apply) + " — hermes: pick /model custom:inference-console"
+    prov = {"name": "Inference Console", "base_url": base + "/v1",
+            "default_model": alias, "model": alias,
+            "models": {alias: {}}, "models_discovered": True}
+    if key:
+        prov["api_key"] = key
+    return _yaml_upsert(HOME / ".hermes/config.yaml", "providers", PANEL_PROVIDER_ID, prov) \
+        + " — hermes: pick /model custom:inference-console"
 
 def _w_kimi(alias, base, ctx, key):
     path = HOME / ".kimi-code/config.toml"
@@ -3505,35 +4538,48 @@ def _w_kimi(alias, base, ctx, key):
     return str(path) + " — kimi: model inference-console/" + alias
 
 AGENTS = {
-    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c),        "selector inference-console/<alias>"),
-    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),      "selector inference-console/<alias>"),
-    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c),   "provider inference-console"),
-    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c),      "codex --profile inference-console"),
-    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c),      "openai/<alias>"),
-    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),        "replaces Zed openai available_models"),
-    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c),   "adds model row"),
-    "claude-code": ("Claude Code",        _w_claude,                                 "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
-    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),  "then pick /model custom:inference-console"),
-    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),    "model inference-console/<alias>"),
+    "omp":         ("omp (oh-my-pi)",     lambda a, b, c, k: _w_omp(a, b, c, k),      "selector inference-console/<alias>"),
+    "pi":          ("pi",                 lambda a, b, c, k: _w_pi(a, b, c, k),       "selector inference-console/<alias>"),
+    "opencode":    ("OpenCode",           lambda a, b, c, k: _w_opencode(a, b, c, k), "provider inference-console"),
+    "codex":       ("Codex CLI",          lambda a, b, c, k: _w_codex(a, b, c, k),    "codex --profile inference-console"),
+    "aider":       ("Aider",              lambda a, b, c, k: _w_aider(a, b, c, k),    "openai/<alias>"),
+    "zed":         ("Zed",                lambda a, b, c, k: _w_zed(a, b, c),         "merges into Zed openai available_models"),
+    "continue":    ("Continue",           lambda a, b, c, k: _w_continue(a, b, c, k), "adds model row"),
+    "claude-code": ("Claude Code",        _w_claude,                                  "needs /v1/messages; rewrites ANTHROPIC_BASE_URL"),
+    "hermes":      ("Hermes Agent",       lambda a, b, c, k: _w_hermes(a, b, c, k),   "then pick /model custom:inference-console"),
+    "kimi":        ("Kimi Code",          lambda a, b, c, k: _w_kimi(a, b, c, k),     "model inference-console/<alias>"),
 }
 
 @app.get("/api/agents")
-def api_agents():
+def api_agents(source: str | None = None):
     m = MGR.status()
     a = SMGR.status()
     s = strata_status()
+    my = MAYA.status()
+    sources = {
+        "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
+        "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
+        "strata": bool(s.get("running") and s.get("port")),
+        "maya": bool(my.get("running") and my.get("port")),
+    }
+    targets = {}
+    for src_name, up in sources.items():
+        if not up:
+            targets[src_name] = None
+            continue
+        cur = _current_llm(src_name)
+        targets[src_name] = {"alias": cur[0], "port": cur[1], "ctx": cur[2], "source": cur[4]} if cur else None
+    src = (source or "auto").lower()
+    running = _current_llm(None if src == "auto" else src)
     return {"agents": [{"id": k, "label": v[0], "hint": v[2]} for k, v in AGENTS.items()],
             "registry": _load_agents_state(),
-            "running": _current_llm(),
-            "sources": {
-                "panel": bool(m.get("running") and m["port"] != AVALON_PORT),
-                "avalon": bool(a.get("running") or (m.get("running") and m["port"] == AVALON_PORT)),
-                "strata": bool(s.get("running") and s.get("port")),
-            }}
+            "running": [running[0], running[1], running[2], running[4]] if running else None,
+            "sources": sources,
+            "targets": targets}
 
 class AgentSyncBody(BaseModel):
     agents: list[str]
-    source: str | None = None  # auto | panel | avalon | strata
+    source: str | None = None  # auto | panel | avalon | strata | maya
 
 @app.post("/api/agents/sync")
 def api_agents_sync(b: AgentSyncBody):
@@ -3559,9 +4605,10 @@ def api_agents_sync(b: AgentSyncBody):
             out[aid] = {"ok": False, "detail": str(e.detail)}
         except Exception as e:
             out[aid] = {"ok": False, "detail": f"{type(e).__name__}: {e}"}
-    st.update(alias=alias, port=port, source=source, synced_at=time.time())
-    _save_agents_state(st)
-    return {"results": out, "alias": alias, "port": port}
+    if any(v["ok"] for v in out.values()):
+        st.update(alias=alias, port=port, source=source, synced_at=time.time())
+        _save_agents_state(st)
+    return {"results": out, "alias": alias, "port": port, "source": source}
 
 
 class StartBody(BaseModel):
@@ -3619,6 +4666,12 @@ class SettingsBody(BaseModel):
     strata_bin: str | None = None
     strata_alias: str | None = None
     strata_api_key: str | None = None
+    agent_llm_provider: str | None = None
+    agent_llm_url: str | None = None
+    agent_llm_key: str | None = None
+    agent_llm_model: str | None = None
+    agent_llm_headers: str | None = None
+    agent_llm_fallback_local: bool | None = None
 
 @app.get("/api/settings")
 def api_settings_get():
@@ -3640,6 +4693,8 @@ def api_settings_get():
     masked = (tok[:4] + "…" + tok[-4:]) if len(tok) >= 8 else ("(from $HF_TOKEN)" if env_tok else "")
     skey = CFG.get("strata_api_key", "")
     skey_masked = (skey[:4] + "…" + skey[-4:]) if len(skey) >= 8 else ""
+    akey = CFG.get("agent_llm_key", "")
+    akey_masked = (akey[:4] + "…" + akey[-4:]) if len(akey) >= 8 else ""
     sbin = strata_bin()
     return {
         "model_dirs": CFG.get("model_dirs", []),
@@ -3666,6 +4721,13 @@ def api_settings_get():
         "strata_api_key_set": bool(skey),
         "strata_api_key_masked": skey_masked,
         "strata_ctx": int(CFG.get("strata_ctx", 8192) or 8192),
+        "agent_llm_provider": CFG.get("agent_llm_provider", "custom"),
+        "agent_llm_url": CFG.get("agent_llm_url", ""),
+        "agent_llm_model": CFG.get("agent_llm_model", ""),
+        "agent_llm_headers": CFG.get("agent_llm_headers", ""),
+        "agent_llm_key_set": bool(akey),
+        "agent_llm_key_masked": akey_masked,
+        "agent_llm_fallback_local": bool(CFG.get("agent_llm_fallback_local", True)),
     }
 
 @app.post("/api/settings")
@@ -3706,8 +4768,77 @@ def api_settings_set(b: SettingsBody):
             CFG["strata_api_key"] = ""
         elif val and val != "__keep__":
             CFG["strata_api_key"] = val
+    if b.agent_llm_provider is not None:
+        CFG["agent_llm_provider"] = b.agent_llm_provider.strip() or "custom"
+    if b.agent_llm_url is not None:
+        CFG["agent_llm_url"] = b.agent_llm_url.strip()
+    if b.agent_llm_model is not None:
+        CFG["agent_llm_model"] = b.agent_llm_model.strip()
+    if b.agent_llm_headers is not None:
+        CFG["agent_llm_headers"] = b.agent_llm_headers.strip()
+    if b.agent_llm_key is not None:
+        val = b.agent_llm_key.strip()
+        if val == "clear":
+            CFG["agent_llm_key"] = ""
+        elif val and val != "__keep__":
+            CFG["agent_llm_key"] = val
+    if b.agent_llm_fallback_local is not None:
+        CFG["agent_llm_fallback_local"] = bool(b.agent_llm_fallback_local)
     _save_config_secure()
     return api_settings_get()
+
+# ---------------------------------------------------------------- panel process (restart)
+PANEL_STARTED_AT = time.time()
+
+def _self_argv() -> list:
+    """argv that re-launches this panel exactly as it was invoked, with a resolved
+    interpreter and script/shim path so execv works after a cd or a PATH change."""
+    argv = list(sys.argv) or [str(Path(__file__).resolve())]
+    first = Path(argv[0])
+    if first.exists():
+        argv[0] = str(first.resolve())
+    else:
+        found = shutil.which(argv[0])
+        if found:
+            argv[0] = found
+    return [sys.executable] + argv
+
+def _restart_self(argv: list, delay: float):
+    """Replace this process image in place. Nothing else is forked, so the PID stays the
+    same (systemd keeps tracking it) and the llama-server/Avalon/Strata children, which run
+    in their own sessions, keep serving; the panel re-adopts them from its state files."""
+    time.sleep(delay)
+    print(f"panel: restarting in place: {' '.join(argv)}", flush=True)
+    for f in (sys.stdout, sys.stderr):
+        try:
+            f.flush()
+        except Exception:
+            pass
+    try:
+        os.execv(sys.executable, argv)
+    except OSError as e:
+        # Do not exit: a failed restart must leave the running panel serving.
+        print(f"panel: restart failed, still serving: {e}", flush=True)
+
+class RestartBody(BaseModel):
+    delay_ms: int = 600
+
+@app.get("/api/panel/ping")
+def api_panel_ping():
+    argv = _self_argv()
+    return {"ok": True, "pid": os.getpid(), "port": PORT,
+            "started_at": PANEL_STARTED_AT, "uptime_s": round(time.time() - PANEL_STARTED_AT, 1),
+            "argv": argv, "restartable": Path(argv[0]).exists()}
+
+@app.post("/api/panel/restart")
+def api_panel_restart(b: RestartBody | None = None):
+    argv = _self_argv()
+    if not Path(argv[0]).exists():
+        raise HTTPException(400, f"cannot restart: interpreter not found: {argv[0]}")
+    delay = max(0.0, min(5.0, (b.delay_ms if b else 600) / 1000))
+    _save_sessions()  # keep the tab signed in across the re-exec
+    threading.Thread(target=_restart_self, args=(argv, delay), daemon=True).start()
+    return {"ok": True, "pid": os.getpid(), "argv": argv, "delay_s": delay}
 
 # ---------------------------------------------------------------- engine setup (one-click installs)
 # One background job at a time: download/build runs stream log lines the UI polls.
@@ -3920,12 +5051,404 @@ def api_setup_install(b: SetupInstallBody):
         return _setup_start("Avalon build", _build_avalon)
     raise HTTPException(400, f"unknown engine: {b.engine}")
 
+# ---------------------------------------------------------------- optimization agent api
+from agent_memory import AgentStore
+from optimizer_agent import AGENT_ACTION_TEMPLATES, HostContext, OptimizerAgent, PROVIDER_PRESETS
+from thermal_guard import ThermalGuard
+
+AGENT_STORE = AgentStore(APP_DIR / "agent")
+OPT_AGENT = OptimizerAgent(
+    host=HostContext(
+        cfg=CFG,
+        default_bin=BIN,
+        avalon_bin=AVALON_BIN,
+        avalon_profiles=AVALON_PROFILES,
+        launch_profiles_path=LAUNCH_PROFILES_PATH,
+        vitals=vitals,
+        scan_models=scan_models,
+        estimate_vram=estimate_vram,
+        bin_caps=bin_caps,
+        find_draft=find_draft,
+        save_config=_save_config_secure,
+        mgr=MGR,
+        smgr=SMGR,
+        avalon_target=_avalon_target,
+        strata_bin=strata_bin,
+        strata_status=strata_status,
+        strata_build_args=strata_build_args,
+        strata_run=_strata_run,
+        strata_launch_body_cls=StrataLaunchBody,
+        strata_stop=api_strata_stop,
+        strata_log_path=STRATA_LOG,
+        chat_target=_chat_target,
+        benchmark_run=lambda pk, mt: api_benchmark_run(BenchRunBody(prompt_key=pk, max_tokens=mt)),
+        read_json=_read_json,
+        write_json=_write_json,
+        sync_agents_fn=lambda ags, src: api_agents_sync(AgentSyncBody(agents=ags, source=src)),
+        coding_agents_list=lambda: list(AGENTS.keys()),
+        hf_search_fn=api_hf_search,
+        hf_files_fn=api_hf_files,
+        hf_pull_fn=lambda repo, files, sizes: api_hf_pull(PullBody(repo=repo, files=files, sizes=sizes)),
+        downloads_fn=api_downloads,
+        thermal_status_fn=lambda: THERMAL_GUARD.status(),
+        thermal_eval_fn=lambda: THERMAL_GUARD.evaluate_once(),
+        strata_doctor_fn=api_strata_doctor,
+        maya_mgr=MAYA,
+    ),
+    store=AGENT_STORE,
+)
+
+def _save_thermal_cfg(c: dict):
+    CFG["thermal_guard"] = c
+    _save_config_secure()
+
+THERMAL_GUARD = ThermalGuard(
+    get_config=lambda: CFG.get("thermal_guard") or {},
+    save_config=_save_thermal_cfg,
+    vitals_fn=vitals,
+    downshift_fn=OPT_AGENT.downshift_active_engine,
+    killswitch_fn=OPT_AGENT.emergency_killswitch,
+)
+if (CFG.get("thermal_guard") or {}).get("enabled"):
+    THERMAL_GUARD.start_loop()
+
+class AgentAdviseBody(BaseModel):
+    engine: str = "llama"
+    goal: str = "balanced"
+    model: str = ""
+    profile: str = "flagship"
+    constraints: dict | None = None
+    user_prompt: str = ""
+    use_llm: bool = True
+
+class AgentApplyBody(BaseModel):
+    engine: str = "llama"
+    config: dict
+    launch: bool = True
+    save_preset_name: str = ""
+    goal: str = "balanced"
+    checkpoint_label: str = ""
+
+class AgentTuneStartBody(BaseModel):
+    engine: str = "llama"
+    goal: str = "fastest"
+    model: str = ""
+    profile: str = "flagship"
+    constraints: dict | None = None
+    user_prompt: str = ""
+    max_trials: int = 5
+    max_seconds: int = 240
+    save_preset_name: str = ""
+
+class AgentTuneStopBody(BaseModel):
+    rollback: bool = False
+
+class AgentDiagnoseBody(BaseModel):
+    engine: str = "llama"
+    log_text: str | None = None
+    last_config: dict | None = None
+    use_llm: bool = True
+
+class AgentCheckpointCreateBody(BaseModel):
+    engine: str = "llama"
+    label: str = ""
+    reason: str = "manual"
+
+class AgentCheckpointRestoreBody(BaseModel):
+    relaunch: bool = False
+
+class AgentPresetSaveBody(BaseModel):
+    name: str
+    engine: str = "llama"
+    goal: str = "balanced"
+    config: dict
+    notes: str = ""
+    model_key: str = ""
+
+class AgentDocsBody(BaseModel):
+    engine: str = "llama"
+    query: str = ""
+
+class AgentChatBody(BaseModel):
+    message: str = ""
+    engine: str = "llama"
+    model: str = ""
+    action_id: str = ""
+    params: dict | None = None
+
+@app.get("/api/agent/actions")
+def api_agent_actions():
+    return {"actions": AGENT_ACTION_TEMPLATES}
+
+@app.get("/api/agent/status")
+def api_agent_status():
+    return {
+        "llm": OPT_AGENT.llm_status(),
+        "tune": OPT_AGENT.tune_status(),
+        "checkpoints_count": len(AGENT_STORE.list_checkpoints(limit=50)),
+        "presets_count": len(AGENT_STORE.list_presets()),
+        "memory": AGENT_STORE.memory_summary(limit=10),
+    }
+
+@app.post("/api/agent/advise")
+def api_agent_advise(b: AgentAdviseBody):
+    try:
+        return OPT_AGENT.advise(
+            engine=b.engine, goal=b.goal, model=b.model, profile=b.profile,
+            constraints=b.constraints, user_prompt=b.user_prompt, use_llm=b.use_llm,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/apply")
+def api_agent_apply(b: AgentApplyBody):
+    try:
+        return OPT_AGENT.apply_config(
+            engine=b.engine, config=b.config, launch=b.launch,
+            save_preset_name=b.save_preset_name, goal=b.goal,
+            checkpoint_label=b.checkpoint_label,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/tune/start")
+def api_agent_tune_start(b: AgentTuneStartBody):
+    try:
+        return OPT_AGENT.start_tune(
+            engine=b.engine, goal=b.goal, model=b.model, profile=b.profile,
+            constraints=b.constraints, user_prompt=b.user_prompt,
+            max_trials=b.max_trials, max_seconds=b.max_seconds,
+            save_preset_name=b.save_preset_name,
+        )
+    except RuntimeError as e:
+        raise HTTPException(409, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.get("/api/agent/tune/status")
+def api_agent_tune_status():
+    return OPT_AGENT.tune_status()
+
+@app.post("/api/agent/tune/stop")
+def api_agent_tune_stop(b: AgentTuneStopBody):
+    return OPT_AGENT.stop_tune(rollback=b.rollback)
+
+@app.post("/api/agent/diagnose")
+def api_agent_diagnose(b: AgentDiagnoseBody):
+    return OPT_AGENT.diagnose_failure(
+        engine=b.engine, log_text=b.log_text, last_config=b.last_config, use_llm=b.use_llm,
+    )
+
+@app.post("/api/agent/heal")
+def api_agent_heal(b: AgentDiagnoseBody):
+    return OPT_AGENT.heal_failure(engine=b.engine, last_config=b.last_config)
+
+@app.get("/api/agent/checkpoints")
+def api_agent_checkpoints():
+    return {"checkpoints": AGENT_STORE.list_checkpoints(limit=30)}
+
+@app.post("/api/agent/checkpoints")
+def api_agent_checkpoint_create(b: AgentCheckpointCreateBody):
+    return OPT_AGENT.capture_checkpoint(engine=b.engine, label=b.label, reason=b.reason)
+
+@app.post("/api/agent/checkpoints/{cp_id}/restore")
+def api_agent_checkpoint_restore(cp_id: str, b: AgentCheckpointRestoreBody):
+    try:
+        return OPT_AGENT.restore_checkpoint(cp_id, relaunch=b.relaunch)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+
+@app.delete("/api/agent/checkpoints/{cp_id}")
+def api_agent_checkpoint_delete(cp_id: str):
+    if not AGENT_STORE.delete_checkpoint(cp_id):
+        raise HTTPException(404, "checkpoint not found")
+    return {"ok": True}
+
+@app.get("/api/agent/presets")
+def api_agent_presets(engine: str | None = None):
+    return {"presets": AGENT_STORE.list_presets(engine=engine)}
+
+@app.post("/api/agent/presets")
+def api_agent_preset_save(b: AgentPresetSaveBody):
+    return AGENT_STORE.save_preset(
+        name=b.name, engine=b.engine, goal=b.goal, config=b.config,
+        notes=b.notes, model_key=b.model_key,
+    )
+
+@app.delete("/api/agent/presets/{preset_id}")
+def api_agent_preset_delete(preset_id: str):
+    if not AGENT_STORE.delete_preset(preset_id):
+        raise HTTPException(404, "preset not found or builtin")
+    return {"ok": True}
+
+@app.get("/api/agent/memory")
+def api_agent_memory():
+    return AGENT_STORE.memory_summary(limit=30)
+
+@app.delete("/api/agent/memory")
+def api_agent_memory_clear():
+    AGENT_STORE.clear_memory()
+    return {"ok": True}
+
+@app.post("/api/agent/docs")
+def api_agent_docs(b: AgentDocsBody):
+    return OPT_AGENT.docs.lookup(b.engine, b.query)
+
+@app.post("/api/agent/chat")
+def api_agent_chat(b: AgentChatBody):
+    return OPT_AGENT.chat(
+        message=b.message,
+        engine=b.engine,
+        model=b.model,
+        action_id=b.action_id,
+        params=b.params,
+    )
+
+@app.delete("/api/agent/chat")
+def api_agent_chat_clear():
+    return OPT_AGENT.clear_chat_history()
+
+class AgentThermalConfigBody(BaseModel):
+    enabled: bool | None = None
+    auto_act: bool | None = None
+    warn_temp_c: int | None = None
+    throttle_temp_c: int | None = None
+    kill_temp_c: int | None = None
+    cool_temp_c: int | None = None
+    power_throttle_pct: int | None = None
+    vram_pressure_pct: int | None = None
+
+class AgentThermalActionBody(BaseModel):
+    action: str
+
+class AgentRouteBody(BaseModel):
+    task: str = "coding"
+    apply: bool = False
+    sync_agents: bool = False
+    agents: list[str] | None = None
+
+class AgentSpeculateBody(BaseModel):
+    model: str = ""
+    draft_candidates: list[str] | None = None
+    apply_best: bool = True
+
+class AgentHFRecommendBody(BaseModel):
+    query: str
+    goal: str = "balanced"
+    max_repos: int = 4
+    assume_empty_gpu: bool = True
+
+@app.get("/api/agent/thermal")
+def api_agent_thermal():
+    return THERMAL_GUARD.status()
+
+@app.post("/api/agent/thermal/config")
+def api_agent_thermal_config(b: AgentThermalConfigBody):
+    patch = {k: v for k, v in b.model_dump().items() if v is not None}
+    return {"ok": True, "config": THERMAL_GUARD.update_config(patch), "status": THERMAL_GUARD.status()}
+
+@app.post("/api/agent/thermal/evaluate")
+def api_agent_thermal_evaluate():
+    return THERMAL_GUARD.evaluate_once()
+
+@app.post("/api/agent/thermal/action")
+def api_agent_thermal_action(b: AgentThermalActionBody):
+    return THERMAL_GUARD.run_manual_action(b.action)
+
+@app.post("/api/agent/route")
+def api_agent_route(b: AgentRouteBody):
+    try:
+        return OPT_AGENT.route_workload(
+            task=b.task, apply=b.apply, sync_agents=b.sync_agents, agents=b.agents,
+        )
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/speculate")
+def api_agent_speculate(b: AgentSpeculateBody):
+    try:
+        return OPT_AGENT.tune_speculation(
+            model=b.model, draft_candidates=b.draft_candidates, apply_best=b.apply_best,
+        )
+    except (ValueError, RuntimeError) as e:
+        raise HTTPException(400, str(e))
+
+@app.post("/api/agent/hf/recommend")
+def api_agent_hf_recommend(b: AgentHFRecommendBody):
+    try:
+        return OPT_AGENT.recommend_hf(
+            query=b.query,
+            goal=b.goal,
+            max_repos=b.max_repos,
+            assume_empty_gpu=b.assume_empty_gpu,
+        )
+    except Exception as e:
+        raise HTTPException(502, f"HF recommendation failed: {e}")
+
+class AgentProviderBody(BaseModel):
+    provider: str | None = None
+    url: str | None = None
+    model: str | None = None
+    api_key: str | None = None
+    headers: str | None = None
+    fallback_local: bool | None = None
+
+class AgentProviderModelsBody(BaseModel):
+    provider: str | None = None
+    url: str | None = None
+    api_key: str | None = None
+
+@app.get("/api/agent/provider")
+def api_agent_provider_get():
+    akey = CFG.get("agent_llm_key", "")
+    akey_masked = (akey[:4] + "…" + akey[-4:]) if len(akey) >= 8 else ""
+    return {
+        "presets": PROVIDER_PRESETS,
+        "provider": CFG.get("agent_llm_provider", "custom"),
+        "url": CFG.get("agent_llm_url", ""),
+        "model": CFG.get("agent_llm_model", ""),
+        "headers": CFG.get("agent_llm_headers", ""),
+        "key_set": bool(akey),
+        "key_masked": akey_masked,
+        "fallback_local": bool(CFG.get("agent_llm_fallback_local", True)),
+        "status": OPT_AGENT.llm_status(),
+    }
+
+@app.post("/api/agent/provider")
+def api_agent_provider_set(b: AgentProviderBody):
+    if b.provider is not None:
+        CFG["agent_llm_provider"] = b.provider.strip() or "custom"
+    if b.url is not None:
+        CFG["agent_llm_url"] = b.url.strip()
+    if b.model is not None:
+        CFG["agent_llm_model"] = b.model.strip()
+    if b.headers is not None:
+        CFG["agent_llm_headers"] = b.headers.strip()
+    if b.api_key is not None:
+        val = b.api_key.strip()
+        if val == "clear":
+            CFG["agent_llm_key"] = ""
+        elif val and val != "__keep__":
+            CFG["agent_llm_key"] = val
+    if b.fallback_local is not None:
+        CFG["agent_llm_fallback_local"] = bool(b.fallback_local)
+    _save_config_secure()
+    return api_agent_provider_get()
+
+@app.post("/api/agent/provider/models")
+def api_agent_provider_models(b: AgentProviderModelsBody):
+    return OPT_AGENT.fetch_provider_models(provider=b.provider, url=b.url, api_key=b.api_key)
+
+@app.post("/api/agent/provider/test")
+def api_agent_provider_test():
+    return OPT_AGENT.test_provider()
+
 # ---------------------------------------------------------------- chat api
 @app.post("/api/chat")
 async def api_chat(req: Request):
     tgt = _chat_target()
     if not tgt:
-        raise HTTPException(409, "no model ready — load one in the Models, Strata, or Avalon tab")
+        raise HTTPException(409, "no model ready — load one in the Models, Strata, Avalon, or Maya tab")
     MGR.touch()
     port, key = tgt
     body = await req.json()
@@ -3951,7 +5474,7 @@ def index():
     return HTMLResponse(content=HTML, headers={"Cache-Control": "no-cache, no-store, must-revalidate"})
 
 HTML = r"""<!doctype html>
-<html lang="en" data-theme="dark">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <title>Inference Console · Local Inference Manager</title>
@@ -3962,359 +5485,1078 @@ HTML = r"""<!doctype html>
   try {
     const s = localStorage.getItem('ic.theme');
     const m = document.querySelector('meta[name="color-scheme"]');
-    const t = (s === 'light' || s === 'dark') ? s : (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
-    if (m) m.content = t;
-    document.documentElement.dataset.theme = t;
-  } catch (e) {}
+    if (s === 'light' || s === 'dark') {
+      if (m) m.content = s;
+      document.documentElement.dataset.theme = s;
+    } else {
+      document.documentElement.dataset.theme = matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark';
+    }
+  } catch (e) {
+    document.documentElement.dataset.theme = 'dark';
+  }
 })();
 </script>
-<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%2322d3ee'/><path d='M17.5 5l-8.5 13h5.2l-1.2 9 8.5-13h-5.2z' fill='%2305131a'/></svg>">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Source+Code+Pro:wght@400;500;600;700&family=Wix+Madefor+Display:wght@500;600;700&display=swap" rel="stylesheet">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='8' fill='%23B8C4FF'/><path d='M17.5 5l-8.5 13h5.2l-1.2 9 8.5-13h-5.2z' fill='%231E2C64'/></svg>">
 <style>
+/* ==========================================================================
+   Inference Console — Stitch Design System
+   Slate tonal surfaces · Pastel Periwinkle & Peach accents · Tabular metrics
+   ========================================================================== */
+:root {
+  color-scheme: light dark;
+
+  --font-display: "Wix Madefor Display", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-sans: "Instrument Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", sans-serif;
+  --font-mono: "Source Code Pro", ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --r-sm: 4px;
+  --r: 8px;
+  --r-md: 12px;
+  --r-lg: 16px;
+  --r-full: 9999px;
+  --rail: 240px;
+
+  --dur-state: 100ms;
+  --ease-state: ease-out;
+  --dur-enter: 200ms;
+  --ease-enter: cubic-bezier(0.2, 0, 0, 1);
+  --dur-exit: 140ms;
+  --ease-exit: cubic-bezier(0.3, 0, 1, 1);
+
+  /* Raw Stitch dark tokens */
+  --d-surface: #111318;
+  --d-surface-dim: #111318;
+  --d-surface-bright: #37393F;
+  --d-surface-lowest: #0C0E13;
+  --d-surface-low: #1A1C21;
+  --d-surface-container: #1E2025;
+  --d-surface-high: #282A2F;
+  --d-surface-highest: #33353A;
+  --d-on-surface: #E2E2E9;
+  --d-on-surface-variant: #C6C5D1;
+  --d-outline: #90909B;
+  --d-outline-variant: #454650;
+  --d-primary: #B8C4FF;
+  --d-on-primary: #1E2C64;
+  --d-primary-container: #9BA8E8;
+  --d-on-primary-container: #2E3C74;
+  --d-secondary: #F0BBA2;
+  --d-on-secondary: #492817;
+  --d-secondary-container: #633E2B;
+  --d-on-secondary-container: #DDAA91;
+  --d-tertiary: #E6C367;
+  --d-on-tertiary: #3D2E00;
+  --d-error: #FFB4AB;
+  --d-on-error: #690005;
+  --d-error-container: #93000A;
+  --d-on-error-container: #FFDAD6;
+  --d-success: #86D9B5;
+  --d-on-success: #0B291E;
+  --d-success-container: #163B2D;
+  --d-on-success-container: #BCEFD8;
+  --d-warning: #F3C87B;
+  --d-on-warning: #332204;
+  --d-warning-container: #4A330A;
+  --d-on-warning-container: #FCE4B8;
+
+  /* Raw Stitch light tokens */
+  --l-surface: #F9F9FF;
+  --l-surface-dim: #D9D9E0;
+  --l-surface-bright: #F9F9FF;
+  --l-surface-lowest: #FFFFFF;
+  --l-surface-low: #F3F3FA;
+  --l-surface-container: #EDEDF4;
+  --l-surface-high: #E8E7EF;
+  --l-surface-highest: #E2E2E9;
+  --l-on-surface: #1A1C21;
+  --l-on-surface-variant: #454650;
+  --l-outline: #767681;
+  --l-outline-variant: #C6C5D1;
+  --l-primary: #4E5B95;
+  --l-on-primary: #FFFFFF;
+  --l-primary-container: #9BA8E8;
+  --l-on-primary-container: #2E3C74;
+  --l-secondary: #7D5541;
+  --l-on-secondary: #FFFFFF;
+  --l-secondary-container: #FFC9AF;
+  --l-on-secondary-container: #7A523E;
+  --l-tertiary: #755B02;
+  --l-on-tertiary: #FFFFFF;
+  --l-error: #BA1A1A;
+  --l-on-error: #FFFFFF;
+  --l-error-container: #FFDAD6;
+  --l-on-error-container: #93000A;
+  --l-success: #166847;
+  --l-on-success: #FFFFFF;
+  --l-success-container: #D6F3E5;
+  --l-on-success-container: #0B3D28;
+  --l-warning: #8A5A00;
+  --l-on-warning: #FFFFFF;
+  --l-warning-container: #FDEBC4;
+  --l-on-warning-container: #472E00;
+
+  /* Semantic tokens (dark default + fallbacks) */
+  --surface: var(--d-surface);
+  --surface-dim: var(--d-surface-dim);
+  --surface-bright: var(--d-surface-bright);
+  --surface-lowest: var(--d-surface-lowest);
+  --surface-low: var(--d-surface-low);
+  --surface-container: var(--d-surface-container);
+  --surface-high: var(--d-surface-high);
+  --surface-highest: var(--d-surface-highest);
+  --on-surface: var(--d-on-surface);
+  --on-surface-variant: var(--d-on-surface-variant);
+  --outline: var(--d-outline);
+  --outline-variant: var(--d-outline-variant);
+  --primary: var(--d-primary);
+  --on-primary: var(--d-on-primary);
+  --primary-container: var(--d-primary-container);
+  --on-primary-container: var(--d-on-primary-container);
+  --secondary: var(--d-secondary);
+  --on-secondary: var(--d-on-secondary);
+  --secondary-container: var(--d-secondary-container);
+  --on-secondary-container: var(--d-on-secondary-container);
+  --tertiary: var(--d-tertiary);
+  --on-tertiary: var(--d-on-tertiary);
+  --error: var(--d-error);
+  --on-error: var(--d-on-error);
+  --error-container: var(--d-error-container);
+  --on-error-container: var(--d-on-error-container);
+  --success: var(--d-success);
+  --on-success: var(--d-on-success);
+  --success-container: var(--d-success-container);
+  --on-success-container: var(--d-on-success-container);
+  --warning: var(--d-warning);
+  --on-warning: var(--d-on-warning);
+  --warning-container: var(--d-warning-container);
+  --on-warning-container: var(--d-on-warning-container);
+
+  /* Compatibility aliases for dynamic/inline styles */
+  --bg: var(--surface);
+  --bg-2: var(--surface-lowest);
+  --panel: var(--surface-low);
+  --panel-2: var(--surface-container);
+  --raise: var(--surface-high);
+  --bd: var(--outline-variant);
+  --bd-2: var(--outline-variant);
+  --border: var(--outline-variant);
+  --fg: var(--on-surface);
+  --fg-2: var(--on-surface-variant);
+  --mut: var(--outline);
+  --faint: var(--outline);
+  --acc: var(--primary);
+  --acc-2: var(--secondary);
+  --acc-ink: var(--on-primary);
+  --ok: var(--success);
+  --warn: var(--warning);
+  --err: var(--error);
+  --mono: var(--font-mono);
+
+  scrollbar-color: var(--outline-variant) transparent;
+}
 :root:has(> head > meta[name="color-scheme"][content="dark"]) { color-scheme: dark; }
 :root:has(> head > meta[name="color-scheme"][content="light"]) { color-scheme: light; }
-:root {
-  --bg:#090b10; --bg-2:#0d1118; --panel:#11161f; --panel-2:#151c27; --raise:#1a2230;
-  --bd:#1f2837; --bd-2:#2a3548;
-  --fg:#edf2f8; --fg-2:#c0cad8; --mut:#8493a8; --faint:#59667a;
-  --acc:#22d3ee; --acc-2:#f59e0b; --acc-ink:#04131a;
-  --ok:#34d399; --warn:#f59e0b; --err:#f87171;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(34,211,238,.09) 0%,rgba(245,158,11,.04) 44%,rgba(0,0,0,0) 70%);
-  --grad:linear-gradient(135deg,#22d3ee,#06b6d4);
-  --sh:0 2px 6px rgba(0,0,0,.28);
-  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
-  --r:12px;
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --surface: var(--l-surface);
+    --surface-dim: var(--l-surface-dim);
+    --surface-bright: var(--l-surface-bright);
+    --surface-lowest: var(--l-surface-lowest);
+    --surface-low: var(--l-surface-low);
+    --surface-container: var(--l-surface-container);
+    --surface-high: var(--l-surface-high);
+    --surface-highest: var(--l-surface-highest);
+    --on-surface: var(--l-on-surface);
+    --on-surface-variant: var(--l-on-surface-variant);
+    --outline: var(--l-outline);
+    --outline-variant: var(--l-outline-variant);
+    --primary: var(--l-primary);
+    --on-primary: var(--l-on-primary);
+    --primary-container: var(--l-primary-container);
+    --on-primary-container: var(--l-on-primary-container);
+    --secondary: var(--l-secondary);
+    --on-secondary: var(--l-on-secondary);
+    --secondary-container: var(--l-secondary-container);
+    --on-secondary-container: var(--l-on-secondary-container);
+    --tertiary: var(--l-tertiary);
+    --on-tertiary: var(--l-on-tertiary);
+    --error: var(--l-error);
+    --on-error: var(--l-on-error);
+    --error-container: var(--l-error-container);
+    --on-error-container: var(--l-on-error-container);
+    --success: var(--l-success);
+    --on-success: var(--l-on-success);
+    --success-container: var(--l-success-container);
+    --on-success-container: var(--l-on-success-container);
+    --warning: var(--l-warning);
+    --on-warning: var(--l-on-warning);
+    --warning-container: var(--l-warning-container);
+    --on-warning-container: var(--l-on-warning-container);
+  }
 }
-[data-theme=light] {
-  --bg:#f4f6fa; --bg-2:#eaeff5; --panel:#ffffff; --panel-2:#f9fbfd; --raise:#edf2f8;
-  --bd:#d9e1ec; --bd-2:#c2cedd;
-  --fg:#0f1724; --fg-2:#334155; --mut:#5b6b82; --faint:#8594a8;
-  --acc:#0284c7; --acc-2:#d97706; --acc-ink:#ffffff;
-  --ok:#059669; --warn:#b45309; --err:#dc2626;
-  --glow:radial-gradient(1000px 460px at 84% -10%,rgba(2,132,199,.08) 0%,rgba(0,0,0,0) 68%);
-  --sh:0 2px 6px rgba(15,23,36,.07);
+[data-theme="light"] {
+  --surface: var(--l-surface);
+  --surface-dim: var(--l-surface-dim);
+  --surface-bright: var(--l-surface-bright);
+  --surface-lowest: var(--l-surface-lowest);
+  --surface-low: var(--l-surface-low);
+  --surface-container: var(--l-surface-container);
+  --surface-high: var(--l-surface-high);
+  --surface-highest: var(--l-surface-highest);
+  --on-surface: var(--l-on-surface);
+  --on-surface-variant: var(--l-on-surface-variant);
+  --outline: var(--l-outline);
+  --outline-variant: var(--l-outline-variant);
+  --primary: var(--l-primary);
+  --on-primary: var(--l-on-primary);
+  --primary-container: var(--l-primary-container);
+  --on-primary-container: var(--l-on-primary-container);
+  --secondary: var(--l-secondary);
+  --on-secondary: var(--l-on-secondary);
+  --secondary-container: var(--l-secondary-container);
+  --on-secondary-container: var(--l-on-secondary-container);
+  --tertiary: var(--l-tertiary);
+  --on-tertiary: var(--l-on-tertiary);
+  --error: var(--l-error);
+  --on-error: var(--l-on-error);
+  --error-container: var(--l-error-container);
+  --on-error-container: var(--l-on-error-container);
+  --success: var(--l-success);
+  --on-success: var(--l-on-success);
+  --success-container: var(--l-success-container);
+  --on-success-container: var(--l-on-success-container);
+  --warning: var(--l-warning);
+  --on-warning: var(--l-on-warning);
+  --warning-container: var(--l-warning-container);
+  --on-warning-container: var(--l-on-warning-container);
 }
-*,*::before,*::after{box-sizing:border-box}
-html{-webkit-text-size-adjust:100%}
-body{margin:0;min-height:100vh;background-color:var(--bg);
-  background-image:var(--glow),radial-gradient(color-mix(in srgb,var(--bd-2) 45%,transparent) 1px,transparent 1px);
-  background-size:100% 100%,24px 24px;background-repeat:no-repeat,repeat;color:var(--fg);
-  font:13.5px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,"Noto Sans",sans-serif;
-  -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
-::selection{background:color-mix(in srgb,var(--acc) 26%,transparent);color:var(--fg)}
-input,textarea{caret-color:var(--acc)}
-h1,h2,h3{margin:0;letter-spacing:-.015em}
-a{color:var(--acc);text-decoration:none}
-a:hover{text-decoration:underline}
-code,pre,.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
-.num{font-variant-numeric:tabular-nums}
-.skip{position:absolute;left:-1px;top:-44px;background:var(--acc);color:var(--acc-ink);padding:8px 12px;border-radius:8px;z-index:99;font-weight:600}
-.skip:focus{top:8px;left:8px}
-:focus-visible{outline:2px solid var(--acc);outline-offset:2px;border-radius:6px}
-::-webkit-scrollbar{width:9px;height:9px}
-::-webkit-scrollbar-thumb{background:var(--bd-2);border-radius:99px;border:2px solid transparent;background-clip:content-box}
-::-webkit-scrollbar-track{background:transparent}
-
-/* ---------- header ---------- */
-header{position:sticky;top:0;z-index:40;display:flex;align-items:center;gap:10px;padding:8px 16px;
-  background:color-mix(in srgb,var(--bg) 86%,transparent);
-  backdrop-filter:blur(14px) saturate(150%);-webkit-backdrop-filter:blur(14px) saturate(150%);
-  border-bottom:1px solid var(--bd)}
-.brand{display:flex;align-items:center;gap:10px;flex-shrink:0}
-.mark{width:30px;height:30px;border-radius:8px;background:var(--grad);display:grid;place-items:center;
-  color:var(--acc-ink);box-shadow:0 1px 3px rgba(0,0,0,.35)}
-.mark svg{width:16px;height:16px}
-.brand .nm{font-size:14.5px;font-weight:700;line-height:1.15;letter-spacing:-.02em}
-.brand .sub{display:block;font-size:11px;font-weight:500;color:var(--mut);font-family:var(--mono)}
-.nav{display:flex;gap:2px;padding:3px;background:var(--panel);border:1px solid var(--bd);border-radius:10px;
-  overflow-x:auto;scrollbar-width:none;min-width:0}
-.nav::-webkit-scrollbar{display:none}
-.nav button{display:flex;align-items:center;gap:6px;padding:6px 10px;border:0;border-radius:7px;background:transparent;
-  color:var(--mut);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;transition:background .14s,color .14s}
-.nav button svg{width:14px;height:14px;opacity:.82;flex-shrink:0}
-.nav button:hover{color:var(--fg);background:var(--raise)}
-.nav button.on{color:var(--fg);background:var(--raise);box-shadow:inset 0 0 0 1px var(--bd-2)}
-.nav button.on svg{color:var(--acc);opacity:1}
-.hgap{flex:1;min-width:4px}
-.tele-strip{display:flex;align-items:center;gap:6px;flex-wrap: nowrap;overflow:hidden}
-.pill{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;border:1px solid var(--bd-2);
-  background:var(--panel);color:var(--fg-2);font-size:12px;font-weight:600;white-space:nowrap;max-width:34vw;overflow:hidden;
-  font-variant-numeric:tabular-nums}
-.pill.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 36%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
-.pill.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 36%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
-.pill .dot{width:7px;height:7px;border-radius:99px;background:currentColor;flex-shrink:0}
-.icon{display:grid;place-items:center;width:32px;height:32px;border-radius:8px;border:1px solid var(--bd);
-  background:var(--panel);color:var(--mut);cursor:pointer;flex-shrink:0;transition:background .14s,color .14s,border-color .14s}
-.icon:hover{color:var(--fg);border-color:var(--bd-2);background:var(--raise)}
-.icon svg{width:15px;height:15px}
-.cmdbtn{display:inline-flex;align-items:center;gap:6px;padding:5px 9px;border-radius:8px;border:1px solid var(--bd);
-  background:var(--panel);color:var(--mut);font:inherit;font-size:12px;font-weight:600;cursor:pointer;transition:.14s;flex-shrink:0}
-.cmdbtn:hover{color:var(--fg);border-color:var(--bd-2);background:var(--raise)}
-.cmdbtn svg{width:13px;height:13px}
-
-/* ---------- layout ---------- */
-main{padding:16px 16px 44px;max-width:1320px;margin:0 auto}
-section{animation:fade .18s ease-out}
-@keyframes fade{from{opacity:0;transform:translateY(3px)}to{opacity:1;transform:none}}
-.hide{display:none !important}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:12px}
-.grid4{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px}
-.card{background:linear-gradient(180deg,var(--panel-2),var(--panel));border:1px solid var(--bd);border-radius:var(--r);
-  padding:14px 16px;margin-bottom:14px;box-shadow:var(--sh)}
-.card.sub{background:var(--bg-2);box-shadow:none;padding:12px 14px;margin-bottom:10px}
-.hd{display:flex;align-items:center;gap:10px;justify-content:space-between;flex-wrap:wrap;margin:-2px 0 12px}
-.hd h2{font-size:14px;font-weight:650;display:flex;align-items:center;gap:8px}
-.hd .meta{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
-.two{display:flex;gap:14px;align-items:flex-start;flex-wrap:wrap}
-.two>.side{width:270px;flex:0 0 270px}
-.two>.main{flex:1;min-width:300px}
-.hint{color:var(--mut);font-size:12px}
-.sep{height:1px;background:var(--bd);margin:12px 0}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(175px,1fr));gap:10px}
-.field{display:flex;flex-direction:column;gap:4px}
-.field label{font-size:11.5px;font-weight:600;color:var(--fg-2);display:flex;justify-content:space-between;align-items:center}
-.field label span{color:var(--mut);font-weight:500;font-family:var(--mono)}
-
-/* ---------- controls ---------- */
-.btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:7px 12px;border-radius:8px;border:1px solid var(--bd-2);
-  background:var(--raise);color:var(--fg-2);font:inherit;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap;
-  transition:transform .1s,background .14s,border-color .14s,color .14s,opacity .14s}
-.btn svg{width:14px;height:14px;flex-shrink:0}
-.btn:hover{background:var(--panel-2);border-color:var(--mut);color:var(--fg)}
-.btn:active{transform:translateY(1px)}
-.btn.primary{background:var(--grad);border:1px solid transparent;color:var(--acc-ink);box-shadow:0 2px 6px rgba(0,0,0,.28)}
-.btn.primary:hover{filter:brightness(1.07);color:var(--acc-ink)}
-.btn.acc2{background:color-mix(in srgb,var(--acc-2) 15%,transparent);border-color:color-mix(in srgb,var(--acc-2) 42%,transparent);color:var(--acc-2)}
-.btn.acc2:hover{background:color-mix(in srgb,var(--acc-2) 24%,transparent)}
-.btn.danger{background:color-mix(in srgb,var(--err) 13%,transparent);border-color:color-mix(in srgb,var(--err) 38%,transparent);color:var(--err)}
-.btn.danger:hover{background:color-mix(in srgb,var(--err) 22%,transparent);color:var(--err)}
-.btn.sm{padding:5px 9px;font-size:12px;border-radius:7px}
-.btn.xs{padding:3px 7px;font-size:11.5px;border-radius:6px}
-.btn[disabled]{opacity:.42;cursor:not-allowed;transform:none;pointer-events:none}
-select,input[type=text],input[type=password],input[type=search],input[type=number],textarea{
-  background:var(--bg-2);border:1px solid var(--bd-2);color:var(--fg);border-radius:8px;padding:6px 10px;
-  font:inherit;font-size:12.5px;transition:border-color .14s}
-select:focus,input:focus,textarea:focus{border-color:var(--acc);outline:2px solid var(--acc);outline-offset:1px}
-input[type=checkbox],input[type=radio]{accent-color:var(--acc);width:15px;height:15px;cursor:pointer}
-input[type=range]{accent-color:var(--acc);width:100%;cursor:pointer}
-.toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
-.search{position:relative;flex:1;min-width:190px}
-.search svg{position:absolute;left:9px;top:50%;transform:translateY(-50%);width:14px;height:14px;color:var(--faint);pointer-events:none}
-.search input{width:100%;padding-left:30px}
-.segs{display:flex;gap:2px;padding:3px;background:var(--bg-2);border:1px solid var(--bd);border-radius:9px;flex-wrap:wrap}
-.segs button{border:0;background:transparent;color:var(--mut);font:inherit;font-size:12px;font-weight:600;
-  padding:4px 9px;border-radius:6px;cursor:pointer;transition:.14s;white-space:nowrap}
-.segs button:hover{color:var(--fg)}
-.segs button.on{background:var(--raise);color:var(--fg);box-shadow:inset 0 0 0 1px var(--bd-2)}
-.switch{display:inline-flex;align-items:center;gap:7px;cursor:pointer;user-select:none}
-.switch input{position:absolute;opacity:0;pointer-events:none}
-.switch .track{width:36px;height:20px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd-2);position:relative;transition:.16s;flex-shrink:0}
-.switch .track::after{content:"";position:absolute;top:2px;left:2px;width:14px;height:14px;border-radius:99px;background:var(--mut);transition:.16s}
-.switch input:checked+.track{background:color-mix(in srgb,var(--acc) 26%,transparent);border-color:var(--acc)}
-.switch input:checked+.track::after{transform:translateX(16px);background:var(--acc)}
-.switch input:focus-visible+.track{outline:2px solid var(--acc);outline-offset:2px}
-input[type="checkbox"][switch]{accent-color:var(--ok);margin:0;width:auto;height:auto;cursor:pointer;vertical-align:middle}
-input[type="checkbox"][switch]:focus:not(:focus-visible){outline:none}
-input[type="checkbox"][switch]:focus-visible{outline:3px solid var(--acc);outline-offset:3px}
-html.no-native-switch input[type="checkbox"][switch]{
-  appearance:none;-webkit-appearance:none;
-  width:34px;height:18px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd-2);
-  position:relative;flex-shrink:0;transition:background .16s,border-color .16s}
-html.no-native-switch input[type="checkbox"][switch]::after{
-  content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;
-  background:var(--mut);transition:transform .16s,background .16s}
-html.no-native-switch input[type="checkbox"][switch]:checked{
-  background:color-mix(in srgb,var(--ok) 26%,transparent);border-color:var(--ok)}
-html.no-native-switch input[type="checkbox"][switch]:checked::after{
-  transform:translateX(16px);background:var(--ok)}
-html.no-native-switch input[type="checkbox"][switch]:disabled{opacity:.5;cursor:not-allowed}
-.host-toggle{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;
-  border:1px solid var(--bd-2);background:var(--panel);color:var(--mut);font-size:11.5px;font-weight:600;
-  cursor:pointer;white-space:nowrap;user-select:none;flex-shrink:0;font-family:var(--mono);
-  transition:border-color .14s,background .14s,color .14s}
-.host-toggle:hover{border-color:var(--mut);color:var(--fg)}
-.host-toggle.on{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent);
-  background:color-mix(in srgb,var(--ok) 11%,transparent)}
-
-/* ---------- tags / stats / meters ---------- */
-.tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;border:1px solid var(--bd-2);
-  background:color-mix(in srgb,var(--fg) 4%,transparent);color:var(--fg-2);font-size:11px;font-weight:600;white-space:nowrap;
-  font-variant-numeric:tabular-nums}
-.tag.acc{color:var(--acc);border-color:color-mix(in srgb,var(--acc) 35%,transparent);background:color-mix(in srgb,var(--acc) 10%,transparent)}
-.tag.ok{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 35%,transparent);background:color-mix(in srgb,var(--ok) 10%,transparent)}
-.tag.warn{color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent);background:color-mix(in srgb,var(--warn) 10%,transparent)}
-.tag.err{color:var(--err);border-color:color-mix(in srgb,var(--err) 35%,transparent);background:color-mix(in srgb,var(--err) 10%,transparent)}
-.tag.mut{color:var(--mut)}
-.kvs{display:flex;gap:6px;flex-wrap:wrap;align-items:center}
-.stat{font-size:24px;font-weight:700;letter-spacing:-.03em;font-variant-numeric:tabular-nums;line-height:1.15}
-.stat small{font-size:12px;font-weight:500;color:var(--mut);letter-spacing:0}
-.meter{height:7px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd);overflow:hidden;margin:6px 0 2px;display:flex}
-.meter i{display:block;height:100%;background:var(--grad);transition:opacity .2s}
-.meter i.kv{background:var(--acc-2)}
-.meter i.cmp{background:var(--ok)}
-.meter.warn i{background:linear-gradient(90deg,var(--warn),#fb923c)}
-.meter.err i{background:linear-gradient(90deg,var(--err),#f43f5e)}
-.spark{width:100%;height:26px;display:block;margin-top:6px;opacity:.85}
-
-/* ---------- model list ---------- */
-.mlist{display:flex;flex-direction:column;gap:8px}
-.mrow{display:grid;grid-template-columns:auto minmax(0,1fr) minmax(170px,225px) auto;gap:12px;align-items:center;padding:11px 13px;
-  border:1px solid var(--bd);border-radius:11px;background:var(--panel);transition:border-color .14s,background .14s}
-.mrow:hover{border-color:var(--bd-2);background:var(--panel-2)}
-.mrow.run{border-color:var(--acc);background:color-mix(in srgb,var(--acc) 5%,var(--panel))}
-.pinbtn{background:transparent;border:0;color:var(--faint);cursor:pointer;padding:4px;border-radius:6px;display:grid;place-items:center;transition:.14s}
-.pinbtn:hover{color:var(--acc-2);background:var(--raise)}
-.pinbtn.on{color:var(--acc-2)}
-.pinbtn svg{width:15px;height:15px}
-.mrow .nm{font-weight:650;font-size:13.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:flex;align-items:center;gap:6px}
-.mrow .pth{color:var(--faint);font-size:11px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-top:1px}
-.mrow .tags{display:flex;gap:5px;flex-wrap:wrap;margin-top:6px}
-.fitbox{display:flex;flex-direction:column;gap:2px;font-size:11px;font-variant-numeric:tabular-nums}
-.fitbox .fit-top{display:flex;justify-content:space-between;gap:6px;color:var(--fg-2);font-weight:600}
-.fitbox .fit-sub{color:var(--mut);font-size:10.5px}
-.mrow .acts{display:flex;gap:6px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
-.shardlist{display:grid;gap:2px;margin:-4px 0 6px;padding:6px 10px;border:1px solid var(--border);border-radius:8px;background:var(--surface)}
-.shardlist .shrow{display:flex;justify-content:space-between;gap:10px;padding:2px 4px;border-radius:5px;cursor:copy}
-.shardlist .shrow:hover{background:var(--border)}
-.shardlist .shrow code{font-size:10.5px;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.shardlist .shrow .hint{flex:none}
-.empty{text-align:center;color:var(--mut);padding:26px 12px;border:1px dashed var(--bd-2);border-radius:11px}
-.empty b{display:block;color:var(--fg-2);font-size:13.5px;margin-bottom:4px}
-
-/* ---------- logs & cmd preview ---------- */
-.cmdbox{font-family:var(--mono);font-size:11.5px;line-height:1.5;color:var(--fg-2);background:var(--bg);
-  border:1px solid var(--bd);border-radius:9px;padding:8px 11px;overflow-x:auto;white-space:pre-wrap;word-break:break-all}
-.logbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
-.log{font-family:var(--mono);font-size:11.5px;line-height:1.55;color:var(--fg-2);background:var(--bg);
-  border:1px solid var(--bd);border-radius:10px;padding:10px 12px;max-height:400px;overflow:auto;
-  white-space:pre-wrap;word-break:break-word;margin:0}
-.log.wrapoff{white-space:pre}
-.log .e{color:var(--err)}
-.log .w{color:var(--warn)}
-.log .g{color:var(--faint)}
-
-/* ---------- table ---------- */
-.tbl-wrap{overflow-x:auto;border:1px solid var(--bd);border-radius:10px}
-table.tbl{width:100%;border-collapse:collapse;font-size:12px;font-variant-numeric:tabular-nums}
-table.tbl th,table.tbl td{padding:8px 10px;text-align:left;border-bottom:1px solid var(--bd)}
-table.tbl th{background:var(--bg-2);color:var(--mut);font-weight:600;font-size:11px;white-space:nowrap}
-table.tbl tr:last-child td{border-bottom:0}
-table.tbl tr:hover td{background:color-mix(in srgb,var(--raise) 50%,transparent)}
-
-/* ---------- chat ---------- */
-.thread{display:flex;flex-direction:column;gap:10px;padding:2px;min-height:38vh;max-height:58vh;overflow-y:auto}
-.msg{max-width:min(88%,800px);padding:10px 13px;border-radius:12px;border:1px solid var(--bd);
-  background:var(--panel-2);line-height:1.6;overflow-wrap:break-word;position:relative}
-.msg.u{align-self:flex-end;background:linear-gradient(180deg,color-mix(in srgb,var(--acc) 16%,var(--panel)),var(--panel));
-  border-color:color-mix(in srgb,var(--acc) 34%,transparent)}
-.msg.a{align-self:flex-start}
-.msg .who{font-size:11px;font-weight:650;color:var(--mut);margin-bottom:4px;display:flex;align-items:center;justify-content:space-between;gap:8px}
-.msg .codewrap{margin:8px 0;border:1px solid var(--bd);border-radius:9px;overflow:hidden;background:var(--bg)}
-.msg .codebar{display:flex;align-items:center;justify-content:space-between;padding:4px 10px;background:var(--bg-2);
-  border-bottom:1px solid var(--bd);font-family:var(--mono);font-size:11px;color:var(--mut)}
-.msg pre{margin:0;padding:10px 12px;overflow:auto;font-size:12px;line-height:1.55;background:transparent;border:0}
-.msg code{font-size:12px;background:color-mix(in srgb,var(--bg-2) 80%,transparent);padding:1px 5px;border-radius:5px;border:1px solid var(--bd)}
-.msg pre code{background:none;border:0;padding:0}
-.msg .md-h{font-weight:700;margin:8px 0 3px}
-.msg ul,.msg ol{margin:6px 0;padding-left:20px}
-.msg details{margin-bottom:8px;border:1px solid var(--bd);border-radius:8px;padding:6px 10px;background:var(--bg-2);color:var(--mut);font-size:12px}
-.msg summary{cursor:pointer;font-weight:600;color:var(--fg-2);font-size:11.5px}
-.msg details[open] summary{margin-bottom:5px}
-.msg .think{white-space:pre-wrap;font-family:var(--mono);font-size:11.5px}
-.msg .bar{display:flex;gap:5px;justify-content:flex-end;margin-top:6px;opacity:.75;transition:opacity .14s}
-.msg:hover .bar,.msg:focus-within .bar{opacity:1}
-.typing{color:var(--mut);font-size:12px;font-family:var(--mono)}
-.composer{display:flex;gap:8px;align-items:flex-end;border:1px solid var(--bd-2);border-radius:11px;padding:7px 8px 7px 11px;
-  background:var(--bg-2);margin-top:10px;transition:border-color .14s}
-.composer:focus-within{border-color:var(--acc);outline:2px solid var(--acc);outline-offset:1px}
-.composer textarea{flex:1;border:0;background:transparent;color:var(--fg);resize:none;min-height:24px;max-height:220px;
-  padding:4px 0;font-size:13.5px;line-height:1.5}
-.composer textarea:focus{outline:0;box-shadow:none}
-.clist{display:flex;flex-direction:column;gap:4px;max-height:52vh;overflow-y:auto}
-.citem{display:flex;align-items:center;gap:6px;padding:7px 8px;border-radius:8px;border:1px solid transparent;
-  cursor:pointer;transition:.14s}
-.citem:hover{background:var(--raise);border-color:var(--bd)}
-.citem.on{background:var(--raise);border-color:var(--bd-2)}
-.citem .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12.5px;font-weight:500}
-.citem .s{font-size:11px;color:var(--faint);white-space:nowrap;font-variant-numeric:tabular-nums}
-
-/* ---------- hf / downloads ---------- */
-.frow{display:flex;align-items:center;gap:10px;padding:7px 9px;border-radius:8px;cursor:pointer;border:1px solid transparent}
-.frow:hover{background:var(--raise);border-color:var(--bd)}
-.frow .p{flex:1;min-width:0;font-family:var(--mono);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.dl{padding:9px 0;border-bottom:1px solid var(--bd)}
-.dl:last-child{border-bottom:0}
-
-/* ---------- native dialog & command palette ---------- */
-dialog{border:1px solid var(--bd-2);border-radius:14px;background:linear-gradient(180deg,var(--panel-2),var(--panel));
-  color:var(--fg);padding:0;max-width:min(760px,95vw);width:100%;max-height:88vh;
-  box-shadow:0 4px 10px rgba(0,0,0,.45)}
-dialog:modal{overscroll-behavior:contain;display:flex;flex-direction:column}
-dialog:not([open]){display:none}
-dialog::backdrop{background:rgba(4,7,12,.68);backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);
-  overflow:hidden;overscroll-behavior:contain}
-.dlg-hd{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 16px;border-bottom:1px solid var(--bd)}
-.dlg-hd h2{font-size:14.5px;font-weight:650}
-.dlg-bd{padding:14px 16px;overflow-y:auto;min-height:0;flex:1}
-.dlg-ft{display:flex;gap:8px;justify-content:flex-end;align-items:center;padding:11px 16px;border-top:1px solid var(--bd);flex-wrap:wrap;background:var(--bg-2);border-radius:0 0 14px 14px}
-.pal-list{display:flex;flex-direction:column;gap:3px;max-height:52vh;overflow-y:auto;margin-top:8px}
-.pal-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:8px;
-  border:1px solid transparent;background:transparent;color:var(--fg);cursor:pointer;text-align:left;font:inherit;width:100%}
-.pal-item:hover,.pal-item.sel{background:var(--raise);border-color:var(--bd-2)}
-.pal-item .pi-main{display:flex;align-items:center;gap:8px;min-width:0;font-weight:600;font-size:13px}
-.pal-item .pi-sub{font-size:11.5px;color:var(--mut);font-family:var(--mono);white-space:nowrap}
-
-/* ---------- toasts ---------- */
-.toasts{position:fixed;right:16px;bottom:16px;display:flex;flex-direction:column;gap:8px;z-index:95;max-width:min(430px,92vw)}
-.toast{display:flex;gap:9px;align-items:flex-start;padding:10px 12px;border-radius:10px;border:1px solid var(--bd-2);
-  background:var(--panel-2);box-shadow:0 6px 14px rgba(0,0,0,.4);cursor:pointer;font-size:12.5px;
-  animation:tin .18s cubic-bezier(.2,.8,.2,1)}
-.toast.out{animation:tout .16s forwards}
-.toast .ti{width:8px;height:8px;border-radius:99px;background:var(--acc);margin-top:5px;flex-shrink:0}
-.toast.ok .ti{background:var(--ok)}.toast.err{border-color:color-mix(in srgb,var(--err) 42%,transparent)}
-.toast.err .ti{background:var(--err)}.toast.warn .ti{background:var(--warn)}
-@keyframes tin{from{opacity:0;transform:translateY(8px) scale(.98)}to{opacity:1;transform:none}}
-@keyframes tout{to{opacity:0;transform:translateY(5px)}}
-
-/* ---------- footer ---------- */
-footer{max-width:1320px;margin:0 auto;padding:0 16px 26px;color:var(--faint);font-size:11.5px;
-  display:flex;gap:14px;flex-wrap:wrap;align-items:center}
-kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border-radius:5px;
-  padding:1px 5px;background:var(--bg-2);color:var(--fg-2)}
-
-@media (max-width:960px){
-  header{flex-wrap:wrap;gap:8px}
-  .brand .sub{display:none}
-  .nav{order:3;width:100%}
-  .two>.side{width:100%;flex:1 1 100%}
-  .mrow{grid-template-columns:auto 1fr}
-  .mrow .fitbox{grid-column:1 / -1}
-  .mrow .acts{grid-column:1 / -1;justify-content:flex-start}
-  .thread{max-height:none}
+@supports (color: light-dark(white, black)) {
+  :root {
+    --surface: light-dark(var(--l-surface), var(--d-surface));
+    --surface-dim: light-dark(var(--l-surface-dim), var(--d-surface-dim));
+    --surface-bright: light-dark(var(--l-surface-bright), var(--d-surface-bright));
+    --surface-lowest: light-dark(var(--l-surface-lowest), var(--d-surface-lowest));
+    --surface-low: light-dark(var(--l-surface-low), var(--d-surface-low));
+    --surface-container: light-dark(var(--l-surface-container), var(--d-surface-container));
+    --surface-high: light-dark(var(--l-surface-high), var(--d-surface-high));
+    --surface-highest: light-dark(var(--l-surface-highest), var(--d-surface-highest));
+    --on-surface: light-dark(var(--l-on-surface), var(--d-on-surface));
+    --on-surface-variant: light-dark(var(--l-on-surface-variant), var(--d-on-surface-variant));
+    --outline: light-dark(var(--l-outline), var(--d-outline));
+    --outline-variant: light-dark(var(--l-outline-variant), var(--d-outline-variant));
+    --primary: light-dark(var(--l-primary), var(--d-primary));
+    --on-primary: light-dark(var(--l-on-primary), var(--d-on-primary));
+    --primary-container: light-dark(var(--l-primary-container), var(--d-primary-container));
+    --on-primary-container: light-dark(var(--l-on-primary-container), var(--d-on-primary-container));
+    --secondary: light-dark(var(--l-secondary), var(--d-secondary));
+    --on-secondary: light-dark(var(--l-on-secondary), var(--d-on-secondary));
+    --secondary-container: light-dark(var(--l-secondary-container), var(--d-secondary-container));
+    --on-secondary-container: light-dark(var(--l-on-secondary-container), var(--d-on-secondary-container));
+    --tertiary: light-dark(var(--l-tertiary), var(--d-tertiary));
+    --on-tertiary: light-dark(var(--l-on-tertiary), var(--d-on-tertiary));
+    --error: light-dark(var(--l-error), var(--d-error));
+    --on-error: light-dark(var(--l-on-error), var(--d-on-error));
+    --error-container: light-dark(var(--l-error-container), var(--d-error-container));
+    --on-error-container: light-dark(var(--l-on-error-container), var(--d-on-error-container));
+    --success: light-dark(var(--l-success), var(--d-success));
+    --on-success: light-dark(var(--l-on-success), var(--d-on-success));
+    --success-container: light-dark(var(--l-success-container), var(--d-success-container));
+    --on-success-container: light-dark(var(--l-on-success-container), var(--d-on-success-container));
+    --warning: light-dark(var(--l-warning), var(--d-warning));
+    --on-warning: light-dark(var(--l-on-warning), var(--d-on-warning));
+    --warning-container: light-dark(var(--l-warning-container), var(--d-warning-container));
+    --on-warning-container: light-dark(var(--l-on-warning-container), var(--d-on-warning-container));
+  }
 }
-@media (prefers-reduced-motion:reduce){
-  *,*::before,*::after{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important}
+
+*, *::before, *::after { box-sizing: border-box; }
+html { -webkit-text-size-adjust: 100%; accent-color: var(--primary); }
+body {
+  margin: 0;
+  min-height: 100vh;
+  background-color: var(--surface);
+  color: var(--on-surface);
+  font: 400 14px/20px var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+}
+::selection { background: color-mix(in oklab, var(--primary) 28%, transparent); color: var(--on-surface); }
+input, textarea { caret-color: var(--primary); }
+h1, h2, h3 {
+  margin: 0;
+  font-family: var(--font-display);
+  letter-spacing: -0.15px;
+  color: var(--on-surface);
+}
+a { color: var(--primary); text-decoration: none; }
+a:hover { text-decoration: underline; }
+code, pre, .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.num { font-variant-numeric: tabular-nums; }
+.skip {
+  position: absolute; left: -1px; top: -44px;
+  background: var(--primary); color: var(--on-primary);
+  padding: 8px 12px; border-radius: var(--r); z-index: 99; font-weight: 600;
+}
+.skip:focus { top: 8px; left: 8px; }
+:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; border-radius: var(--r); }
+
+@supports not (scrollbar-color: auto) {
+  ::-webkit-scrollbar { width: 8px; height: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--outline-variant); border-radius: 99px; border: 2px solid transparent; background-clip: content-box; }
+  ::-webkit-scrollbar-track { background: transparent; }
+}
+
+/* ---------- Workbench Shell (240px left rail + 56px sticky topbar) ---------- */
+.shell { display: grid; grid-template-columns: var(--rail) minmax(0, 1fr); min-height: 100vh; }
+.rail {
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-low);
+  border-right: 1px solid var(--outline-variant);
+  padding: 12px;
+  gap: 12px;
+  overflow-y: auto;
+  z-index: 45;
+}
+.rail-top {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 2px 4px 12px;
+  border-bottom: 1px solid var(--outline-variant);
+}
+.brand { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.mark {
+  width: 28px; height: 28px;
+  border-radius: var(--r);
+  background: var(--primary);
+  color: var(--on-primary);
+  display: grid; place-items: center;
+  flex-shrink: 0;
+}
+.mark svg { width: 16px; height: 16px; }
+.brand .nm {
+  font-family: var(--font-display);
+  font-size: 15px; font-weight: 600; line-height: 19px; letter-spacing: -0.15px;
+  color: var(--on-surface);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.brand .sub {
+  display: block;
+  font-family: var(--font-mono);
+  font-size: 11px; font-weight: 500; line-height: 15px;
+  color: var(--outline);
+}
+.nav { display: flex; flex-direction: column; gap: 14px; flex: 1; min-height: 0; }
+.nav-grp { display: flex; flex-direction: column; gap: 3px; }
+.nav-lbl {
+  font-family: var(--font-sans);
+  font-size: 11px; font-weight: 600; line-height: 15px;
+  color: var(--outline);
+  text-transform: uppercase;
+  letter-spacing: 0.4px;
+  padding: 4px 10px 2px;
+}
+.nav button {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 10px;
+  border: 1px solid transparent;
+  border-radius: var(--r);
+  background: transparent;
+  color: var(--on-surface-variant);
+  font-family: var(--font-sans);
+  font-size: 13px; font-weight: 600; line-height: 18px; letter-spacing: 0.1px;
+  cursor: pointer; white-space: nowrap; text-align: left; width: 100%;
+  transition: background-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.nav button svg { width: 15px; height: 15px; opacity: 0.82; flex-shrink: 0; }
+.nav button .nl { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.nav button .nb {
+  font-size: 11px; font-family: var(--font-mono);
+  color: var(--on-surface-variant);
+  background: var(--surface-lowest);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--r-sm);
+  padding: 0 6px; line-height: 17px;
+  font-variant-numeric: tabular-nums;
+}
+.nav button .ndot { width: 7px; height: 7px; border-radius: var(--r-full); background: var(--outline-variant); flex-shrink: 0; }
+.nav button .ndot.ok { background: var(--success); }
+.nav button .ndot.warn { background: var(--warning); }
+.nav button:hover { color: var(--on-surface); background: var(--surface-container); }
+.nav button.on {
+  color: var(--primary);
+  background: var(--surface-high);
+  border-color: var(--outline-variant);
+}
+.nav button.on svg { color: var(--primary); opacity: 1; }
+.nav button.on .nb { color: var(--primary); border-color: color-mix(in oklab, var(--primary) 45%, var(--outline-variant)); }
+
+.rail-foot { border-top: 1px solid var(--outline-variant); padding-top: 12px; display: flex; flex-direction: column; gap: 8px; }
+.rail-vitals {
+  padding: 10px 11px;
+  border-radius: var(--r);
+  background: var(--surface-container);
+  border: 1px solid var(--outline-variant);
+  cursor: pointer;
+  transition: border-color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.rail-vitals:hover { border-color: var(--primary); background: var(--surface-high); }
+.rv-row {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; font-family: var(--font-mono);
+  color: var(--on-surface);
+  font-variant-numeric: tabular-nums;
+}
+.rv-row span:last-child { color: var(--on-surface-variant); }
+
+.work { display: flex; flex-direction: column; min-width: 0; min-height: 100vh; }
+header.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 40;
+  min-height: 56px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 20px;
+  background: var(--surface-low);
+  border-bottom: 1px solid var(--outline-variant);
+}
+.mob-menu { display: none; }
+.view-title {
+  font-family: var(--font-display);
+  font-size: 16px; font-weight: 600; line-height: 22px; letter-spacing: -0.15px;
+  color: var(--on-surface);
+  white-space: nowrap;
+}
+.hgap { flex: 1; min-width: 4px; }
+.tele-strip { display: flex; align-items: center; gap: 6px; flex-wrap: nowrap; overflow: hidden; }
+.pill {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 5px 11px;
+  border-radius: var(--r-full);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-lowest);
+  color: var(--on-surface-variant);
+  font-family: var(--font-mono);
+  font-size: 12px; font-weight: 500; line-height: 16px;
+  white-space: nowrap; max-width: min(300px, 30vw); overflow: hidden; text-overflow: ellipsis;
+  font-variant-numeric: tabular-nums;
+  cursor: pointer;
+  transition: border-color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.pill:hover { border-color: var(--primary); background: var(--surface-container); }
+.pill.ok { color: var(--on-surface); border-color: var(--outline-variant); background: var(--surface-lowest); }
+.pill.ok .dot { background: var(--success); }
+.pill.warn {
+  color: var(--on-warning-container);
+  border-color: color-mix(in oklab, var(--warning) 45%, var(--outline-variant));
+  background: var(--warning-container);
+}
+.pill.warn .dot { background: var(--warning); }
+.pill .dot { width: 7px; height: 7px; border-radius: var(--r-full); background: var(--outline); flex-shrink: 0; }
+
+.icon {
+  display: grid; place-items: center;
+  width: 34px; height: 34px;
+  border-radius: var(--r);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-container);
+  color: var(--on-surface-variant);
+  cursor: pointer; flex-shrink: 0;
+  transition: background-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.icon:hover { color: var(--on-surface); border-color: var(--primary); background: var(--surface-high); }
+.icon svg { width: 15px; height: 15px; }
+
+.cmdbtn {
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 34px; padding: 0 11px;
+  border-radius: var(--r);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-container);
+  color: var(--on-surface);
+  font-family: var(--font-sans);
+  font-size: 13px; font-weight: 600;
+  cursor: pointer; flex-shrink: 0;
+  transition: background-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.cmdbtn:hover { color: var(--on-surface); border-color: var(--primary); background: var(--surface-high); }
+.cmdbtn svg { width: 14px; height: 14px; color: var(--primary); }
+.cmdbtn kbd { border: 0; background: transparent; padding: 0; color: var(--on-surface-variant); font-size: 12px; }
+
+/* ---------- Main Layout & Tonal Cards ---------- */
+main { padding: 20px 24px 36px; max-width: 1380px; width: 100%; margin: 0 auto; flex: 1; }
+@media (prefers-reduced-motion: no-preference) {
+  section:not(.hide) { animation: view-enter var(--dur-enter) var(--ease-enter); }
+}
+@keyframes view-enter { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: none; } }
+.hide { display: none !important; }
+
+.hf-shell { display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 16px; align-items: start; }
+.rail-sticky { position: sticky; top: 72px; }
+
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 16px; }
+.grid.g4, .grid4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 14px; }
+
+.card {
+  background: var(--surface-low);
+  border: 1px solid var(--outline-variant);
+  border-radius: var(--r-md);
+  padding: 18px 20px;
+  margin-bottom: 16px;
+}
+.card.sub {
+  background: var(--surface-container);
+  border-color: var(--outline-variant);
+  padding: 14px 16px;
+  margin-bottom: 12px;
+}
+.hd {
+  display: flex; align-items: center; gap: 10px;
+  justify-content: space-between; flex-wrap: wrap;
+  margin: 0 0 14px;
+}
+.hd h2 {
+  font-family: var(--font-display);
+  font-size: 16px; font-weight: 600; line-height: 22px; letter-spacing: -0.15px;
+  display: flex; align-items: center; gap: 8px;
+}
+.hd .meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.two { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.two > .side { width: 280px; flex: 0 0 280px; }
+.two > .main { flex: 1; min-width: 300px; }
+.hint { color: var(--on-surface-variant); font-size: 12px; line-height: 17px; }
+.sep { height: 1px; background: var(--outline-variant); margin: 14px 0; }
+.form-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 12px; }
+.field { display: flex; flex-direction: column; gap: 5px; }
+.field label {
+  font-size: 12px; font-weight: 600; line-height: 16px; letter-spacing: 0.1px;
+  color: var(--on-surface-variant);
+  display: flex; flex-wrap: wrap; justify-content: flex-start; align-items: center; gap: 4px 8px;
+}
+.field label > span { margin-left: auto; color: var(--primary); font-weight: 500; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+
+/* ---------- Controls & Buttons ---------- */
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  padding: 7px 14px;
+  border-radius: var(--r);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-high);
+  color: var(--on-surface);
+  font-family: var(--font-sans);
+  font-size: 13px; font-weight: 600; line-height: 18px; letter-spacing: 0.1px;
+  cursor: pointer; white-space: nowrap;
+  transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state), opacity var(--dur-state) var(--ease-state);
+}
+.btn svg { width: 14px; height: 14px; flex-shrink: 0; }
+.btn:hover { background: var(--surface-highest); border-color: var(--primary); color: var(--on-surface); }
+@media (prefers-reduced-motion: no-preference) { .btn:active { transform: translateY(1px); } }
+.btn.primary { background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+.btn.primary:hover { opacity: 0.9; background: var(--primary); border-color: var(--primary); color: var(--on-primary); }
+.btn.acc2 {
+  background: var(--secondary-container);
+  border-color: color-mix(in oklab, var(--secondary) 45%, var(--outline-variant));
+  color: var(--on-secondary-container);
+}
+.btn.acc2:hover { border-color: var(--secondary); opacity: 0.94; color: var(--on-secondary-container); }
+.btn.danger {
+  background: var(--error-container);
+  border-color: color-mix(in oklab, var(--error) 45%, var(--outline-variant));
+  color: var(--on-error-container);
+}
+.btn.danger:hover { border-color: var(--error); opacity: 0.92; color: var(--on-error-container); }
+.btn.sm { padding: 5px 11px; font-size: 12px; line-height: 16px; border-radius: var(--r); }
+.btn.xs { padding: 3px 8px; font-size: 11px; line-height: 15px; border-radius: var(--r-sm); letter-spacing: 0.2px; }
+.btn[disabled] { opacity: 0.42; cursor: not-allowed; transform: none; pointer-events: none; }
+
+select, input[type=text], input[type=password], input[type=search], input[type=number], textarea {
+  background: var(--surface-lowest);
+  border: 1px solid var(--outline-variant);
+  color: var(--on-surface);
+  border-radius: var(--r);
+  padding: 7px 11px;
+  font-family: var(--font-mono);
+  font-size: 12.5px; line-height: 18px;
+  transition: border-color var(--dur-state) var(--ease-state);
+}
+input::placeholder, textarea::placeholder { color: var(--outline); font-family: var(--font-sans); }
+select:focus, input:focus, textarea:focus { border-color: var(--primary); outline: 2px solid var(--primary); outline-offset: 1px; }
+input[type=checkbox], input[type=radio] { accent-color: var(--primary); width: 15px; height: 15px; cursor: pointer; }
+input[type=range] { accent-color: var(--primary); width: 100%; cursor: pointer; }
+
+.toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.search { position: relative; flex: 1; min-width: 200px; }
+.search svg { position: absolute; left: 10px; top: 50%; transform: translateY(-50%); width: 15px; height: 15px; color: var(--outline); pointer-events: none; }
+.search input { width: 100%; padding-left: 33px; }
+.segs {
+  display: flex; gap: 4px; padding: 3px;
+  background: var(--surface-lowest); border: 1px solid var(--outline-variant);
+  border-radius: var(--r); flex-wrap: wrap;
+}
+.segs button {
+  border: 1px solid transparent; background: transparent; color: var(--on-surface-variant);
+  font-family: var(--font-sans); font-size: 12px; font-weight: 600; line-height: 16px;
+  padding: 5px 10px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  transition: background-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.segs button:hover { color: var(--on-surface); background: var(--surface-container); }
+.segs button.on { background: var(--surface-high); color: var(--primary); border-color: var(--primary); }
+
+.switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+.switch input { position: absolute; opacity: 0; pointer-events: none; }
+.switch .track {
+  width: 36px; height: 20px; border-radius: var(--r-full);
+  background: var(--surface-lowest); border: 1px solid var(--outline-variant);
+  position: relative; flex-shrink: 0;
+  transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.switch .track::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 14px; height: 14px; border-radius: var(--r-full); background: var(--outline);
+  transition: transform var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.switch input:checked + .track { background: color-mix(in oklab, var(--primary) 22%, var(--surface-lowest)); border-color: var(--primary); }
+.switch input:checked + .track::after { transform: translateX(16px); background: var(--primary); }
+.switch input:focus-visible + .track { outline: 2px solid var(--primary); outline-offset: 2px; }
+input[type="checkbox"][switch] { accent-color: var(--success); margin: 0; width: auto; height: auto; cursor: pointer; vertical-align: middle; }
+input[type="checkbox"][switch]:focus:not(:focus-visible) { outline: none; }
+input[type="checkbox"][switch]:focus-visible { outline: 3px solid var(--primary); outline-offset: 3px; }
+html.no-native-switch input[type="checkbox"][switch] {
+  appearance: none; -webkit-appearance: none;
+  width: 34px; height: 18px; border-radius: var(--r-full);
+  background: var(--surface-lowest); border: 1px solid var(--outline-variant);
+  position: relative; flex-shrink: 0;
+  transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+html.no-native-switch input[type="checkbox"][switch]::after {
+  content: ""; position: absolute; top: 2px; left: 2px;
+  width: 12px; height: 12px; border-radius: var(--r-full);
+  background: var(--outline);
+  transition: transform var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+html.no-native-switch input[type="checkbox"][switch]:checked {
+  background: var(--success-container); border-color: var(--success);
+}
+html.no-native-switch input[type="checkbox"][switch]:checked::after {
+  transform: translateX(16px); background: var(--success);
+}
+html.no-native-switch input[type="checkbox"][switch]:disabled { opacity: 0.5; cursor: not-allowed; }
+.host-toggle {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: 32px; padding: 0 11px; border-radius: var(--r-full);
+  border: 1px solid var(--outline-variant); background: var(--surface-container);
+  color: var(--on-surface-variant); font-family: var(--font-mono);
+  font-size: 12px; font-weight: 600; line-height: 16px;
+  cursor: pointer; white-space: nowrap; user-select: none; flex-shrink: 0;
+  transition: border-color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state), color var(--dur-state) var(--ease-state);
+}
+.host-toggle:hover { border-color: var(--primary); color: var(--on-surface); background: var(--surface-high); }
+.host-toggle.on {
+  color: var(--on-success-container);
+  border-color: color-mix(in oklab, var(--success) 50%, var(--outline-variant));
+  background: var(--success-container);
+}
+
+/* ---------- Tags / Stats / Meters ---------- */
+.tag {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 2px 7px; border-radius: var(--r-sm);
+  border: 1px solid var(--outline-variant);
+  background: var(--surface-lowest); color: var(--on-surface-variant);
+  font-family: var(--font-mono); font-size: 11px; font-weight: 600; line-height: 15px; letter-spacing: 0.2px;
+  white-space: nowrap; font-variant-numeric: tabular-nums;
+}
+.tag:empty { display: none; }
+.tag.acc { color: var(--primary); border-color: color-mix(in oklab, var(--primary) 45%, var(--outline-variant)); background: color-mix(in oklab, var(--primary) 10%, var(--surface-lowest)); }
+.tag.sec { color: var(--secondary); border-color: color-mix(in oklab, var(--secondary) 45%, var(--outline-variant)); background: var(--surface-lowest); }
+.tag.ok { color: var(--on-success-container); border-color: transparent; background: var(--success-container); }
+.tag.warn { color: var(--on-warning-container); border-color: transparent; background: var(--warning-container); }
+.tag.err { color: var(--on-error-container); border-color: transparent; background: var(--error-container); }
+.tag.mut { color: var(--on-surface-variant); background: var(--surface-container); }
+.tag.pill-tag { border-radius: var(--r-full); padding: 3px 10px; }
+
+.kvs { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.stat {
+  font-family: var(--font-mono); font-size: 22px; font-weight: 600;
+  letter-spacing: -0.25px; font-variant-numeric: tabular-nums; line-height: 28px;
+  color: var(--on-surface);
+}
+.stat small { font-size: 12px; font-weight: 500; color: var(--on-surface-variant); letter-spacing: 0; }
+.stat.is-primary { color: var(--primary); }
+.stat.is-secondary { color: var(--secondary); }
+.stat.is-success { color: var(--success); }
+
+.meter {
+  height: 7px; border-radius: var(--r-full);
+  background: var(--surface-lowest);
+  border: 1px solid color-mix(in oklab, var(--outline-variant) 55%, transparent);
+  overflow: hidden; margin: 6px 0 2px; display: flex;
+}
+.meter i { display: block; height: 100%; background: var(--primary); transition: opacity var(--dur-state) var(--ease-state); }
+.meter i.kv { background: var(--secondary); }
+.meter i.cmp { background: var(--success); }
+.meter.sec i { background: var(--secondary); }
+.meter.ok i { background: var(--success); }
+.meter.warn i { background: var(--warning); }
+.meter.err i { background: var(--error); }
+.spark { width: 100%; height: 28px; display: block; margin-top: 8px; opacity: 0.88; }
+
+/* ---------- Model List ---------- */
+.mlist { display: flex; flex-direction: column; gap: 8px; }
+.mrow {
+  display: grid; grid-template-columns: auto minmax(0, 1fr) minmax(170px, 220px) auto;
+  gap: 12px; align-items: center; padding: 12px 14px;
+  border: 1px solid var(--outline-variant); border-radius: var(--r-md);
+  background: var(--surface-container);
+  transition: border-color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.mrow:hover { border-color: var(--primary); background: var(--surface-high); }
+.mrow.run { border-color: var(--primary); background: var(--surface-high); }
+.pinbtn {
+  background: transparent; border: 0; color: var(--outline);
+  cursor: pointer; padding: 4px; border-radius: var(--r-sm); display: grid; place-items: center;
+  transition: color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.pinbtn:hover { color: var(--secondary); background: var(--surface-highest); }
+.pinbtn.on { color: var(--secondary); }
+.pinbtn svg { width: 15px; height: 15px; }
+.mrow .nm { font-weight: 600; font-size: 14px; line-height: 20px; color: var(--on-surface); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: flex; align-items: center; gap: 6px; }
+.mrow .pth { color: var(--outline); font-size: 11px; line-height: 15px; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; margin-top: 2px; }
+.mrow .tags { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 7px; }
+.fitbox { display: flex; flex-direction: column; gap: 3px; font-family: var(--font-mono); font-size: 11px; font-variant-numeric: tabular-nums; }
+.fitbox .fit-top { display: flex; justify-content: space-between; align-items: center; gap: 6px; color: var(--on-surface); font-weight: 600; }
+.fitbox .fit-sub { color: var(--on-surface-variant); font-size: 10.5px; }
+.mrow .acts { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.mrow .acts select { padding: 5px 8px; font-size: 11.5px; font-family: var(--font-sans); }
+.shardlist { display: grid; gap: 3px; margin: -4px 0 6px; padding: 8px 12px; border: 1px solid var(--outline-variant); border-radius: var(--r); background: var(--surface-lowest); }
+.shardlist .shrow { display: flex; justify-content: space-between; gap: 10px; padding: 3px 6px; border-radius: var(--r-sm); cursor: copy; }
+.shardlist .shrow:hover { background: var(--surface-container); }
+.shardlist .shrow code { font-size: 11px; font-family: var(--font-mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface-variant); }
+.shardlist .shrow .hint { flex: none; font-family: var(--font-mono); }
+.empty { text-align: center; color: var(--on-surface-variant); padding: 28px 16px; border: 1px dashed var(--outline-variant); border-radius: var(--r-md); background: var(--surface-lowest); }
+.empty b { display: block; color: var(--on-surface); font-family: var(--font-display); font-size: 15px; margin-bottom: 4px; }
+
+/* ---------- Logs & Command Preview ---------- */
+.cmdbox {
+  font-family: var(--font-mono); font-size: 12px; line-height: 18px;
+  color: var(--primary); background: var(--surface-lowest);
+  border: 1px solid var(--outline-variant); border-radius: var(--r);
+  padding: 10px 12px; overflow-x: auto; white-space: pre-wrap; word-break: break-all;
+}
+.logbar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 10px; }
+.log {
+  font-family: var(--font-mono); font-size: 12px; line-height: 1.6;
+  color: var(--on-surface-variant); background: var(--surface-lowest);
+  border: 1px solid var(--outline-variant); border-radius: var(--r);
+  padding: 12px 14px; max-height: 420px; overflow: auto;
+  white-space: pre-wrap; word-break: break-word; margin: 0;
+}
+.log.wrapoff { white-space: pre; }
+.log .e { color: var(--error); }
+.log .w { color: var(--warning); }
+.log .g { color: var(--outline); }
+
+/* ---------- Tables ---------- */
+.tbl-wrap { overflow-x: auto; border: 1px solid var(--outline-variant); border-radius: var(--r); background: var(--surface-lowest); }
+table.tbl { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 12px; font-variant-numeric: tabular-nums; }
+table.tbl th, table.tbl td { padding: 9px 12px; text-align: left; border-bottom: 1px solid var(--outline-variant); }
+table.tbl th { background: var(--surface-container); color: var(--on-surface-variant); font-family: var(--font-sans); font-weight: 600; font-size: 11px; letter-spacing: 0.4px; text-transform: uppercase; white-space: nowrap; }
+table.tbl tr:last-child td { border-bottom: 0; }
+table.tbl tr:hover td { background: var(--surface-low); }
+
+/* ---------- Chat ---------- */
+.thread { display: flex; flex-direction: column; gap: 12px; padding: 4px 2px; min-height: 40vh; max-height: 58vh; overflow-y: auto; }
+.msg {
+  max-width: min(88%, 780px); padding: 13px 16px;
+  border-radius: var(--r-md); border: 1px solid var(--outline-variant);
+  background: var(--surface-container); color: var(--on-surface);
+  font-size: 14px; line-height: 1.6; overflow-wrap: break-word; position: relative;
+}
+.msg.u { align-self: flex-end; background: var(--surface-high); border-color: var(--primary); }
+.msg.a { align-self: flex-start; background: var(--surface-container); }
+.msg .who { font-family: var(--font-mono); font-size: 11.5px; font-weight: 600; color: var(--primary); margin-bottom: 6px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.msg.u .who { color: var(--on-surface-variant); }
+.msg .codewrap { margin: 10px 0; border: 1px solid var(--outline-variant); border-radius: var(--r); overflow: hidden; background: var(--surface-lowest); }
+.msg .codebar { display: flex; align-items: center; justify-content: space-between; padding: 5px 10px; background: var(--surface-low); border-bottom: 1px solid var(--outline-variant); font-family: var(--font-mono); font-size: 11px; color: var(--on-surface-variant); }
+.msg pre { margin: 0; padding: 12px 14px; overflow: auto; font-size: 12px; line-height: 1.55; background: transparent; border: 0; color: var(--on-surface); }
+.msg code { font-size: 12px; background: var(--surface-lowest); padding: 1px 5px; border-radius: var(--r-sm); border: 1px solid var(--outline-variant); color: var(--primary); }
+.msg pre code { background: none; border: 0; padding: 0; color: inherit; }
+.msg .md-h { font-family: var(--font-display); font-weight: 600; margin: 10px 0 4px; }
+.msg ul, .msg ol { margin: 6px 0; padding-left: 20px; }
+.msg details { margin-bottom: 8px; border: 1px solid var(--outline-variant); border-radius: var(--r); padding: 7px 10px; background: var(--surface-lowest); color: var(--on-surface-variant); font-size: 12px; }
+.msg summary { cursor: pointer; font-weight: 600; color: var(--secondary); font-family: var(--font-mono); font-size: 11.5px; }
+.msg details[open] summary { margin-bottom: 6px; }
+.msg .think { white-space: pre-wrap; font-family: var(--font-mono); font-size: 11.5px; }
+.msg .bar { display: flex; gap: 6px; justify-content: flex-end; margin-top: 8px; opacity: 0.78; transition: opacity var(--dur-state) var(--ease-state); }
+.msg:hover .bar, .msg:focus-within .bar { opacity: 1; }
+.typing { color: var(--primary); font-size: 12px; font-family: var(--font-mono); }
+.composer {
+  display: flex; gap: 10px; align-items: flex-end;
+  border: 1px solid var(--outline-variant); border-radius: var(--r-md);
+  padding: 10px 12px; background: var(--surface-lowest); margin-top: 12px;
+  transition: border-color var(--dur-state) var(--ease-state);
+}
+.composer:focus-within { border-color: var(--primary); outline: 2px solid var(--primary); outline-offset: 1px; }
+.composer textarea { flex: 1; border: 0; background: transparent; color: var(--on-surface); resize: none; min-height: 24px; max-height: 220px; padding: 3px 0; font-family: var(--font-sans); font-size: 14px; line-height: 20px; }
+.composer textarea:focus { outline: 0; box-shadow: none; }
+.clist { display: flex; flex-direction: column; gap: 6px; max-height: 54vh; overflow-y: auto; }
+.citem {
+  display: flex; align-items: center; gap: 6px; padding: 9px 10px;
+  border-radius: var(--r); border: 1px solid var(--outline-variant); background: var(--surface-container);
+  cursor: pointer; transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.citem:hover, .citem.on { background: var(--surface-high); border-color: var(--primary); }
+.citem .t { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 600; color: var(--on-surface); }
+.citem .s { font-family: var(--font-mono); font-size: 11px; color: var(--on-surface-variant); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+/* ---------- HF / Downloads / Setup Cards ---------- */
+.frow {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border-radius: var(--r); cursor: pointer;
+  border: 1px solid var(--outline-variant); background: var(--surface-container); margin-bottom: 6px;
+  transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.frow:hover { background: var(--surface-high); border-color: var(--primary); }
+.frow .p { flex: 1; min-width: 0; font-family: var(--font-mono); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--on-surface); }
+.dl { padding: 12px; border: 1px solid var(--outline-variant); border-radius: var(--r); background: var(--surface-container); margin-bottom: 8px; }
+.dl:last-child { margin-bottom: 0; }
+.setup-card {
+  padding: 14px 16px; border-radius: var(--r-md);
+  background: var(--surface-container); border: 1px solid var(--outline-variant);
+  display: flex; flex-direction: column; justify-content: space-between; gap: 10px;
+}
+
+/* ---------- Native Dialog & Command Palette ---------- */
+dialog {
+  border: 1px solid var(--outline-variant); border-radius: var(--r-lg);
+  background: var(--surface-low); color: var(--on-surface);
+  padding: 0; max-width: min(760px, 95vw); width: 100%; max-height: 88vh;
+}
+dialog:modal { overscroll-behavior: contain; display: flex; flex-direction: column; }
+dialog:not([open]) { display: none; }
+dialog::backdrop { background: rgba(12, 14, 19, 0.72); overflow: hidden; overscroll-behavior: contain; }
+@media (prefers-reduced-motion: no-preference) {
+  dialog {
+    opacity: 0; transform: translateY(6px);
+    transition: opacity var(--dur-exit) var(--ease-exit), transform var(--dur-exit) var(--ease-exit), display var(--dur-exit), overlay var(--dur-exit);
+    transition-behavior: allow-discrete;
+  }
+  dialog[open] {
+    opacity: 1; transform: none;
+    transition: opacity var(--dur-enter) var(--ease-enter), transform var(--dur-enter) var(--ease-enter), display var(--dur-enter), overlay var(--dur-enter);
+    transition-behavior: allow-discrete;
+  }
+  @starting-style { dialog[open] { opacity: 0; transform: translateY(6px); } }
+}
+.dlg-hd { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 20px; border-bottom: 1px solid var(--outline-variant); }
+.dlg-eyebrow { font-family: var(--font-mono); font-size: 11px; font-weight: 600; line-height: 15px; letter-spacing: 0.4px; text-transform: uppercase; color: var(--primary); margin-bottom: 2px; }
+.dlg-hd h2 { font-size: 18px; font-weight: 600; line-height: 24px; letter-spacing: -0.15px; }
+.dlg-bd { padding: 18px 20px; overflow-y: auto; min-height: 0; flex: 1; }
+.dlg-ft { display: flex; gap: 8px; justify-content: flex-end; align-items: center; padding: 13px 20px; border-top: 1px solid var(--outline-variant); flex-wrap: wrap; background: var(--surface-lowest); border-radius: 0 0 var(--r-lg) var(--r-lg); }
+
+.pal-search-bar { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-bottom: 1px solid var(--outline-variant); }
+.pal-search-bar svg { width: 18px; height: 18px; color: var(--primary); flex-shrink: 0; }
+.pal-search-bar input { flex: 1; border: 0; background: transparent; padding: 0; font-family: var(--font-sans); font-size: 14px; color: var(--on-surface); }
+.pal-search-bar input:focus { outline: 0; border: 0; }
+.pal-list { display: flex; flex-direction: column; gap: 4px; max-height: 52vh; overflow-y: auto; padding: 12px; }
+.pal-item {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 9px 12px; border-radius: var(--r); border: 1px solid transparent;
+  background: transparent; color: var(--on-surface); cursor: pointer; text-align: left; font: inherit; width: 100%;
+  transition: background-color var(--dur-state) var(--ease-state), border-color var(--dur-state) var(--ease-state);
+}
+.pal-item:hover { background: var(--surface-container); }
+.pal-item.sel { background: var(--surface-high); border-color: var(--primary); }
+.pal-item .pi-main { display: flex; align-items: center; gap: 8px; min-width: 0; font-weight: 600; font-size: 13px; }
+.pal-item.sel .pi-main { color: var(--primary); }
+.pal-item .pi-sub { font-size: 11.5px; color: var(--on-surface-variant); font-family: var(--font-mono); white-space: nowrap; }
+.pal-ft { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 16px; background: var(--surface-lowest); border-top: 1px solid var(--outline-variant); font-family: var(--font-mono); font-size: 11px; color: var(--on-surface-variant); }
+
+/* ---------- Toasts ---------- */
+.toasts { position: fixed; right: 18px; bottom: 18px; display: flex; flex-direction: column; gap: 8px; z-index: 95; max-width: min(430px, 92vw); }
+.toast {
+  display: flex; gap: 10px; align-items: flex-start; padding: 11px 14px;
+  border-radius: var(--r); border: 1px solid var(--outline-variant);
+  background: var(--surface-high); color: var(--on-surface); cursor: pointer; font-size: 13px; line-height: 18px;
+}
+@media (prefers-reduced-motion: no-preference) {
+  .toast { animation: tin var(--dur-enter) var(--ease-enter); }
+  .toast.out { animation: tout var(--dur-exit) var(--ease-exit) forwards; }
+}
+.toast .ti { width: 8px; height: 8px; border-radius: var(--r-full); background: var(--primary); margin-top: 5px; flex-shrink: 0; }
+.toast.ok { border-color: color-mix(in oklab, var(--success) 55%, var(--outline-variant)); }
+.toast.ok .ti { background: var(--success); }
+.toast.err { border-color: color-mix(in oklab, var(--error) 60%, var(--outline-variant)); }
+.toast.err .ti { background: var(--error); }
+.toast.warn { border-color: color-mix(in oklab, var(--warning) 55%, var(--outline-variant)); }
+.toast.warn .ti { background: var(--warning); }
+@keyframes tin { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+@keyframes tout { to { opacity: 0; transform: translateY(4px); } }
+
+/* ---------- Footer Allocation Strip ---------- */
+footer {
+  width: 100%; padding: 9px 20px;
+  background: var(--surface-low); border-top: 1px solid var(--outline-variant);
+  color: var(--on-surface-variant); font-family: var(--font-mono); font-size: 11.5px; line-height: 16px;
+  font-variant-numeric: tabular-nums;
+  display: flex; gap: 10px 18px; flex-wrap: wrap; align-items: center; justify-content: space-between;
+}
+footer .ft-group { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+kbd {
+  font-family: var(--font-mono); font-size: 11px;
+  border: 1px solid var(--outline-variant); border-radius: var(--r-sm);
+  padding: 1px 6px; background: var(--surface-container); color: var(--on-surface-variant);
+}
+
+/* ---------- Responsive Mobile Rail (< 1024px per Stitch spec) ---------- */
+.rail-backdrop { display: none; position: fixed; inset: 0; background: rgba(12, 14, 19, 0.68); z-index: 44; }
+@media (max-width: 1120px) {
+  .hf-shell { grid-template-columns: 1fr; }
+  .rail-sticky { position: static; }
+}
+@media (max-width: 1024px) {
+  .shell { grid-template-columns: 1fr; }
+  .rail { position: fixed; left: 0; top: 0; bottom: 0; width: 256px; transform: translateX(-105%); }
+  @media (prefers-reduced-motion: no-preference) {
+    .rail { transition: transform var(--dur-enter) var(--ease-enter); }
+  }
+  body.nav-open .rail { transform: translateX(0); }
+  body.nav-open .rail-backdrop { display: block; }
+  .mob-menu { display: grid; }
+  header.topbar { padding: 8px 14px; }
+  main { padding: 16px 14px 32px; }
+  .two > .side { width: 100%; flex: 1 1 100%; }
+  .mrow { grid-template-columns: auto 1fr; }
+  .mrow .fitbox { grid-column: 1 / -1; }
+  .mrow .acts { grid-column: 1 / -1; justify-content: flex-start; }
+  .thread { max-height: none; }
+}
+
+/* ---------- Agent Chat Sidebar & Action Menu Templates ---------- */
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; border: 0; }
+.agent-drawer {
+  position: fixed; top: 0; right: 0; bottom: 0; width: min(470px, 96vw);
+  background: var(--surface-low); border-left: 1px solid var(--outline-variant);
+  z-index: 85; display: flex; flex-direction: column; transform: translateX(100%);
+}
+@media (prefers-reduced-motion: no-preference) {
+  .agent-drawer { transition: transform var(--dur-enter) var(--ease-enter); }
+}
+.agent-drawer.open { transform: translateX(0); }
+.agent-drawer-hd { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--outline-variant); }
+.agent-drawer-hd h2 { font-family: var(--font-display); font-size: 15px; font-weight: 600; margin: 0; display: flex; align-items: center; gap: 6px; }
+.agent-drawer-bd { flex: 1; overflow-y: auto; padding: 14px 16px; display: flex; flex-direction: column; gap: 10px; }
+.agent-drawer-ft { padding: 12px 14px; border-top: 1px solid var(--outline-variant); display: flex; flex-direction: column; gap: 8px; background: var(--surface-lowest); }
+.agent-msg { padding: 10px 12px; border-radius: var(--r); border: 1px solid var(--outline-variant); background: var(--surface-container); color: var(--on-surface); font-size: 13px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.agent-msg.usr { background: var(--surface-high); border-color: var(--primary); align-self: flex-end; max-width: 88%; }
+.agent-msg.bot { align-self: flex-start; max-width: 97%; color: var(--on-surface-variant); }
+.agent-acts { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 8px; }
+.agent-chips { display: flex; gap: 5px; flex-wrap: wrap; }
+
+.ag-menu-panel { border-bottom: 1px solid var(--outline-variant); background: var(--surface-lowest); max-height: 48vh; display: flex; flex-direction: column; overflow: hidden; }
+.ag-menu-panel[hidden] { display: none; }
+.ag-menu-bar { display: flex; align-items: center; gap: 6px; padding: 8px 12px; border-bottom: 1px solid var(--outline-variant); }
+.ag-menu-bar input { flex: 1; min-width: 0; padding: 6px 9px; font-size: 12px; }
+.ag-menu-toggle-all[aria-expanded="true"] .expand,
+.ag-menu-toggle-all[aria-expanded="false"] .collapse { display: none; }
+.ag-menu-acc { overflow-y: auto; padding: 8px 10px 10px; display: flex; flex-direction: column; gap: 6px; }
+.ag-menu-acc details { border: 1px solid var(--outline-variant); border-radius: var(--r); background: var(--surface-low); }
+.ag-menu-acc summary { list-style: none; display: flex; align-items: center; gap: 6px; padding: 8px 10px; font-size: 12.5px; font-weight: 600; color: var(--on-surface); cursor: pointer; user-select: none; }
+.ag-menu-acc summary::-webkit-details-marker { display: none; }
+.ag-menu-acc summary::before {
+  content: ""; inline-size: 9px; block-size: 9px; flex-shrink: 0;
+  border-right: 1.75px solid currentColor; border-bottom: 1.75px solid currentColor;
+  transform: rotate(-45deg) translate(-1px, -1px); margin-right: 2px; opacity: 0.75;
+}
+.ag-menu-acc details[open] > summary::before { transform: rotate(45deg) translate(-1px, -1px); }
+.ag-menu-acc details::details-content { interpolate-size: allow-keywords; overflow: clip; contain: layout; }
+.ag-menu-acc details:not([open])::details-content { block-size: 0; }
+@media (prefers-reduced-motion: no-preference) {
+  .ag-menu-acc summary::before { transition: transform var(--dur-enter) var(--ease-enter); }
+  .ag-menu-acc details::details-content { transition: block-size var(--dur-enter) var(--ease-enter), content-visibility var(--dur-enter) var(--ease-enter); transition-behavior: allow-discrete; }
+}
+.ag-menu-grid { display: grid; grid-template-columns: 1fr; gap: 5px; padding: 0 8px 8px; }
+.ag-act-item {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 2px; width: 100%; text-align: left;
+  padding: 8px 10px; border-radius: var(--r); border: 1px solid var(--outline-variant);
+  background: var(--surface-container); color: var(--on-surface); cursor: pointer;
+  transition: border-color var(--dur-state) var(--ease-state), background-color var(--dur-state) var(--ease-state);
+}
+.ag-act-item:hover, .ag-act-item:focus-visible { border-color: var(--primary); background: var(--surface-high); }
+.ag-act-item-top { display: flex; align-items: center; justify-content: space-between; gap: 6px; width: 100%; font-size: 12.5px; font-weight: 600; }
+.ag-act-item-desc { font-size: 11.5px; color: var(--on-surface-variant); line-height: 1.35; }
+.ag-tpl-form { border: 1px solid var(--primary); border-radius: var(--r); background: var(--surface-container); padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+.ag-tpl-form[hidden] { display: none; }
+.ag-tpl-hd { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+.ag-tpl-title { font-family: var(--font-display); font-size: 13px; font-weight: 600; color: var(--primary); }
+.ag-tpl-fields { display: flex; flex-direction: column; gap: 6px; }
+.ag-tpl-field { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--on-surface-variant); }
+.ag-tpl-field.chk { flex-direction: row; align-items: center; gap: 6px; color: var(--on-surface); cursor: pointer; }
+.ag-tpl-field input[type="text"], .ag-tpl-field input[type="number"], .ag-tpl-field select { padding: 6px 8px; font-size: 12px; }
+.ag-tpl-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-top: 2px; }
+
+@media (forced-colors: active) {
+  .card, .mrow, .rail-vitals, .btn, .tag, .pill, dialog, .cmdbox, .log, .agent-drawer { border: 1px solid CanvasText; }
+  .nav button.on, .segs button.on, .mrow.run, .citem.on, .pal-item.sel { outline: 2px solid Highlight; }
+  .meter i { forced-color-adjust: none; background: Highlight; }
 }
 </style></head>
 <body>
 <a class="skip" href="#main">Skip to content</a>
-<header>
-  <div class="brand">
-    <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
-    <span class="nm">Inference Console<span class="sub">local inference console</span></span>
+<div class="rail-backdrop" id="railbackdrop"></div>
+<div class="shell">
+<aside class="rail" id="rail" aria-label="Primary navigation">
+  <div class="rail-top">
+    <div class="brand">
+      <span class="mark" aria-hidden="true"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M13.2 2 4 14h6l-1.4 8L20 9.5h-6.2z"/></svg></span>
+      <span class="nm">Inference Console<span class="sub">local model workbench</span></span>
+    </div>
   </div>
   <nav class="nav" id="nav" aria-label="Sections">
-    <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg>Models</button>
-    <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg>llama.cpp</button>
-    <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg>Strata</button>
-    <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg>Avalon</button>
-    <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg>Vitals</button>
-    <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg>Chat</button>
-    <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg>HF Pull</button>
-    <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg>Settings</button>
+    <div class="nav-grp">
+      <div class="nav-lbl">Workspace</div>
+      <button data-t="models" class="on"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7c0-1.7 3.6-3 8-3s8 1.3 8 3-3.6 3-8 3-8-1.3-8-3z"/><path d="M4 7v10c0 1.7 3.6 3 8 3s8-1.3 8-3V7"/><path d="M4 12c0 1.7 3.6 3 8 3s8-1.3 8-3"/></svg><span class="nl">Models</span><span class="nb" id="nb-models">0</span></button>
+      <button data-t="agent"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/><circle cx="9.5" cy="13" r="1"/><circle cx="14.5" cy="13" r="1"/></svg><span class="nl">Agent</span></button>
+      <button data-t="chat"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M21 12a8 8 0 01-8 8H7l-4 3 1.2-4.2A8 8 0 1121 12z"/></svg><span class="nl">Chat</span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">Engines</div>
+      <button data-t="server"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="4" width="18" height="7" rx="2"/><rect x="3" y="13" width="18" height="7" rx="2"/><path d="M7 7.5h.01M7 16.5h.01"/></svg><span class="nl">llama.cpp</span><span class="ndot" id="nd-server" title="llama.cpp status"></span></button>
+      <button data-t="strata"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2l9 5-9 5-9-5 9-5z"/><path d="M3 12l9 5 9-5"/><path d="M3 17l9 5 9-5"/></svg><span class="nl">Strata</span><span class="ndot" id="nd-strata" title="Strata status"></span></button>
+      <button data-t="avalon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg><span class="nl">Avalon</span><span class="ndot" id="nd-avalon" title="Avalon status"></span></button>
+      <button data-t="maya"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2L4 7v10l8 5 8-5V7l-8-5z"/><circle cx="12" cy="12" r="3"/></svg><span class="nl">Maya</span><span class="ndot" id="nd-maya" title="Maya status"></span></button>
+    </div>
+    <div class="nav-grp">
+      <div class="nav-lbl">System</div>
+      <button data-t="vitals"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 12h4l2.5-6 4 12L16 12h5"/></svg><span class="nl">Vitals</span></button>
+      <button data-t="hf"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 3v12m0 0l-4-4m4 4l4-4"/><path d="M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2"/></svg><span class="nl">HF Pull</span><span class="nb hide" id="nb-dl">0</span></button>
+      <button data-t="settings"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 01-2.83 2.83l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-4 0v-.09a1.65 1.65 0 00-1-1.51 1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06a1.65 1.65 0 00.33-1.82 1.65 1.65 0 00-1.51-1H3a2 2 0 010-4h.09a1.65 1.65 0 001.51-1 1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06a1.65 1.65 0 001.82.33h.08a1.65 1.65 0 001-1.51V3a2 2 0 014 0v.09a1.65 1.65 0 001 1.51h.08a1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06a1.65 1.65 0 00-.33 1.82v.08a1.65 1.65 0 001.51 1H21a2 2 0 010 4h-.09a1.65 1.65 0 00-1.51 1z"/></svg><span class="nl">Settings</span></button>
+    </div>
   </nav>
+  <div class="rail-foot">
+    <div class="rail-vitals" id="railvitals" title="Click to open System Vitals">
+      <div class="rv-row"><span id="rv-mem-lbl">Memory</span><span id="rv-mem-val">…</span></div>
+      <div class="meter" id="rv-mem-bar" style="margin:4px 0 6px"><i style="width:0%"></i></div>
+      <div class="rv-row"><span>CPU</span><span id="rv-cpu-val">…</span></div>
+    </div>
+  </div>
+</aside>
+
+<div class="work">
+<header class="topbar">
+  <button class="icon mob-menu" id="mobmenu" aria-label="Toggle navigation"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
+  <span class="view-title" id="viewtitle">Models</span>
   <span class="hgap"></span>
   <div class="tele-strip">
-    <span class="pill" id="hdrstatus" title="Active inference server"><span class="dot"></span><span id="hdrtext">checking…</span></span>
+    <button type="button" class="pill" id="hdrstatus" title="Active inference server (click to inspect)"><span class="dot"></span><span id="hdrtext">checking…</span></button>
     <span class="tag acc hide" id="hdrtps" title="Live generation throughput"></span>
     <span class="tag mut hide" id="hdrkv" title="KV cache fill"></span>
     <span class="tag mut hide" id="hdridle" title="Idle auto-unload timer"></span>
@@ -4323,6 +6565,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <input type="checkbox" switch id="hdrhost">
     <span id="hdrhostlbl">0.0.0.0</span>
   </label>
+  <button class="cmdbtn" id="agentdrawerbtn" title="Toggle Optimization Agent Chat Sidebar" aria-label="Toggle Agent Chat Sidebar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 2a4 4 0 014 4v1h2a2 2 0 012 2v6a5 5 0 01-5 5H9a5 5 0 01-5-5V9a2 2 0 012-2h2V6a4 4 0 014-4z"/></svg>
+    <span>Agent</span>
+  </button>
   <button class="cmdbtn" id="cmdbtn" title="Command palette (Ctrl+K or Cmd+K)" aria-label="Open command palette">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
     <kbd>⌘K</kbd>
@@ -4392,6 +6638,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
       <button class="btn danger" id="srvstop">Stop server</button>
       <button class="btn" id="srvtune">Tune active model…</button>
+      <button class="btn acc2" data-agent-quick="llama:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="llama:diagnose">Diagnose failure</button>
       <button class="btn" id="agentsbtn">Register in coding agents…</button>
       <label class="host-toggle" id="srvhostwrap" title="Bind model servers to 0.0.0.0 (all interfaces / LAN)">
         <input type="checkbox" switch id="srvhost">
@@ -4477,6 +6725,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn danger" id="stratastopbtn" disabled>Stop</button>
       <button class="btn" id="stratadoctor">Run doctor</button>
       <button class="btn" id="strataupdate">Check update</button>
+      <button class="btn acc2" data-agent-quick="strata:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="strata:diagnose">Diagnose</button>
       <button class="btn" id="strataagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at the running Strata server">Register in coding agents…</button>
       <label class="host-toggle" id="stratahostwrap" title="Default Strata launches to --access lan (0.0.0.0)">
         <input type="checkbox" switch id="stratahost">
@@ -4487,9 +6737,9 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 
   <div class="card hide" id="strataformcard" style="margin-top:14px">
-    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed — Strata defaults stay in charge</span></div>
+    <div class="hd"><h2>Launch configuration</h2><span class="tag mut">only filled fields are passed, Strata defaults stay in charge</span></div>
     <div class="form-grid">
-      <div class="field"><label>Preset</label><select id="st-preset"><option value="">— none —</option></select></div>
+      <div class="field"><label>Preset</label><select id="st-preset"><option value="">(none)</option></select></div>
       <div class="field"><label>Family</label><select id="st-family"><option value="">auto</option><option value="qwen">qwen (Flash-Next)</option><option value="coder">coder</option><option value="unsloth">unsloth</option><option value="gyro">gyro</option><option value="swift">swift</option><option value="nvfp4">nvfp4</option><option value="qwen36">qwen36 (35B)</option></select></div>
       <div class="field"><label>Model / quant</label><input id="st-model" type="text" placeholder="e.g. iq3_xxs, q2_0, UD-Q4_K_XL"></div>
       <div class="field"><label>Model path (files I already have)</label><input id="st-modelpath" type="text" placeholder="/path/to/model folder or .gguf"></div>
@@ -4533,8 +6783,19 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <div id="st-presets" class="kvs"></div>
   </div>
 
+  <div class="card hide" id="stratametricscard" style="margin-top:14px">
+    <div class="hd"><h2>Strata live metrics</h2><span class="tag acc" id="st-metrics-chip">polling</span></div>
+    <div id="st-metrics" class="kvs"></div>
+  </div>
+
   <div class="card" style="margin-top:14px">
-    <div class="hd"><h2>Strata log</h2></div>
+    <div class="hd"><h2>Strata log</h2><span class="tag mut" id="stlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="stlogfilter" type="search" placeholder="Filter Strata log…" aria-label="Filter Strata log"></div>
+      <label class="switch"><input type="checkbox" id="stlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="stlogcopy">Copy</button>
+    </div>
     <pre class="log" id="stratalog" style="max-height:280px"></pre>
   </div>
 </section>
@@ -4554,6 +6815,8 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn primary" id="avalonstart">Start selected profile</button>
       <button class="btn danger" id="avalonstop">Stop</button>
       <button class="btn acc2" id="avalontunebtn">Config Optimizer &amp; Tuning…</button>
+      <button class="btn acc2" data-agent-quick="avalon:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="avalon:diagnose">Diagnose</button>
       <button class="btn" id="avalonagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at this Avalon server">Register in coding agents…</button>
       <span class="hint">OpenAI-compatible · streams <code>reasoning_content</code></span>
     </div>
@@ -4584,25 +6847,25 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <select id="av-np"><option value="0">Profile default (1)</option><option value="1">1 slot</option><option value="2">2 slots</option><option value="4">4 slots</option></select></div>
         <div class="field"><label>GPU device (--device)</label>
           <select id="av-device">
-            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB) — recommended</option>
+            <option value="ROCm0">ROCm0 · RX 7900 XT eGPU (20 GB, recommended)</option>
             <option value="ROCm1">ROCm1 · 780M iGPU (32 GB GTT, shares system RAM)</option>
             <option value="ROCm0,ROCm1">ROCm0 + ROCm1 split</option>
           </select>
-          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build — any launch that touches it dies with “invalid device function”.</div></div>
+          <div class="hint">ROCm0 only. The iGPU has no FA kernels in this ROCm build, so any launch that touches it dies with “invalid device function”.</div></div>
         <div class="field"><label>GPU layers (-ngl) · empty = auto-fit</label>
           <input id="av-ngl" type="number" placeholder="auto-fit (-fit on)" min="0" max="999">
-          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM — this 88 GiB pack (40 dense + 48 expert + ~10 KV at 262k) never does.</div></div>
+          <div class="hint">Recommended: leave empty. The fork’s <code>-fit</code> measures dense weights + KV + buffers against device memory and places what fits. A fixed <code>-ngl 99</code> only works when the whole model fits in VRAM.</div></div>
         <div class="field"><label>MoE experts in CPU RAM (--n-cpu-moe)</label>
           <input id="av-cmoe" type="number" placeholder="fork default (none forced)" min="0" max="999">
-          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM — forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
+          <div class="hint">Recommended: 999 for this pack. Expert weights are 48 GiB vs 20 GB VRAM; forcing them to CPU lets <code>-fit</code> keep attention + KV on the eGPU. Empty = fork decides.</div></div>
         <div class="field"><label>Flash Attention (-fa)</label>
-          <select id="av-fa"><option value="">default (on)</option><option value="on">on — recommended on ROCm0</option><option value="off">off</option></select>
+          <select id="av-fa"><option value="">default (on)</option><option value="on">on (recommended on ROCm0)</option><option value="off">off</option></select>
           <div class="hint">On cuts KV memory and speeds prefill on NAVI31. Only relevant if you force the iGPU, which lacks the kernels anyway.</div></div>
         <div class="field"><label>CPU threads (-t)</label>
           <input id="av-threads" type="number" placeholder="fork default (all cores)" min="1" max="256">
-          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box) — SMT threads add contention, not throughput.</div></div>
+          <div class="hint">Threads for layers that stay on CPU. Recommended: physical cores (8 on this box), since SMT threads add contention.</div></div>
         <div class="field"><label>Lock weights in RAM (--mlock)</label>
-          <select id="av-mlock"><option value="">off — recommended</option><option value="on">on</option></select>
+          <select id="av-mlock"><option value="">off (recommended)</option><option value="on">on</option></select>
           <div class="hint">With 48 GiB of experts, mlock would pin them resident and OOM this 61 GB machine. Leave off; the page cache does the job.</div></div>
       </div>
       <div style="margin-top:10px">
@@ -4625,7 +6888,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <input id="avsnapname" type="text" placeholder="name this launch…" style="width:220px">
         <button class="btn sm" id="avsnapsave">Save current</button>
       </div></div>
-    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile + every tuning field exactly as resolved right now, and relaunches with one click — same command line, no re-tuning.</div>
+    <div class="hint" style="margin-bottom:8px">A snapshot freezes the profile and every tuning field exactly as resolved right now, and relaunches with one click using the same command line.</div>
     <div id="avsnaps"></div>
   </div>
 
@@ -4634,7 +6897,323 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN (0.0.0.0)</span></label></div>
     <div id="avalonaccess" class="kvs"></div>
   </div>
-  <div class="card"><div class="hd"><h2>Avalon log</h2></div><pre class="log" id="avalonlog" style="max-height:280px"></pre></div>
+  <div class="card">
+    <div class="hd"><h2>Avalon log</h2><span class="tag mut" id="avlogn"></span></div>
+    <div class="logbar">
+      <div class="search" style="flex:1"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+        <input id="avlogfilter" type="search" placeholder="Filter Avalon log…" aria-label="Filter Avalon log"></div>
+      <label class="switch"><input type="checkbox" id="avlogauto" checked><span class="track"></span><span class="hint">Follow</span></label>
+      <button class="btn sm" id="avlogcopy">Copy</button>
+    </div>
+    <pre class="log" id="avalonlog" style="max-height:280px"></pre>
+  </div>
+</section>
+
+<!-- ==================== MAYA ==================== -->
+<section id="t-maya" class="hide">
+  <div class="card">
+    <div class="hd"><h2>Project Maya</h2><span class="tag mut" id="mayachip">checking…</span></div>
+    <div id="mayadetail" class="kvs" style="margin-bottom:10px"></div>
+
+    <div class="grid g4" style="margin-bottom:12px">
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Decode speed</h2><span class="tag mut" id="m-state-tag">idle</span></div>
+        <div class="stat"><span id="m-dec-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-dec-sub">Waiting for log telemetry</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Prefill speed</h2></div>
+        <div class="stat"><span id="m-pre-tps">—</span> <small>tok/s</small></div>
+        <p class="hint" style="margin:4px 0 0">Prompt processing rate</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>VRAM &amp; Experts</h2></div>
+        <div class="stat"><span id="m-vram">—</span> <small>GB</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-exp-sub">Experts in VRAM: —</p>
+      </div>
+      <div class="card sub" style="margin:0">
+        <div class="hd" style="margin-bottom:4px"><h2>Context &amp; Load</h2></div>
+        <div class="stat"><span id="m-ctx">—</span> <small>ctx</small></div>
+        <p class="hint" style="margin:4px 0 0" id="m-load-sub">Load / warmup: —</p>
+      </div>
+    </div>
+
+    <div id="mayaconfigs"></div>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="mayastart">Start selected</button>
+      <button class="btn acc2" id="mayaswitch" title="Stop the running Maya config and start the selected one">Switch to selected</button>
+      <button class="btn danger" id="mayastop">Stop</button>
+      <button class="btn acc2" data-agent-quick="maya:tune">Agent Auto-Tune</button>
+      <button class="btn" data-agent-quick="maya:diagnose">Diagnose</button>
+      <button class="btn" id="mayaagentsbtn" title="Point coding agents at this Maya server">Register in coding agents…</button>
+      <button class="btn sm" id="mayakeybtn" title="Reveal masked API key for the active Maya config">Reveal API key</button>
+      <span class="hint">OpenAI &amp; Anthropic API · exclusive GPU · <code>ROCM_PATH</code> managed automatically</span>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2>Maya engine log</h2>
+      <div class="meta">
+        <span class="hint mono" id="mayalogpath"></span>
+        <button class="btn sm" id="mayalogref">Refresh</button>
+      </div>
+    </div>
+    <pre class="log" id="mayalog" style="max-height:300px"></pre>
+  </div>
+</section>
+
+<!-- ==================== AGENT / OPTIMIZER ==================== -->
+<section id="t-agent" class="hide">
+  <div class="card">
+    <div class="hd">
+      <h2>Engine Optimization Agent</h2>
+      <div class="meta">
+        <span class="tag mut" id="ag-llm-chip">deterministic</span>
+        <span class="tag mut" id="ag-tune-chip">idle</span>
+        <button class="btn sm" id="ag-open-sidebar">Open Chat Sidebar</button>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 12px">MoE-aware, doc-grounded optimizer across llama.cpp, Avalon, Strata, and Project Maya. Every Apply or Auto-Tune run automatically creates a safety checkpoint first so you can revert at any time.</p>
+    <div class="form-grid">
+      <div class="field">
+        <label>Target engine</label>
+        <select id="ag-engine">
+          <option value="llama">llama.cpp</option>
+          <option value="avalon">Avalon</option>
+          <option value="strata">Strata</option>
+          <option value="maya">Project Maya</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>Optimization goal</label>
+        <select id="ag-goal">
+          <option value="fastest">Fastest (max gen tok/s)</option>
+          <option value="low_latency">Lowest latency (min TTFT / prefill)</option>
+          <option value="max_context">Longest stable context</option>
+          <option value="balanced" selected>Balanced</option>
+          <option value="low_vram">Low VRAM / cool</option>
+          <option value="multi_user">Multi-user / parallel slots</option>
+        </select>
+      </div>
+      <div class="field" id="ag-model-wrap">
+        <label>Model / profile</label>
+        <select id="ag-model"><option value="">(auto-select active / pinned)</option></select>
+      </div>
+      <div class="field">
+        <label>Min context constraint (optional)</label>
+        <input id="ag-minctx" type="number" min="0" step="4096" placeholder="e.g. 32768">
+      </div>
+      <div class="field">
+        <label>Extra VRAM headroom MB (optional)</label>
+        <input id="ag-headroom" type="number" min="0" step="512" placeholder="e.g. 4096">
+      </div>
+      <div class="field">
+        <label>Max auto-tune trials</label>
+        <input id="ag-trials" type="number" min="1" max="12" value="5">
+      </div>
+      <div class="field" style="grid-column:1 / -1">
+        <label>Custom preference / constraint (natural language — works deterministically + with optional LLM)</label>
+        <input id="ag-prompt" type="text" placeholder="e.g. longest context with at least 64k tokens and leave 4 GB VRAM free">
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
+      <button class="btn primary" id="ag-advise">Dry-Run Advise</button>
+      <button class="btn acc2" id="ag-tune-start">Start Active Auto-Tune</button>
+      <button class="btn" id="ag-diagnose">Diagnose Engine Failure</button>
+      <button class="btn" id="ag-cp-now">Create Checkpoint</button>
+    </div>
+  </div>
+
+  <!-- Agent LLM Provider (Hermes-style presets + Custom OpenAI-compatible + Always-On Model Polling) -->
+  <div class="card">
+    <div class="hd">
+      <h2>Agent LLM Provider</h2>
+      <div class="meta">
+        <span class="tag mut" id="ag-prov-models-chip">models: —</span>
+        <button class="btn xs" id="ag-prov-poll">Poll Models</button>
+        <button class="btn xs" id="ag-prov-test">Test Connection</button>
+        <button class="btn primary xs" id="ag-prov-save">Save Provider</button>
+      </div>
+    </div>
+    <p class="hint" style="margin:0 0 10px">Choose any common provider (OpenAI, Anthropic, OpenRouter, Gemini, DeepSeek, xAI, Groq, Together, Fireworks, Mistral, Moonshot/Kimi, Z.ai, Nous/Hermes, Ollama, LM Studio, vLLM) or a custom OpenAI-compatible URL. Models are polled automatically.</p>
+    <div class="form-grid">
+      <div class="field">
+        <label>Provider</label>
+        <select id="ag-prov-select"></select>
+      </div>
+      <div class="field">
+        <label>Base URL (editable for custom providers)</label>
+        <input id="ag-prov-url" type="text" placeholder="https://api.example.com/v1">
+      </div>
+      <div class="field">
+        <label>API Key <span id="ag-prov-key-status"></span></label>
+        <input id="ag-prov-key" type="password" placeholder="(leave blank to keep existing; type 'clear' to remove)">
+      </div>
+      <div class="field">
+        <label>Model (auto-polled or type custom ID)</label>
+        <div style="display:flex;gap:6px">
+          <input id="ag-prov-model" type="text" list="ag-prov-models-dl" placeholder="select or type model id" style="flex:1">
+          <select id="ag-prov-model-pick" aria-label="Polled models" style="max-width:48%"><option value="">— polled models —</option></select>
+        </div>
+        <datalist id="ag-prov-models-dl"></datalist>
+      </div>
+      <div class="field">
+        <label>Custom Headers JSON (optional)</label>
+        <input id="ag-prov-headers" type="text" placeholder='e.g. {"HTTP-Referer":"https://localhost"}'>
+      </div>
+      <div class="field" style="justify-content:center">
+        <label class="switch"><input type="checkbox" id="ag-prov-fallback" checked><span class="track"></span><span class="hint">Fall back to active local engine when external LLM is unset</span></label>
+      </div>
+    </div>
+    <div id="ag-prov-msg" class="hint" style="margin-top:8px"></div>
+  </div>
+
+  <div class="card hide" id="ag-result-card">
+    <div class="hd">
+      <h2 id="ag-result-title">Recommendation</h2>
+      <div class="meta">
+        <button class="btn primary sm hide" id="ag-apply-btn">Checkpoint, Apply &amp; Launch</button>
+        <button class="btn sm hide" id="ag-save-preset-btn">Save as Preset</button>
+      </div>
+    </div>
+    <div id="ag-result-moe" class="kvs" style="margin-bottom:8px"></div>
+    <div id="ag-result-notes" style="margin-bottom:10px;font-size:12.5px;line-height:1.5"></div>
+    <pre class="cmdbox" id="ag-result-cfg" style="white-space:pre-wrap;max-height:240px;overflow:auto"></pre>
+  </div>
+
+  <div class="card hide" id="ag-tune-card">
+    <div class="hd">
+      <h2>Active Auto-Tune Session</h2>
+      <div class="meta">
+        <span class="tag acc" id="ag-tune-state">running</span>
+        <button class="btn danger sm" id="ag-tune-stop">Stop</button>
+        <button class="btn danger sm" id="ag-tune-rollback">Stop &amp; Rollback</button>
+      </div>
+    </div>
+    <div id="ag-tune-trials" style="margin-bottom:10px"></div>
+    <pre class="log" id="ag-tune-log" style="max-height:200px"></pre>
+  </div>
+
+  <div class="grid">
+    <div class="card">
+      <div class="hd">
+        <h2>Safety Checkpoints</h2>
+        <button class="btn xs" id="ag-cp-refresh">Refresh</button>
+      </div>
+      <div id="ag-checkpoints"><span class="hint">No checkpoints yet.</span></div>
+    </div>
+    <div class="card">
+      <div class="hd">
+        <h2>Reusable Presets</h2>
+        <button class="btn xs" id="ag-pre-refresh">Refresh</button>
+      </div>
+      <div id="ag-presets"><span class="hint">Loading presets…</span></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="hd">
+      <h2>Persistent Memory &amp; VRAM Calibration</h2>
+      <div class="meta">
+        <button class="btn xs" id="ag-mem-refresh">Refresh</button>
+        <button class="btn xs danger" id="ag-mem-clear">Clear Memory</button>
+      </div>
+    </div>
+    <div id="ag-memory"><span class="hint">No empirical trials recorded yet.</span></div>
+  </div>
+
+  <!-- Phase 2: Workload Router & Speculative Decoding -->
+  <div class="grid">
+    <div class="card">
+      <div class="hd"><h2>Workload Router &amp; Coding-Agent Sync</h2></div>
+      <p class="hint" style="margin:0 0 10px">Pick a workload — the agent selects the best local model + engine + config (MoE-aware &amp; memory-backed) and can sync coding agents automatically.</p>
+      <div class="form-grid">
+        <div class="field">
+          <label>Workload / Task</label>
+          <select id="ag-route-task">
+            <option value="coding">Coding Agent (≥32k ctx, fast)</option>
+            <option value="long_doc">Long-Doc Analysis (max context)</option>
+            <option value="fast_chat">Fast Chat (low latency / TTFT)</option>
+            <option value="vision">Vision (mmproj)</option>
+            <option value="reasoning">Deep Reasoning / Large MoE</option>
+          </select>
+        </div>
+        <div class="field" style="justify-content:center">
+          <label class="switch"><input type="checkbox" id="ag-route-sync" checked><span class="track"></span><span class="hint">Auto-sync coding agents (omp, claude-code, codex, aider…)</span></label>
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn" id="ag-route-preview">Preview Selection</button>
+        <button class="btn primary" id="ag-route-apply">Launch &amp; Sync</button>
+      </div>
+      <div id="ag-route-out" style="margin-top:10px;font-size:12.5px"></div>
+    </div>
+
+    <div class="card">
+      <div class="hd"><h2>Speculative Decoding Auto-Pairing</h2></div>
+      <p class="hint" style="margin:0 0 10px">Benchmarks baseline (no draft) vs candidate draft/MTP models in your library and disables speculation automatically if overhead hurts net tok/s.</p>
+      <div class="field">
+        <label>Target model (llama.cpp)</label>
+        <select id="ag-spec-model"><option value="">(auto-select active / pinned)</option></select>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px">
+        <button class="btn acc2" id="ag-spec-run">Auto-Pair &amp; Benchmark Drafts</button>
+      </div>
+      <div id="ag-spec-out" style="margin-top:10px;font-size:12.5px"></div>
+    </div>
+  </div>
+
+  <!-- Phase 2: Graduated Thermal & Shared-GPU Guard -->
+  <div class="card">
+    <div class="hd">
+      <h2>Graduated Thermal &amp; Shared-GPU Guard</h2>
+      <div class="meta">
+        <span class="tag mut" id="tg-state-chip">normal</span>
+        <button class="btn xs" id="tg-eval-now">Evaluate Now</button>
+      </div>
+    </div>
+    <p class="hint" id="tg-hw-hint" style="margin:0 0 10px">Ladder: (1) Ramp GPU fans to 100% &amp; throttle power cap → (2) Checkpoint &amp; downshift to low-VRAM profile → (3) Emergency killswitch. Auto-restores fans &amp; power once cool.</p>
+    <div class="form-grid">
+      <div class="field"><label>Warn / Fan+Power (°C)</label><input id="tg-warn" type="number" value="80"></div>
+      <div class="field"><label>Downshift (°C)</label><input id="tg-throttle" type="number" value="88"></div>
+      <div class="field"><label>Killswitch (°C)</label><input id="tg-kill" type="number" value="95"></div>
+      <div class="field"><label>Cool / Auto-Restore (°C)</label><input id="tg-cool" type="number" value="70"></div>
+      <div class="field"><label>Power Throttle (%)</label><input id="tg-pwrpct" type="number" value="15" min="5" max="40"></div>
+      <div class="field"><label>VRAM Pressure (%)</label><input id="tg-vrampct" type="number" value="92" min="60" max="99"></div>
+    </div>
+    <div style="display:flex;gap:14px;flex-wrap:wrap;margin:10px 0;align-items:center">
+      <label class="switch"><input type="checkbox" id="tg-enabled"><span class="track"></span><span class="hint">Enable background watchdog</span></label>
+      <label class="switch"><input type="checkbox" id="tg-autoact"><span class="track"></span><span class="hint">Auto-execute ladder actions</span></label>
+      <button class="btn primary sm" id="tg-save">Save Guard Policy</button>
+    </div>
+    <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+      <button class="btn xs" data-tg-act="max_fans">Max Fans</button>
+      <button class="btn xs" data-tg-act="throttle_power">Throttle Power</button>
+      <button class="btn xs" data-tg-act="restore_hw">Restore Auto Fan/Power</button>
+      <button class="btn xs" data-tg-act="downshift">Downshift Profile</button>
+      <button class="btn xs danger" data-tg-act="killswitch">Emergency Killswitch</button>
+    </div>
+    <div id="tg-events" class="hint"></div>
+  </div>
+
+  <!-- Phase 2: Hardware-Aware HF Model / Quant Recommender -->
+  <div class="card">
+    <div class="hd"><h2>Hardware-Aware Hugging Face Recommender</h2></div>
+    <p class="hint" style="margin:0 0 10px">Searches HF GGUF repos and scores quants against your real VRAM + RAM with MoE-aware hybrid placement (pairs matching mmproj/draft files automatically).</p>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <input id="ag-hf-q" type="text" placeholder="e.g. Qwen3-Coder, DeepSeek, Llama-3.3, Gemma-3…" style="flex:1;min-width:220px">
+      <select id="ag-hf-goal">
+        <option value="balanced">Balanced</option>
+        <option value="fastest">Fastest (Full GPU)</option>
+        <option value="max_context">Max Context</option>
+        <option value="low_vram">Low VRAM</option>
+      </select>
+      <button class="btn primary" id="ag-hf-go">Recommend Quants</button>
+    </div>
+    <div id="ag-hf-out" style="margin-top:10px"></div>
+  </div>
 </section>
 
 <!-- ==================== VITALS ==================== -->
@@ -4667,7 +7246,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       </div>
       <div id="sysbox" class="card sub hide">
         <div class="field" style="margin-bottom:10px">
-          <label>System Prompt</label>
+          <label>System Prompt <button type="button" class="btn xs" id="sp-reset">Reset defaults</button></label>
           <textarea id="sysprompt" rows="2" style="width:100%"></textarea>
         </div>
         <div class="form-grid">
@@ -4689,43 +7268,54 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <button class="btn danger" id="stopbtn" style="display:none">Stop</button>
         <button class="btn primary" id="sendbtn">Send</button>
       </div>
-      <p class="hint" style="margin:8px 2px 0" id="chatnote"></p>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin:7px 2px 0">
+        <span class="hint" id="chatnote"></span>
+        <span class="hint mono" id="chatcount"></span>
+      </div>
     </div>
   </div>
 </section>
 
 <!-- ==================== HF PULL ==================== -->
 <section id="t-hf" class="hide">
-  <div class="card">
-    <div class="hd"><h2>Search Hugging Face GGUF</h2><span class="tag mut" id="hfinfo"></span></div>
-    <div style="display:flex;gap:8px;flex-wrap:wrap">
-      <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-        <input id="hfq" type="search" placeholder="Search GGUF repositories (e.g. Qwen3, Llama-3.3, Gemma-3)… press Enter" aria-label="Search Hugging Face"></div>
-      <button class="btn primary" id="hfsearch">Search</button>
+  <div class="hf-shell">
+    <div>
+      <div class="card">
+        <div class="hd"><h2>Search Hugging Face GGUF</h2><span class="tag mut" id="hfinfo"></span></div>
+        <div style="display:flex;gap:8px;flex-wrap:wrap">
+          <div class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+            <input id="hfq" type="search" placeholder="Search GGUF repositories (e.g. Qwen3, Llama-3.3, Gemma-3)… press Enter" aria-label="Search Hugging Face"></div>
+          <button class="btn primary" id="hfsearch">Search</button>
+        </div>
+        <div id="hfresults" style="margin-top:12px"></div>
+      </div>
+      <div class="card hide" id="hffilesbox">
+        <div class="hd"><h2 id="hfrepo"></h2><div class="meta"><span class="tag mut" id="hftotal"></span>
+          <button class="btn sm" id="hfnone">Clear</button></div></div>
+        <div id="hffiles"></div>
+        <button class="btn primary" id="hfpull" style="margin-top:12px">Pull selected (resumable)</button>
+      </div>
     </div>
-    <div id="hfresults" style="margin-top:10px"></div>
+    <aside class="card rail-sticky" aria-label="Downloads queue">
+      <div class="hd"><h2>Downloads queue</h2><span class="tag mut" id="dlinfo"></span></div>
+      <div id="downloads"><span class="hint">No downloads queued. Partial <code>.part</code> files automatically resume where they left off.</span></div>
+    </aside>
   </div>
-  <div class="card hide" id="hffilesbox">
-    <div class="hd"><h2 id="hfrepo"></h2><div class="meta"><span class="tag mut" id="hftotal"></span>
-      <button class="btn sm" id="hfnone">Clear</button></div></div>
-    <div id="hffiles"></div>
-    <button class="btn primary" id="hfpull" style="margin-top:10px">Pull selected (resumable)</button>
-  </div>
-  <div class="card"><div class="hd"><h2>Downloads queue</h2><span class="tag mut" id="dlinfo"></span></div>
-    <div id="downloads"><span class="hint">No downloads queued. Partial <code>.part</code> files automatically resume where they left off.</span></div></div>
 </section>
 
 <!-- ==================== SETTINGS ==================== -->
 <section id="t-settings" class="hide">
-  <div class="card" style="margin-bottom:14px">
+  <div class="card" style="margin-bottom:16px">
     <div class="hd"><h2>Engine setup</h2><span class="tag mut" id="setupjobchip">idle</span></div>
-    <p class="hint" style="margin:0 0 10px">One-click installs pull official upstream artifacts (llama.cpp GitHub releases, the official Strata installer). Avalon builds from your local source tree. Each action asks for confirmation and streams its log below.</p>
+    <p class="hint" style="margin:0 0 12px">One-click installs pull official upstream artifacts (llama.cpp GitHub releases, the official Strata installer). Avalon builds from your local source tree. Each action asks for confirmation and streams its log below.</p>
     <div class="form-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
-      <div class="field">
-        <label>llama.cpp <span id="setup-llama-chip" class="tag mut">checking…</span></label>
-        <div class="kvs" id="setup-llama-detail" style="margin-bottom:6px"></div>
-        <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
-          <select id="setup-llama-variant" style="width:130px">
+      <div class="setup-card">
+        <div class="field">
+          <label>llama.cpp <span id="setup-llama-chip" class="tag mut">checking…</span></label>
+          <div class="kvs" id="setup-llama-detail" style="margin-top:4px"></div>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <select id="setup-llama-variant" style="width:136px">
             <option value="auto">auto backend</option>
             <option value="cpu">cpu only</option>
             <option value="vulkan">vulkan</option>
@@ -4734,18 +7324,22 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
           <button class="btn primary sm" id="setup-llama-btn">Install latest</button>
         </div>
       </div>
-      <div class="field">
-        <label>Strata <span id="setup-strata-chip" class="tag mut">checking…</span></label>
-        <div class="kvs" id="setup-strata-detail" style="margin-bottom:6px"></div>
-        <button class="btn primary sm" id="setup-strata-btn">Install (official installer)</button>
+      <div class="setup-card">
+        <div class="field">
+          <label>Strata <span id="setup-strata-chip" class="tag mut">checking…</span></label>
+          <div class="kvs" id="setup-strata-detail" style="margin-top:4px"></div>
+        </div>
+        <div><button class="btn primary sm" id="setup-strata-btn">Install (official installer)</button></div>
       </div>
-      <div class="field">
-        <label>Avalon <span id="setup-avalon-chip" class="tag mut">checking…</span></label>
-        <div class="kvs" id="setup-avalon-detail" style="margin-bottom:6px"></div>
-        <button class="btn sm" id="setup-avalon-btn">Build from source</button>
+      <div class="setup-card">
+        <div class="field">
+          <label>Avalon <span id="setup-avalon-chip" class="tag mut">checking…</span></label>
+          <div class="kvs" id="setup-avalon-detail" style="margin-top:4px"></div>
+        </div>
+        <div><button class="btn sm" id="setup-avalon-btn">Build from source</button></div>
       </div>
     </div>
-    <pre class="log hide" id="setuplog" style="max-height:220px;margin-top:10px"></pre>
+    <pre class="log hide" id="setuplog" style="max-height:220px;margin-top:12px"></pre>
   </div>
   <div class="card">
     <div class="hd"><h2>Panel &amp; Runtime Settings</h2><span class="tag mut" id="set-caps-badge"></span></div>
@@ -4801,19 +7395,102 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
         <label>Strata API key override (only if you manage the key yourself) <span id="set-stratakey-status"></span></label>
         <input id="set-stratakey" type="password" placeholder="(leave blank to keep existing)">
       </div>
+      <div class="field" style="grid-column:1 / -1;border-top:1px solid var(--bd);padding-top:10px;margin-top:4px">
+        <label style="font-weight:650">Optimization Agent · Optional OpenAI-Compatible LLM</label>
+        <span class="hint">Leave blank to run purely deterministically (or fall back to the active local model for dry-run advice).</span>
+      </div>
+      <div class="field">
+        <label>Agent LLM Base URL</label>
+        <input id="set-agenturl" type="text" placeholder="e.g. https://api.openai.com/v1 or http://127.0.0.1:11434/v1">
+      </div>
+      <div class="field">
+        <label>Agent LLM Model</label>
+        <input id="set-agentmodel" type="text" placeholder="e.g. gpt-4o-mini, claude-3-5-sonnet, qwen3-14b">
+      </div>
+      <div class="field">
+        <label>Agent LLM API Key <span id="set-agentkey-status"></span></label>
+        <input id="set-agentkey" type="password" placeholder="(leave blank to keep existing; type 'clear' to remove)">
+      </div>
+      <div class="field" style="justify-content:center">
+        <label class="switch"><input type="checkbox" id="set-agentfallback" checked><span class="track"></span><span class="hint">Fall back to active local engine when external LLM is unset</span></label>
+      </div>
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:14px">
       <button class="btn" id="set-reload">Reload</button>
       <button class="btn primary" id="set-save">Save settings</button>
     </div>
   </div>
+  <div class="card">
+    <div class="hd"><h2>Panel process</h2><span class="tag mut" id="panel-proc-chip">—</span></div>
+    <div class="hint" style="margin-bottom:10px">Restart re-execs the panel in place. Running llama-server, Avalon, and Strata processes keep serving, and this tab reconnects on its own.</div>
+    <div style="display:flex;gap:8px;align-items:center;justify-content:space-between;flex-wrap:wrap">
+      <span class="hint mono" id="panel-proc-detail"></span>
+      <button class="btn danger" id="panelrestart">Restart panel</button>
+    </div>
+  </div>
 </section>
 </main>
+
+<!-- ==================== AGENT CHAT SIDEBAR ==================== -->
+<aside id="agentdrawer" class="agent-drawer" aria-label="Optimization Agent Chat">
+  <div class="agent-drawer-hd">
+    <h2>Agent</h2>
+    <div style="display:flex;gap:6px;align-items:center">
+      <button type="button" class="btn xs" id="ag-menu-toggle" aria-expanded="false" aria-controls="ag-menu-panel">Actions Menu</button>
+      <button type="button" class="btn xs" id="ag-sb-clear" title="Clear chat">Clear</button>
+      <span class="tag mut" id="ag-sb-llm">deterministic</span>
+      <button class="icon" id="ag-sb-close" aria-label="Close sidebar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
+  </div>
+  <div id="ag-menu-panel" class="ag-menu-panel" hidden>
+    <div class="ag-menu-bar">
+      <label for="ag-menu-filter" class="sr-only">Filter agent actions</label>
+      <input id="ag-menu-filter" type="search" placeholder="Filter actions (quant, pull, tune, stop, bench, sync)…">
+      <button type="button" class="btn xs ag-menu-toggle-all" id="ag-menu-expand-all" aria-expanded="false">
+        <span class="expand">Expand all</span>
+        <span class="collapse">Collapse all</span>
+      </button>
+    </div>
+    <div id="ag-menu-acc" class="ag-menu-acc" aria-label="Agent action categories"></div>
+  </div>
+  <div class="agent-drawer-bd" id="ag-sb-msgs">
+    <div class="agent-msg bot">Pick any workflow from <b>Actions Menu</b> above (quant calculator &amp; HF pull, engine optimization, auto-tune, benchmarks, diagnostics, thermal guard, coding-agent sync) or type freely below.</div>
+  </div>
+  <div class="agent-drawer-ft">
+    <form id="ag-tpl-form" class="ag-tpl-form" hidden>
+      <div class="ag-tpl-hd">
+        <span class="ag-tpl-title" id="ag-tpl-title">Action Template</span>
+        <button type="button" class="btn xs" id="ag-tpl-cancel">Cancel</button>
+      </div>
+      <div class="hint" id="ag-tpl-desc"></div>
+      <div class="ag-tpl-fields" id="ag-tpl-fields"></div>
+      <div class="ag-tpl-btns">
+        <button type="button" class="btn xs" id="ag-tpl-insert">Insert as Prompt</button>
+        <button type="submit" class="btn xs primary" id="ag-tpl-run">Run Action</button>
+      </div>
+    </form>
+    <div class="agent-chips">
+      <button type="button" class="btn xs primary" data-ag-tpl="hf_quant_empty_gpu">Calc &amp; Pull Quant (Empty GPU)</button>
+      <button type="button" class="btn xs" data-ag-tpl="optimize_engine">Optimize Engine</button>
+      <button type="button" class="btn xs" data-ag-tpl="system_status">System Status</button>
+      <button type="button" class="btn xs" data-ag-tpl="diagnose_engine">Diagnose Crash</button>
+      <button type="button" class="btn xs" data-ag-tpl="stop_all_engines">Free GPU</button>
+    </div>
+    <form id="ag-sb-form" style="display:flex;gap:6px">
+      <label for="ag-sb-in" class="sr-only">Message the agent</label>
+      <input id="ag-sb-in" type="text" placeholder="Ask anything or pick an action template…" style="flex:1">
+      <button type="submit" class="btn primary sm" id="ag-sb-send">Send</button>
+    </form>
+  </div>
+</aside>
 
 <!-- ==================== MODALS (<dialog>) ==================== -->
 <dialog id="launchdlg" closedby="any">
   <div class="dlg-hd">
-    <h2 id="ld-title">Tune &amp; Launch Model</h2>
+    <div>
+      <div class="dlg-eyebrow">Tune &amp; Launch</div>
+      <h2 id="ld-title">Tune &amp; Launch Model</h2>
+    </div>
     <button class="icon" data-close="launchdlg" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
   </div>
   <div class="dlg-bd">
@@ -4974,13 +7651,16 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 </dialog>
 
-<dialog id="cmdpal" closedby="any" style="max-width:min(620px,95vw)">
-  <div class="dlg-bd" style="padding:12px">
-    <div class="search">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
-      <input id="pal-q" type="search" placeholder="Type a command, model name, or action…" aria-label="Command palette search">
-    </div>
-    <div id="pal-list" class="pal-list"></div>
+<dialog id="cmdpal" closedby="any" style="max-width:min(640px,95vw)">
+  <div class="pal-search-bar">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
+    <input id="pal-q" type="search" placeholder="Jump to view, launch model, or run action…" aria-label="Command palette search">
+    <kbd>ESC</kbd>
+  </div>
+  <div id="pal-list" class="pal-list"></div>
+  <div class="pal-ft">
+    <span>↑↓ Navigate · Enter Select</span>
+    <span>Inference Console</span>
   </div>
 </dialog>
 
@@ -5008,13 +7688,37 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
   </div>
 </dialog>
 
+<dialog id="renamedlg" closedby="any" style="max-width:min(440px,94vw)">
+  <div class="dlg-hd">
+    <h2>Rename conversation</h2>
+    <button class="icon" data-close="renamedlg" aria-label="Close"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+  </div>
+  <form id="ren-form">
+    <div class="dlg-bd">
+      <div class="field">
+        <label for="ren-input">Conversation title</label>
+        <input id="ren-input" type="text" maxlength="120" required style="width:100%">
+      </div>
+    </div>
+    <div class="dlg-ft">
+      <button type="button" class="btn" data-close="renamedlg">Cancel</button>
+      <button type="submit" class="btn primary">Save title</button>
+    </div>
+  </form>
+</dialog>
+
 <footer>
-  <span><kbd>⌘K</kbd> / <kbd>Ctrl+K</kbd> command palette</span>
-  <span><kbd>1</kbd>–<kbd>7</kbd> switch tabs</span>
-  <span><kbd>/</kbd> filter</span>
-  <span><kbd>Esc</kbd> close</span>
-  <span id="footnote"></span>
+  <div class="ft-group">
+    <span><kbd>⌘K</kbd> command palette</span>
+    <span><kbd>1</kbd>–<kbd>9</kbd> switch tabs</span>
+    <span><kbd>/</kbd> filter</span>
+    <span><kbd>Esc</kbd> close</span>
+  </div>
+  <div class="ft-group">
+    <span id="footnote"></span>
+  </div>
 </footer>
+</div></div>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
 
@@ -5121,19 +7825,26 @@ function confirmDlg(title,msg,okLabel,danger){
 const SUN='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="4"/><path d="M12 2v2m0 16v2M2 12h2m16 0h2M5 5l1.5 1.5M17.5 17.5L19 19M19 5l-1.5 1.5M6.5 17.5L5 19"/></svg>';
 const MOON='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M20 14a8 8 0 01-9.5-9.5A8 8 0 1020 14z"/></svg>';
 const themeMeta=$('meta[name="color-scheme"]');
-function applyTheme(t){
-  document.documentElement.dataset.theme=t;
-  if(themeMeta)themeMeta.content=t;
-  $('#theme').innerHTML=t==='dark'?SUN:MOON;
-  $('#theme').title=t==='dark'?'Switch to light theme':'Switch to dark theme';
+const sysThemeMQ=matchMedia('(prefers-color-scheme: light)');
+function sysTheme(){return sysThemeMQ.matches?'light':'dark';}
+function syncTheme(){
+  const stored=(()=>{try{return localStorage.getItem('ic.theme')}catch(_){return null}})();
+  const eff=(stored==='light'||stored==='dark')?stored:sysTheme();
+  document.documentElement.dataset.theme=eff;
+  if(themeMeta)themeMeta.content=(stored==='light'||stored==='dark')?stored:'light dark';
+  $('#theme').innerHTML=eff==='dark'?SUN:MOON;
+  $('#theme').title=eff==='dark'?'Switch to light theme':'Switch to dark theme';
 }
-applyTheme(document.documentElement.dataset.theme||'dark');
+syncTheme();
+sysThemeMQ.addEventListener('change',syncTheme);
+window.addEventListener('storage',e=>{if(e.key==='ic.theme')syncTheme()});
 $('#theme').addEventListener('click',()=>{
-  const next=document.documentElement.dataset.theme==='dark'?'light':'dark';
-  applyTheme(next);
-  const sys=matchMedia('(prefers-color-scheme: light)').matches?'light':'dark';
-  if(next===sys)localStorage.removeItem('ic.theme');
-  else localStorage.setItem('ic.theme',next);
+  const next=(document.documentElement.dataset.theme||sysTheme())==='dark'?'light':'dark';
+  try{
+    if(next===sysTheme())localStorage.removeItem('ic.theme');
+    else localStorage.setItem('ic.theme',next);
+  }catch(_){}
+  syncTheme();
 });
 $('#logout').addEventListener('click',async()=>{
   if(!await confirmDlg('Sign out','End this panel session?','Sign out',true))return;
@@ -5141,24 +7852,43 @@ $('#logout').addEventListener('click',async()=>{
   location.href='/login';
 });
 
-/* ============================== tabs ============================== */
-const TABS=['models','server','strata','avalon','vitals','chat','hf','settings'];
+/* ============================== tabs & workbench rail ============================== */
+const TABS=['models','server','strata','avalon','maya','agent','vitals','chat','hf','settings'];
+const TAB_TITLES={models:'Model Library',server:'llama.cpp Server & Bench',strata:'Strata Engine',
+  avalon:'Avalon 125B MoE',maya:'Project Maya',agent:'Optimization Agent',vitals:'System Vitals',chat:'Chat',hf:'Hugging Face Pull',settings:'Settings & Setup'};
 let tab='models';
+function closeNav(){document.body.classList.remove('nav-open')}
+$('#mobmenu').addEventListener('click',()=>document.body.classList.toggle('nav-open'));
+$('#railbackdrop').addEventListener('click',closeNav);
+$('#railvitals').addEventListener('click',()=>setTab('vitals'));
 function setTab(t){
   if(TABS.indexOf(t)<0)t='models';
   tab=t;localStorage.setItem('ic.tab',t);
+  closeNav();
+  $('#viewtitle').textContent=TAB_TITLES[t]||t;
   $$('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===t));
   $$('main section').forEach(s=>s.classList.toggle('hide',s.id!=='t-'+t));
   if(t==='server'){refreshLog();pollTelemetry();loadBenchmarks();}
-  if(t==='strata'){loadStrata();loadStrataPresets();}
-  if(t==='avalon'){loadAvalon();loadAvalonAccess();}
+  if(t==='strata'){loadStrata();loadStrataPresets();loadStrataKey();pollStrataTelemetry();refreshStrataLog();}
+  if(t==='avalon'){loadAvalon(true);loadAvalonAccess();}
+  if(t==='maya'){loadMaya();refreshMayaLog();}
+  if(t==='agent'){loadAgentAll();}
   if(t==='settings'){loadSettings();loadSetup();}
   if(t==='vitals')refreshVitals();
 }
 $$('.nav button').forEach(b=>b.addEventListener('click',()=>setTab(b.dataset.t)));
+$('#hdrstatus').addEventListener('click',()=>{
+  const ct=chatTarget();
+  if(ct)setTab(ct.src==='avalon'?'avalon':ct.src==='strata'?'strata':ct.src==='maya'?'maya':'server');
+  else if(ACTIVE)setTab('server');
+  else if(AV&&AV.running)setTab('avalon');
+  else if(STRATA&&STRATA.running)setTab('strata');
+  else if(MAYA&&MAYA.running)setTab('maya');
+  else setTab('models');
+});
 
 /* ============================== models & launch modal ============================== */
-let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
+let MODELS=[],MMP=[],ACTIVE=null,AV=null,STRATA=null,MAYA=null,FILTER='all',SORT='smart',CAPS={},DEF_CTX=16384;
 const SHX=new Set(); // expanded multi-shard groups
 const STAR_ON='<svg viewBox="0 0 24 24" fill="currentColor" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
 const STAR_OFF='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg>';
@@ -5189,14 +7919,17 @@ function modelRow(m,i){
   if(m.params)tags.push('<span class="tag">'+esc(m.params)+'</span>');
   if(m.ctx_len)tags.push('<span class="tag mut">'+n0(m.ctx_len)+' ctx</span>');
   tags.push('<span class="tag mut">'+esc(m.size_h)+'</span>');
-  if(m.moe)tags.push('<span class="tag warn">MoE'+(m.experts?' '+m.experts+'x':'')+'</span>');
-  if(m.vl)tags.push('<span class="tag acc">VL</span>');
+  if(m.moe)tags.push('<span class="tag sec">MoE'+(m.experts?' '+m.experts+'x':'')+'</span>');
+  if(m.vl)tags.push('<span class="tag sec">VISION</span>');
   if(m.imatrix)tags.push('<span class="tag mut">imatrix</span>');
   if(m.bench&&m.bench.gen_tps)tags.push('<span class="tag ok" title="Last benchmark speed">'+m.bench.gen_tps+' tok/s</span>');
   if(m.saved_profile)tags.push('<span class="tag mut" title="Custom launch profile saved">tuned</span>');
   if(running)tags.push('<span class="tag ok">loaded</span>');
   const sh=m.shards&&m.shards.length>1;
-  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+(SHX.has(m.path)?'▾':'▸')+' '+m.shards.length+' shards</button>');
+  const chev=SHX.has(m.path)
+    ?'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M6 9l6 6 6-6"/></svg>'
+    :'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M9 6l6 6-6 6"/></svg>';
+  if(sh)tags.push('<button class="btn xs" data-act="shards" title="Show individual shard files">'+chev+' '+m.shards.length+' shards</button>');
   return '<div class="mrow'+(running?' run':'')+'" data-i="'+i+'" data-path="'+esc(m.path)+'" data-name="'+esc(m.name)+'" data-size="'+esc(m.size_h)+'"'+(sh?' data-shards="'+m.shards.length+'"':'')+'">'
     +'<button class="pinbtn'+(m.pinned?' on':'')+'" data-act="pin" title="'+(m.pinned?'Unpin model':'Pin model to top')+'" aria-label="Pin '+esc(m.name)+'">'+(m.pinned?STAR_ON:STAR_OFF)+'</button>'
     +'<div style="min-width:0"><div class="nm" title="'+esc(m.path)+'"><span>'+esc(m.name)+'</span></div>'
@@ -5242,6 +7975,7 @@ function renderModels(){
   list=list.slice().sort(by);
   const bytes=MODELS.reduce((s,m)=>s+m.size,0);
   $('#libinfo').textContent=MODELS.length+' models · '+gib(bytes)+(MMP.length?' · '+MMP.length+' mmproj':'');
+  if($('#nb-models'))$('#nb-models').textContent=String(MODELS.length);
   if(MODELS[0]&&MODELS[0].fit){
     const f=MODELS[0].fit;
     $('#vramchip').textContent=f.budget_source+': '+((f.usable_mb||f.budget_mb)/1024).toFixed(1)+' GB usable';
@@ -5361,13 +8095,6 @@ function applyLaunchForm(p){
   $('#ld-ncmoe-wrap').classList.toggle('hide',!(LD_MODEL&&LD_MODEL.moe));
   $('#ld-draft-wrap').classList.toggle('hide',!CAPS.draft);
   $('#ld-draftmax-wrap').classList.toggle('hide',!CAPS.draft);
-}
-function siblingDraft(m){
-  if(!m)return '';
-  const dir=m.path.replace(/\/[^/]+$/,'/');
-  const hit=MODELS.find(x=>x.path.startsWith(dir)&&x.path!==m.path
-            &&/mtp|draft/i.test(x.name)&&!/mmproj/i.test(x.name));
-  return hit?hit.path:'';
 }
 async function updateLaunchPreview(){
   if(!LD_MODEL)return;
@@ -5567,6 +8294,7 @@ function chatTarget(){
   if(AV&&AV.running&&AV.state==='ready')return{alias:AV.model||'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.port===ap)return{alias:'qwen3.8-flash-next',port:ap,src:'avalon'};
   if(STRATA&&STRATA.running&&STRATA.health==='ready'&&STRATA.port)return{alias:STRATA.model||'strata',port:STRATA.port,src:'strata'};
+  if(MAYA&&MAYA.running&&MAYA.state==='ready'&&MAYA.port)return{alias:MAYA.alias||MAYA.model_name||'maya',port:MAYA.port,src:'maya'};
   return null;
 }
 function drawHeader(){
@@ -5574,7 +8302,7 @@ function drawHeader(){
   const ct=chatTarget();
   if(ct){
     p.className='pill ok';
-    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':'');
+    t.textContent=ct.alias+' · :'+ct.port+(ct.src==='avalon'?' · avalon':ct.src==='strata'?' · strata':ct.src==='maya'?' · maya':'');
     document.title='● '+ct.alias+' — Inference Console';
   }else if(ACTIVE){
     p.className='pill warn';
@@ -5588,11 +8316,21 @@ function drawHeader(){
     p.className='pill warn';
     t.textContent='strata · loading…';
     document.title='◌ Loading Strata — Inference Console';
+  }else if(MAYA&&MAYA.running){
+    p.className='pill warn';
+    t.textContent=(MAYA.model_name||'maya')+' · loading…';
+    document.title='◌ Loading Maya — Inference Console';
   }else{
     p.className='pill';
     t.textContent='no server running';
     document.title='Inference Console — Local Inference Manager';
   }
+  const setDot=(id,st)=>{const d=$(id);if(d)d.className='ndot'+(st==='ok'?' ok':st==='warn'?' warn':'');};
+  const ap=(AV&&AV.port)||8086;
+  setDot('#nd-server',(ACTIVE&&ACTIVE.port!==ap)?(ACTIVE.ready?'ok':'warn'):'');
+  setDot('#nd-avalon',(AV&&AV.running)?(AV.state==='ready'?'ok':'warn'):(ACTIVE&&ACTIVE.port===ap?(ACTIVE.ready?'ok':'warn'):''));
+  setDot('#nd-strata',(STRATA&&STRATA.running)?(STRATA.health==='ready'?'ok':'warn'):'');
+  setDot('#nd-maya',(MAYA&&MAYA.running)?(MAYA.state==='ready'?'ok':'warn'):'');
   const idleChip=$('#hdridle'),srvIdle=$('#srvidlechip');
   if(ACTIVE&&ACTIVE.ready&&ACTIVE.idle_unload_min>0&&ACTIVE.idle_remaining_s!=null){
     const txt='idle unload '+fmtUp(ACTIVE.idle_remaining_s);
@@ -5770,11 +8508,12 @@ function spark(arr){
 }
 const lvlCls=p=>p>=90?'err':p>=75?'warn':'';
 function card(o){
+  const mCls=lvlCls(o.pct||0)||(o.meter||'');
   return '<div class="card" style="margin:0;color:var(--'+(o.tone||'acc')+');'+(o.raw||'')+'">'
-    +'<div class="hd" style="margin-bottom:8px"><h2 style="color:var(--fg-2);font-size:13px">'+o.title+'</h2>'
+    +'<div class="hd" style="margin-bottom:8px"><h2 style="color:var(--on-surface-variant);font-size:13px">'+o.title+'</h2>'
     +'<span class="tag" style="color:inherit">'+o.badge+'</span></div>'
-    +'<div class="stat" style="color:var(--fg)">'+o.big+'</div>'
-    +'<div class="meter '+lvlCls(o.pct||0)+'"><i style="width:'+Math.min(100,o.pct||0)+'%"></i></div>'+spark(o.hist)+'</div>';
+    +'<div class="stat" style="color:var(--on-surface)">'+o.big+'</div>'
+    +'<div class="meter '+mCls+'"><i style="width:'+Math.min(100,o.pct||0)+'%"></i></div>'+spark(o.hist)+'</div>';
 }
 function drawVitals(){
   if(!VIT){$('#vitals').innerHTML='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';return}
@@ -5783,22 +8522,36 @@ function drawVitals(){
     const g=v.gpu,pct=Math.round(100*(g.used_mb||0)/(g.total_mb||1)),idle=g.util===0;
     const bits=[g.power_w!=null?g.power_w+' W':null,idle?null:(g.fan_rpm?g.fan_rpm+' RPM':null),
       idle?null:(g.sclk_mhz?g.sclk_mhz+' MHz':null),g.mclk_mhz?g.mclk_mhz+' MHz mem':null].filter(Boolean);
-    out+=card({title:'GPU'+(g.stale?' · cached':''),tone:idle?'mut':'acc',pct:pct,
+    out+=card({title:'dGPU VRAM'+(g.stale?' · cached':''),tone:idle?'mut':'primary',pct:pct,
       badge:(idle?'idle':(g.temp!=null?g.temp+'°C jct':'')+(g.temp_mem!=null?' · '+g.temp_mem+'°C mem':''))+(g.stale?' · stale':'')+' · '+(g.util||0)+'% util',
-      big:n0(g.used_mb)+' <small>/ '+n0(g.total_mb)+' MB VRAM</small>',hist:VH.gpu});
-    if(bits.length)out+='<div class="card" style="margin:0"><div class="hd" style="margin-bottom:8px"><h2 style="color:var(--fg-2);font-size:13px">GPU clocks &amp; power</h2></div>'
+      big:n0(g.used_mb)+' <small>/ '+n0(g.total_mb)+' MB</small>',hist:VH.gpu});
+    if(bits.length)out+='<div class="card" style="margin:0"><div class="hd" style="margin-bottom:8px"><h2 style="color:var(--on-surface-variant);font-size:13px">GPU clocks &amp; power</h2></div>'
       +'<div class="kvs">'+bits.map(b=>'<span class="tag">'+esc(b)+'</span>').join('')+'</div>'
       +'<p class="hint" style="margin:8px 0 0">Sensors sleep with the card; readings are held until it wakes.</p></div>';
   }
   if(v.mem){const p=Math.round(100*v.mem.used_gb/v.mem.total_gb);
-    out+=card({title:'System RAM',tone:'acc',pct:p,badge:p+'%',big:v.mem.used_gb+' <small>/ '+v.mem.total_gb+' GB</small>',hist:VH.mem})}
-  if(v.cpu){out+=card({title:'CPU Load',tone:'acc',pct:v.cpu.percent,badge:(v.cpu.cores||'?')+' threads',
+    out+=card({title:'System RAM',tone:'secondary',meter:'sec',pct:p,badge:p+'%',big:v.mem.used_gb+' <small>/ '+v.mem.total_gb+' GB</small>',hist:VH.mem})}
+  if(v.cpu){out+=card({title:'CPU Load',tone:'success',meter:'ok',pct:v.cpu.percent,badge:(v.cpu.cores||'?')+' threads',
       big:v.cpu.percent+'%',hist:VH.cpu})}
   Object.keys(v.disk||{}).forEach(k=>{const d=v.disk[k],p=Math.round(100*d.used_gb/d.total_gb);
-    out+=card({title:'Disk '+k,tone:'acc',pct:p,badge:(d.free_gb!=null?d.free_gb+' GB free':p+'%'),big:d.used_gb+' <small>/ '+d.total_gb+' GB</small>'})});
+    out+=card({title:'Disk '+k,tone:'primary',pct:p,badge:(d.free_gb!=null?d.free_gb+' GB free':p+'%'),big:d.used_gb+' <small>/ '+d.total_gb+' GB</small>'})});
   if(!out)out='<div class="empty"><b>No vitals yet</b>Sensors unreadable on this host.</div>';
   $('#vitals').innerHTML=out;
   $('#vupdatetime').textContent='updated '+Math.max(0,Math.round((Date.now()-VT)/1000))+'s ago';
+  if(v.gpu&&v.gpu.total_mb){
+    const gp=Math.round(100*(v.gpu.used_mb||0)/v.gpu.total_mb);
+    $('#rv-mem-lbl').textContent='VRAM';
+    $('#rv-mem-val').textContent=(v.gpu.used_mb/1024).toFixed(1)+'/'+(v.gpu.total_mb/1024).toFixed(0)+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(gp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,gp)+'%"></i>';
+  }else if(v.mem&&v.mem.total_gb){
+    const mp=Math.round(100*v.mem.used_gb/v.mem.total_gb);
+    $('#rv-mem-lbl').textContent='RAM';
+    $('#rv-mem-val').textContent=v.mem.used_gb+'/'+v.mem.total_gb+'G';
+    $('#rv-mem-bar').className='meter '+lvlCls(mp);
+    $('#rv-mem-bar').innerHTML='<i style="width:'+Math.min(100,mp)+'%"></i>';
+  }
+  if(v.cpu)$('#rv-cpu-val').textContent=v.cpu.percent+'%';
 }
 async function refreshVitals(){
   try{VIT=await api('/api/vitals');VT=Date.now();pushHist();drawVitals()}catch(e){drawVitals()}
@@ -5823,6 +8576,12 @@ function syncSamplingLabels(){
   $('#'+id).addEventListener('input',()=>{syncSamplingLabels();localStorage.setItem('ic.'+id,$('#'+id).value)});
 });
 syncSamplingLabels();
+$('#sp-reset').addEventListener('click',()=>{
+  $('#sysprompt').value=DEF_SYS;localStorage.setItem('ic.sys',DEF_SYS);
+  const defs={'sp-temp':'0.7','sp-topp':'0.95','sp-minp':'0.05','sp-rep':'1.05','sp-max':'0'};
+  Object.keys(defs).forEach(k=>{$('#'+k).value=defs[k];localStorage.removeItem('ic.'+k);});
+  syncSamplingLabels();toast('Sampling defaults restored','ok',1800);
+});
 $('#sysbtn').addEventListener('click',()=>{
   const box=$('#sysbox');box.classList.toggle('hide');
   if(box.classList.contains('hide'))localStorage.setItem('ic.sys',$('#sysprompt').value||DEF_SYS);
@@ -5835,7 +8594,7 @@ function drawChatTarget(){
   if(ct){t.className='tag ok';t.textContent=ct.alias+' · :'+ct.port}
   else{t.className='tag warn';t.textContent='no model loaded'}
   $('#sendbtn').disabled=BUSY||!ct;
-  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, or Avalon tab to chat.';
+  $('#chatnote').textContent=ct?'':'Start a model in the Models, Strata, Avalon, or Maya tab to chat.';
 }
 function md(src){
   const blocks=[];
@@ -5924,15 +8683,25 @@ async function loadChatList(){
   try{CHATS_CACHE=await api('/api/chats');renderChatList();}catch(e){}
 }
 $('#csearch').addEventListener('input',renderChatList);
+let REN_CID=null;
+$('#ren-form').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const next=$('#ren-input').value.trim();
+  if(!next||!REN_CID)return;
+  try{
+    await post('/api/chats/'+REN_CID+'/rename',{title:next});
+    if(CID===REN_CID)$('#chattitle').textContent=next;
+    $('#renamedlg').close();loadChatList();toast('Conversation renamed','ok',2000);
+  }catch(err){toast('Rename failed: '+err.message,'err')}
+});
 $('#chatlist').addEventListener('click',async e=>{
   const ren=e.target.closest('[data-ren]');
   if(ren){
     e.stopPropagation();
-    const next=prompt('Rename conversation:',ren.dataset.title||'');
-    if(next&&next.trim()){
-      try{await post('/api/chats/'+ren.dataset.ren+'/rename',{title:next.trim()});loadChatList();}
-      catch(err){toast('Rename failed: '+err.message,'err')}
-    }
+    REN_CID=ren.dataset.ren;
+    $('#ren-input').value=ren.dataset.title||'';
+    $('#renamedlg').showModal();
+    $('#ren-input').focus();$('#ren-input').select();
     return;
   }
   const del=e.target.closest('[data-del]');
@@ -5963,17 +8732,23 @@ $('#newchat').addEventListener('click',newChat);
 $('#chatexportmd').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
   const mdOut=HIST.map(m=>'### '+(m.role==='user'?'User':'Assistant')+'\n\n'+(m.reasoning?'<think>\n'+m.reasoning+'\n</think>\n\n':'')+m.content).join('\n\n---\n\n');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
-  a.download='chat-'+(CID||'export')+'.md';a.click();
+  const url=URL.createObjectURL(new Blob([mdOut],{type:'text/markdown'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.md';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 $('#chatexportjson').addEventListener('click',()=>{
   if(!HIST.length)return toast('Nothing to export','warn');
-  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
-  a.download='chat-'+(CID||'export')+'.json';a.click();
+  const url=URL.createObjectURL(new Blob([JSON.stringify(HIST,null,2)],{type:'application/json'}));
+  const a=document.createElement('a');a.href=url;a.download='chat-'+(CID||'export')+'.json';a.click();
+  setTimeout(()=>URL.revokeObjectURL(url),4000);
 });
 
 const ta=$('#prompt');
-function autosize(){ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px'}
+function autosize(){
+  ta.style.height='auto';ta.style.height=Math.min(220,ta.scrollHeight)+'px';
+  const len=ta.value.length;
+  $('#chatcount').textContent=len?(n0(len)+' chars · ~'+n0(Math.ceil(len/4))+' tok'):'';
+}
 ta.addEventListener('input',autosize);
 ta.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send()}});
 $('#sendbtn').addEventListener('click',send);
@@ -5983,18 +8758,20 @@ async function send(){
   const q=ta.value.trim();
   if(!q||BUSY)return;
   const ct=chatTarget();
-  if(!ct)return toast('Start a model first (Models or Avalon tab)','warn');
+  if(!ct)return toast('Start a model first (Models, Strata, or Avalon tab)','warn');
   ta.value='';autosize();
   const th=$('#chat');if(th.querySelector('.empty'))th.innerHTML='';
   const um={role:'user',content:q};HIST.push(um);addMsg(um,HIST.length-1);
-  post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q})
-    .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
+  try{
+    const r0=await post('/api/chats/append',{id:CID,model:ct.alias,role:'user',content:q});
+    if(r0&&r0.id){CID=r0.id;localStorage.setItem('ic.cid',CID);loadChatList();}
+  }catch(e){}
   const asstIdx=HIST.length;
   const box=addMsg({role:'assistant',content:''},asstIdx);
   const ans=box.querySelector('.ans'),who=box.querySelector('.who');
-  BUSY=true;$('#sendbtn').disabled=true;$('#stopbtn').style.display='';
   AC=new AbortController();
-  let buff='',bufa='',t0=0,toks=0,stopped=false;
+  let buff='',bufa='',t0=0,toks=0,stopped=false,hadErr=false;
   const payload={
     messages:[{role:'system',content:$('#sysprompt').value||DEF_SYS}].concat(HIST.map(m=>({role:m.role,content:m.content}))),
     temperature:Number($('#sp-temp').value),
@@ -6007,7 +8784,7 @@ async function send(){
   try{
     const r=await fetch('/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},signal:AC.signal,
       body:JSON.stringify(payload)});
-    if(!r.ok){const d=await r.text();ans.innerHTML=esc(d.indexOf('no model')>=0?'No model running — load one first.':'error: '+d)}
+    if(!r.ok){hadErr=true;const d=await r.text();ans.innerHTML='<span style="color:var(--err)">'+esc(d.indexOf('no model')>=0?'No model running. Load one first.':'error: '+d)+'</span>'}
     else{
       const rd=r.body.getReader(),dec=new TextDecoder();let sbuf='';
       for(;;){
@@ -6035,64 +8812,119 @@ async function send(){
     }
   }catch(e){
     if(e.name==='AbortError'){stopped=true;ans.innerHTML=md(bufa||buff||'(stopped)')}
-    else ans.textContent='error: '+e.message;
+    else{hadErr=true;ans.innerHTML='<span style="color:var(--err)">'+esc('error: '+e.message)+'</span>'}
   }
   const finalText=bufa||buff||'';
   const secs=Math.max(.001,(performance.now()-(t0||performance.now()))/1000);
   const tps=toks?(toks/secs).toFixed(1):Math.round((finalText.length/4)/secs);
-  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
-  if(finalText){
+  who.innerHTML='<span>Assistant</span><span class="tag mut">'+(stopped?'stopped · ':hadErr?'error · ':'')+tps+' tok/s · '+esc(ct.alias)+'</span>';
+  if(finalText&&!hadErr){
     box.insertAdjacentHTML('beforeend','<div class="bar"><button class="btn xs" data-regen="'+asstIdx+'">Regenerate</button><button class="btn xs" data-copy="'+esc(finalText)+'">Copy</button></div>');
     HIST.push({role:'assistant',content:finalText,reasoning:buff});
     post('/api/chats/append',{id:CID,model:ct.alias,role:'assistant',content:finalText,reasoning:buff})
-      .then(r=>{CID=r.id;loadChatList()}).catch(()=>{});
+      .then(r=>{if(r&&r.id){CID=r.id;loadChatList()}}).catch(()=>{});
   }
   BUSY=false;AC=null;$('#stopbtn').style.display='none';drawChatTarget();ta.focus();
 }
 
 /* ============================== agents registry ============================== */
-let AGSRC=null; // null = auto (panel first); 'avalon' | 'strata' pins the source tab
-async function openAgentsDlg(source){
+let AGSRC=null; // null = auto (panel first); 'panel' | 'avalon' | 'strata' | 'maya' pins the source
+let AGRES='';  // last Apply's per-agent result rows, kept across post-Apply re-render
+async function openAgentsDlg(source,keepResults){
   AGSRC=source||null;
+  if(!keepResults)AGRES='';
   let d;try{d=await api('/api/agents')}catch(e){return toast('Failed: '+e.message,'err')}
   const reg=(d.registry&&d.registry.agents)||{};
-  const cur=d.running?esc(d.running[0])+' @ :'+d.running[1]:'nothing running';
-  const srcOk=!AGSRC||(d.sources&&d.sources[AGSRC]);
-  const srcLbl=AGSRC?('this tab’s server ('+AGSRC+')'):'any running server';
+  const srcs=d.sources||{};
+  const tgts=d.targets||{};
+  const selSrc=AGSRC||'auto';
+  const targetFor=s=>{
+    if(s==='auto')return d.running?{alias:d.running[0],port:d.running[1],source:d.running[3]||''}:null;
+    return tgts[s]||null;
+  };
+  const fmtTarget=t=>t?(esc(t.alias)+' @ :'+t.port+(t.source?' ('+esc(t.source)+')':'')):'nothing running';
+  const srcOpts=['auto','panel','avalon','strata','maya'].map(s=>{
+    const t=targetFor(s);
+    const up=Boolean(t||(s!=='auto'&&srcs[s]));
+    return '<option value="'+s+'"'+(s===selSrc?' selected':'')+'>'+s
+      +(s==='auto'?' (first running)':(up?(t?' · '+t.alias+' @ :'+t.port:' · running'):' · stopped'))+'</option>';
+  }).join('');
+  const curT=targetFor(selSrc);
+  const srcOk=selSrc==='auto'?Boolean(d.running):Boolean(srcs[selSrc]);
   const rows=d.agents.map(a=>{
     const r=reg[a.id];
-    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'">'
+    return '<label class="frow"><input type="checkbox" class="agchk" value="'+esc(a.id)+'"'+(r?' checked':'')+'>'
       +'<span style="flex:1;min-width:0"><b>'+esc(a.label)+'</b>'
       +(r?' <span class="tag ok">'+esc(r.alias)+'@'+r.port+' · '+esc(ago(r.synced_at))+'</span>':'')
       +'<br><span class="hint mono">'+esc(a.hint||'')+'</span></span></label>';
   }).join('');
-  $('#ag-body').innerHTML='<p style="margin:0 0 10px;color:var(--fg-2)">Writes each selected agent config to point at <b>'+cur+'</b>'
-    +(AGSRC?' <span class="tag">'+esc(srcLbl)+'</span>':'')+'.</p>'
-    +(!srcOk?'<p class="hint" style="margin:0 0 10px;color:var(--warn,#c80)">The '+esc(AGSRC)+' server isn’t running — start it on its tab, or apply anyway to get a clear error.</p>':'')
-    +'<div style="max-height:46vh;overflow:auto">'+rows+'</div><div id="agres" style="margin-top:10px"></div>';
-  $('#agentsdlg').showModal();
+  const dlg=$('#agentsdlg');
+  $('#ag-body').innerHTML='<p style="margin:0 0 8px;color:var(--fg-2)">Writes each selected agent config to point at <b id="ag-target">'+fmtTarget(curT)+'</b>.</p>'
+    +'<div style="display:flex;gap:8px;align-items:center;margin:0 0 8px"><label class="hint" for="ag-src">Source</label>'
+    +'<select id="ag-src" style="flex:1">'+srcOpts+'</select>'
+    +'<button type="button" class="btn xs" id="ag-all">All</button>'
+    +'<button type="button" class="btn xs" id="ag-none">None</button></div>'
+    +'<p class="hint'+(srcOk?' hide':'')+'" id="ag-src-warn" style="margin:0 0 8px;color:var(--warn,#c80)">'
+    +(srcOk?'':(selSrc==='auto'?'No server is running — start an engine first.':'The '+esc(selSrc)+' server isn’t running — start it on its tab, or pick another source.'))+'</p>'
+    +'<div style="max-height:42vh;overflow:auto">'+rows+'</div>'
+    +'<div id="agres" style="margin-top:10px">'+AGRES+'</div>';
+  $('#ag-src').addEventListener('change',e=>{
+    const v=e.target.value;
+    AGSRC=v==='auto'?null:v;
+    const t=targetFor(v);
+    $('#ag-target').innerHTML=fmtTarget(t);
+    const w=$('#ag-src-warn');
+    const ok=v==='auto'?Boolean(d.running):Boolean(srcs[v]);
+    if(!ok){
+      w.textContent=v==='auto'?'No server is running — start an engine first.':'The '+v+' server isn’t running — start it on its tab, or pick another source.';
+      w.classList.remove('hide');
+    }else w.classList.add('hide');
+  });
+  $('#ag-all').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=true));
+  $('#ag-none').addEventListener('click',()=>$$('.agchk',$('#agentsdlg')).forEach(x=>x.checked=false));
+  if(!dlg.open)dlg.showModal();
+  if(keepResults&&AGRES){const ar=$('#agres');if(ar)ar.scrollIntoView({block:'nearest'});}
 }
-$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null));
-$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon'));
-$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata'));
+$('#agentsbtn').addEventListener('click',()=>openAgentsDlg(null,false));
+$('#avalonagentsbtn').addEventListener('click',()=>openAgentsDlg('avalon',false));
+$('#strataagentsbtn').addEventListener('click',()=>openAgentsDlg('strata',false));
+$('#mayaagentsbtn').addEventListener('click',()=>openAgentsDlg('maya',false));
 $('#ag-apply').addEventListener('click',async()=>{
   const apply=$('#ag-apply');
   const picks=$$('.agchk',$('#agentsdlg')).filter(x=>x.checked).map(x=>x.value);
-  if(!picks.length)return toast('Pick at least one agent','warn');
+  if(!picks.length){
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag warn">select</span><span class="p">Pick at least one agent checkbox above, then click Apply.</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Pick at least one agent','warn');
+  }
   apply.disabled=true;apply.textContent='Applying…';
   let r;try{r=await post('/api/agents/sync',{agents:picks,source:AGSRC||'auto'})}
-  catch(e){apply.disabled=false;apply.textContent='Apply';return toast('Sync failed: '+e.message,'err',12000)}
-  $('#agres').innerHTML=Object.keys(r.results).map(k=>{const v=r.results[k];
+  catch(e){
+    apply.disabled=false;apply.textContent='Apply';
+    const ar=$('#agres');
+    if(ar){ar.innerHTML='<div class="frow" style="cursor:default"><span class="tag err">error</span><span class="p">'+esc(e.message)+'</span></div>';ar.scrollIntoView({block:'nearest'});}
+    return toast('Sync failed: '+e.message,'err',12000);
+  }
+  const rs=Object.keys(r.results).map(k=>r.results[k]);
+  const okN=rs.filter(v=>v.ok).length;
+  AGRES='<div class="hint" style="margin-bottom:4px">Registered <b>'+okN+' of '+picks.length+'</b> for <b>'+esc(r.alias)+' @ :'+r.port+'</b></div>'
+    +Object.keys(r.results).map(k=>{const v=r.results[k];
     return '<div class="frow" style="cursor:default"><span class="tag '+(v.ok?'ok':'err')+'">'+(v.ok?'ok':'fail')+'</span>'
       +'<span class="p" title="'+esc(v.detail)+'">'+esc(k)+' — '+esc(v.detail)+'</span></div>'}).join('');
   apply.disabled=false;apply.textContent='Apply';
-  toast('Registry updated for '+picks.length+' agent'+(picks.length>1?'s':''),'ok');
+  toast('Registered '+okN+' of '+picks.length+' agent'+(picks.length>1?'s':''), okN===picks.length?'ok':(okN===0?'err':'warn'), 8000);
+  openAgentsDlg(AGSRC,true);  // re-render so the registry tags show the new alias/port
   pollStatus();
 });
 
 /* ============================== strata ============================== */
+let STLOGTEXT='';
 async function loadStrata(){
-  try{const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget()}catch(e){}
+  try{
+    const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget();
+    if(s.running)loadStrataKey();
+    else $('#stratakeychip').classList.add('hide');
+  }catch(e){}
 }
 function drawStrata(s){
   const chip=$('#stratchip');
@@ -6107,7 +8939,22 @@ function drawStrata(s){
     +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>':'')
     :'<span class="hint">'+esc(s.note||'')+'</span>';
   $('#stratastopbtn').disabled=!(s.running);
-  $('#stratakeychip').classList.add('hide');
+}
+async function pollStrataTelemetry(){
+  const card=$('#stratametricscard');
+  if(!(STRATA&&STRATA.running)){card.classList.add('hide');return;}
+  try{
+    const d=await api('/api/strata/telemetry');
+    if(!d.ready||!d.metric_keys||!d.metric_keys.length){card.classList.add('hide');return;}
+    card.classList.remove('hide');
+    $('#st-metrics-chip').textContent=':'+d.port+' · '+d.metric_keys.length+' metrics';
+    const keys=d.metric_keys.slice(0,18);
+    $('#st-metrics').innerHTML=keys.map(k=>{
+      const v=d.metrics[k];
+      const fmt=Number.isInteger(v)?n0(v):Number(v).toFixed(2);
+      return '<span class="tag">'+esc(k)+' <b>'+esc(fmt)+'</b></span>';
+    }).join('');
+  }catch(e){card.classList.add('hide')}
 }
 function stForm(){
   const sets=$('#st-set').value.trim().split(/\s+/).filter(x=>x.includes('='));
@@ -6143,20 +8990,21 @@ function stPreview(){
 }
 $$('#strataformcard input,#strataformcard select').forEach(el=>el.addEventListener('input',stPreview));
 $('#st-toggleform').addEventListener('click',()=>{$('#strataformcard').classList.toggle('hide');stPreview()});
-$('#st-copycmd').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#st-cmd').textContent);toast('Command copied','ok')});
-$('#stratacopyinst').addEventListener('click',()=>{navigator.clipboard&&navigator.clipboard.writeText($('#stratainstcmd').textContent);toast('Install command copied — run it in your own terminal','ok',6000)});
+$('#st-copycmd').addEventListener('click',()=>copy($('#st-cmd').textContent,'Strata command'));
+$('#stratacopyinst').addEventListener('click',()=>copy($('#stratainstcmd').textContent,'Install command'));
 async function loadStrataPresets(){
   if(!$('#st-presets'))return;
   try{
     const d=await api('/api/strata/presets');
     const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?{name:p.name,context:p.context,model:p.model}:null)).filter(Boolean);
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     $('#st-presets').innerHTML=ps.length?ps.map(p=>'<span class="tag">'+esc(p.name)
       +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
       +' <button class="btn xs" data-stp="'+esc(p.name)+'" data-act="use">Use</button>'
-      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset">×</button></span>').join('')
-      :'<span class="hint">No saved presets yet — name one in the launch form to save this exact configuration.</span>';
+      +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset" aria-label="Delete preset">'+xSvg+'</button></span>').join('')
+      :'<span class="hint">No saved presets yet. Name one in the launch form to save this exact configuration.</span>';
     const sel=$('#st-preset'),cur=sel.value;
-    sel.innerHTML='<option value="">— none —</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
+    sel.innerHTML='<option value="">(none)</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     sel.value=cur;
   }catch(e){}
 }
@@ -6218,26 +9066,54 @@ $('#stratakeychip').addEventListener('click',async()=>{
   catch(e){toast('Could not read key: '+e.message,'err')}
 });
 async function loadStrataKey(){
-  try{const k=await api('/api/strata/key');
-    if(k.key_set){const c=$('#stratakeychip');c.dataset.masked=k.masked;c.textContent='key '+k.masked+' (click to reveal)';c.classList.remove('hide')}
+  try{
+    const k=await api('/api/strata/key');
+    const c=$('#stratakeychip');
+    if(k.key_set){
+      c.dataset.masked=k.masked;
+      if(c.dataset.revealed!=='1')c.textContent='key '+k.masked+' (click to reveal)';
+      c.classList.remove('hide');
+    }else c.classList.add('hide');
   }catch(e){}
 }
-async function refreshStrataLog(){try{const d=await api('/api/strata/log');paintInto($('#stratalog'),d.log)}catch(e){}}
+function paintFilteredLog(el,text,filterId,autoId,countId){
+  const f=($(filterId)&&$(filterId).value||'').trim().toLowerCase();
+  const lines=(text||'').split('\n');
+  const shown=lines.filter(l=>!f||l.toLowerCase().includes(f));
+  const html=shown.map(l=>{
+    const e=esc(l);
+    if(/error|failed|exception|abort|refused/i.test(l))return '<span class="e">'+e+'</span>';
+    if(/warn/i.test(l))return '<span class="w">'+e+'</span>';
+    return e;
+  }).join('\n');
+  if(el.innerHTML!==html){el.innerHTML=html;if(!autoId||$(autoId).checked)el.scrollTop=1e9;}
+  if(countId&&$(countId))$(countId).textContent=shown.length+' / '+lines.length+' lines';
+}
+async function refreshStrataLog(){
+  try{const d=await api('/api/strata/log');STLOGTEXT=d.log||'';paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn')}catch(e){}
+}
+$('#stlogfilter').addEventListener('input',()=>paintFilteredLog($('#stratalog'),STLOGTEXT,'#stlogfilter','#stlogauto','#stlogn'));
+$('#stlogauto').addEventListener('change',()=>{if($('#stlogauto').checked)$('#stratalog').scrollTop=1e9});
+$('#stlogcopy').addEventListener('click',()=>copy(STLOGTEXT,'Strata log'));
 
 /* ============================== avalon & optimizer ============================== */
-let ASEL=null,ALIST=[];
-async function loadAvalon(){
+let ASEL=null,ALIST=[],AVSNAPS=[],AVLOGTEXT='',AV_PROF_SIG='',AV_TGT_SIG='',AV_SNAP_SIG='';
+async function loadAvalon(forceAux){
   try{
     ALIST=await api('/api/avalon/profiles');AV=await api('/api/avalon/status');
     if(!ASEL||!ALIST.some(p=>p.key===ASEL))ASEL=(AV&&AV.running&&AV.profile)||'';
     if(!ASEL&&ALIST.length)ASEL=(ALIST.find(p=>p.available)||ALIST[0]).key;
-    $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
-      +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
-      +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
-      +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
-      +(p.available?'':' <span class="tag err">config missing</span>')
-      +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
-    $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    const pSig=JSON.stringify({s:ASEL,r:AV.running,p:AV.profile,a:ALIST.map(x=>[x.key,x.available,x.label])});
+    if(pSig!==AV_PROF_SIG){
+      AV_PROF_SIG=pSig;
+      $('#avalonprofiles').innerHTML=ALIST.map(p=>'<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+        +'<input type="radio" name="sprof" value="'+esc(p.key)+'"'+(p.key===ASEL?' checked':'')+(p.available?'':' disabled')+'>'
+        +'<span style="flex:1;min-width:0"><b>'+esc(p.label)+'</b>'
+        +(AV.running&&AV.profile===p.key?' <span class="tag ok">running</span>':'')
+        +(p.available?'':' <span class="tag err">config missing</span>')
+        +'<br><span class="hint">'+esc(p.desc)+'</span><br><span class="tag ok" style="margin-top:4px">'+esc(p.speed)+'</span></span></label>').join('');
+      $$('#avalonprofiles input[name=sprof]').forEach(r=>r.addEventListener('change',()=>{ASEL=r.value;loadAvalon();previewAvalonTune()}));
+    }
     const c=$('#avalonchip');
     c.textContent=AV.running?(AV.state==='ready'?'avalon · ready':'avalon · loading'):'avalon · stopped';
     c.className='tag '+(AV.running?(AV.state==='ready'?'ok':'warn'):'mut');
@@ -6256,14 +9132,16 @@ async function loadAvalon(){
     }
     const selProf=ALIST.find(p=>p.key===ASEL);
     if(selProf&&selProf.cmd_preview&&!$('#avcmdpreview').textContent)$('#avcmdpreview').textContent=selProf.cmd_preview;
-    const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log);
     drawHeader();drawChatTarget();
-    loadAvalonSnaps();
-    loadAvalonTargets();
+    if(forceAux||!AV_SNAP_SIG)loadAvalonSnaps();
+    if(forceAux||!AV_TGT_SIG)loadAvalonTargets();
   }catch(e){}
 }
+function syncAvCtxLabel(){
+  const v=Number($('#av-ctx').value)||0;
+  $('#av-ctx-lbl').textContent=v?n0(v)+' tok':'default';
+}
 function getAvalonTuneForm(){
-  // Empty number box = unset (null); the two selects use 0 = "profile default".
   const num=v=>{const s=String(v).trim();if(s==='')return null;const n=Number(s);return isNaN(n)?null:n};
   return {
     profile:ASEL||'flagship',
@@ -6284,10 +9162,9 @@ function getAvalonTuneForm(){
   };
 }
 function setAvalonTuneForm(t){
-  // Number boxes: null/undefined = unset (blank), but a saved 0 must render as "0"
-  // (draft_n 0 means drafting off — blank would silently mean "profile default").
   const v=x=>(x==null||x==='')?'':String(x);
   $('#av-ctx').value=String(t.ctx||0);
+  syncAvCtxLabel();
   $('#av-batch').value=v(t.batch);
   $('#av-ubatch').value=v(t.ubatch);
   $('#av-ctk').value=t.ctk||'';
@@ -6303,6 +9180,7 @@ function setAvalonTuneForm(t){
   $('#av-mlock').value=t.mlock?'on':'';
 }
 async function previewAvalonTune(){
+  syncAvCtxLabel();
   try{
     const r=await post('/api/avalon/tune',Object.assign(getAvalonTuneForm(),{preview:true}));
     $('#avcmdpreview').textContent=r.cmd_preview||'';
@@ -6334,6 +9212,9 @@ $('#avapplystart').addEventListener('click',async()=>{
 async function loadAvalonTargets(){
   try{
     const d=await api('/api/avalon/targets');
+    const sig=JSON.stringify(d);
+    if(sig===AV_TGT_SIG||document.activeElement===$('#avtargetsel'))return;
+    AV_TGT_SIG=sig;
     const sel=$('#avtargetsel');
     sel.innerHTML=(d.targets||[]).map(t=>'<option value="'+esc(t.path)+'"'+(t.current?' selected':'')+'>'
       +esc(t.base)+(t.size_h?' · '+esc(t.size_h):'')+(t.shards>1?' · '+t.shards+' shards':'')+(t.draft?' · MTP':'')+'</option>').join('');
@@ -6345,27 +9226,32 @@ $('#avtargetsel').addEventListener('change',async()=>{
   try{
     const r=await post('/api/avalon/target',{model:v});
     toast('Avalon target: '+(r.base||'auto'),'ok');
-    loadAvalon();
-  }catch(e){toast('Target change failed: '+e.message,'err');loadAvalonTargets();}
+    AV_TGT_SIG='';loadAvalon(true);
+  }catch(e){toast('Target change failed: '+e.message,'err');AV_TGT_SIG='';loadAvalonTargets();}
 });
 /* ---- one-click snapshots ---- */
 async function loadAvalonSnaps(){
   try{
     const d=await api('/api/avalon/snapshots');
+    AVSNAPS=d.snapshots||[];
+    const sig=JSON.stringify(AVSNAPS);
+    if(sig===AV_SNAP_SIG)return;
+    AV_SNAP_SIG=sig;
     const el=$('#avsnaps');
-    if(!(d.snapshots||[]).length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
-    el.innerHTML=d.snapshots.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
+    if(!AVSNAPS.length){el.innerHTML='<span class="hint">No saved launches yet. Tune the server above, then “Save current”.</span>';return;}
+    const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:12px;height:12px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
+    el.innerHTML=AVSNAPS.map(s=>'<div class="frow" style="padding:8px 10px;align-items:center;gap:10px">'
       +'<span style="flex:1;min-width:0"><b>'+esc(s.name)+'</b> <span class="tag mut">'+esc(s.profile)+'</span><br>'
-      +'<span class="hint">'+esc(s.cmd||'')+'</span></span>'
+      +'<span class="hint mono">'+esc(s.cmd||'')+'</span></span>'
       +'<button class="btn sm primary" data-snaplaunch="'+esc(s.id)+'">Launch</button>'
-      +'<button class="btn xs" data-snapdel="'+esc(s.id)+'">✕</button></div>').join('');
+      +'<button class="btn xs danger" data-snapdel="'+esc(s.id)+'" title="Delete snapshot" aria-label="Delete snapshot">'+xSvg+'</button></div>').join('');
     $$('[data-snaplaunch]').forEach(b=>b.addEventListener('click',async()=>{
       b.disabled=true;
-      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting — a 125B load takes a while','ok');loadAvalon();}
+      try{await post('/api/avalon/snapshots/launch',{id:b.dataset.snaplaunch});toast('Avalon starting (125B load takes a while)','ok');loadAvalon();}
       catch(e){toast('Launch failed: '+e.message,'err',12000);b.disabled=false;}
     }));
     $$('[data-snapdel]').forEach(b=>b.addEventListener('click',async()=>{
-      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});loadAvalonSnaps();}
+      try{await api('/api/avalon/snapshots/'+b.dataset.snapdel,{method:'DELETE'});AV_SNAP_SIG='';loadAvalonSnaps();}
       catch(e){toast('Delete failed: '+e.message,'err')}
     }));
   }catch(e){}
@@ -6379,7 +9265,7 @@ $('#avsnapsave').addEventListener('click',async()=>{
     const r=await post('/api/avalon/snapshots',{name:name,profile:prof,tune:f});
     $('#avsnapname').value='';
     toast('Saved launch “'+(r.name||name)+'”','ok');
-    loadAvalonSnaps();
+    AV_SNAP_SIG='';loadAvalonSnaps();
   }catch(e){toast('Save failed: '+e.message,'err')}
 });
 function paintInto(el,text){
@@ -6391,6 +9277,9 @@ function paintInto(el,text){
     return e}).join('\n');
   el.scrollTop=1e9;
 }
+$('#avlogfilter').addEventListener('input',()=>paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn'));
+$('#avlogauto').addEventListener('change',()=>{if($('#avlogauto').checked)$('#avalonlog').scrollTop=1e9});
+$('#avlogcopy').addEventListener('click',()=>copy(AVLOGTEXT,'Avalon log'));
 $('#avalonstart').addEventListener('click',async()=>{
   $('#avalonstart').disabled=true;
   try{await post('/api/avalon/start',{profile:ASEL,tune:getAvalonTuneForm()});toast('Avalon starting — a 125B load takes a while','ok')}
@@ -6446,6 +9335,142 @@ $('#avalonlan').addEventListener('change',async e=>{
   e.target.disabled=false;loadAvalonAccess();loadAvalon();loadModelHost();
 });
 
+/* ============================== maya ============================== */
+let MLIST=[],MSEL='';
+function drawMaya(s,list){
+  const chip=$('#mayachip');
+  chip.textContent=s.running?(s.state==='ready'?'maya · ready':'maya · loading'):'maya · stopped';
+  chip.className='tag '+(s.running?(s.state==='ready'?'ok':'warn'):'mut');
+  const tel=s.telemetry||{};
+  $('#m-state-tag').textContent=tel.active?'answering':(s.running?(s.state==='ready'?'ready':'loading'):'idle');
+  $('#m-state-tag').className='tag '+(tel.active?'ok':(s.running&&s.state==='ready'?'acc':'mut'));
+  $('#m-dec-tps').textContent=tel.decode_tps!=null?tel.decode_tps:'—';
+  $('#m-dec-sub').textContent=tel.last_tokens?n0(tel.last_tokens)+' tokens last turn':'Waiting for log telemetry';
+  $('#m-pre-tps').textContent=tel.prefill_tps!=null?tel.prefill_tps:'—';
+  $('#m-vram').textContent=tel.vram_gb!=null?tel.vram_gb:'—';
+  $('#m-exp-sub').textContent=tel.experts_vram!=null&&tel.experts_total
+    ?'Experts in VRAM: '+n0(tel.experts_vram)+' / '+n0(tel.experts_total)+' ('+tel.experts_vram_pct+'%)'
+    :'Experts in VRAM: —';
+  const ctxVal=tel.context||s.ctx;
+  $('#m-ctx').textContent=ctxVal?n0(ctxVal):'—';
+  const loadParts=[];
+  if(tel.load_s!=null)loadParts.push('loaded '+tel.load_s+'s');
+  if(tel.warmup_s!=null)loadParts.push('warmup '+tel.warmup_s+'s');
+  $('#m-load-sub').textContent=loadParts.length?loadParts.join(' · '):'Load / warmup: —';
+
+  if(s.running){
+    const mHost=s.host||'127.0.0.1';
+    const mLanUrl=(mHost==='0.0.0.0'&&MODEL_HOST_STATE.ip&&MODEL_HOST_STATE.ip!=='127.0.0.1')
+      ?('http://'+MODEL_HOST_STATE.ip+':'+s.port+'/v1'):'';
+    const kvs=[
+      ['alias',s.alias||s.model_name],
+      ['engine',s.engine||'maya'],
+      ['host',mHost],
+      ['port',':'+s.port],
+      s.pid?['pid',s.pid]:null,
+      s.ctx?['ctx',n0(s.ctx)]:null,
+      s.adopted?['source','adopted']:['up',fmtUp(s.uptime||0)],
+      s.key_set?['key',s.key_masked]:null,
+    ].filter(Boolean);
+    $('#mayadetail').innerHTML=kvs.map(kv=>'<span class="tag'+(kv[0]==='host'&&kv[1]==='0.0.0.0'?' ok':'')+'">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+      +(s.engine==='hy4'?'<span class="tag warn" title="Hy4 serves one request at a time">1 req/time</span>':'')
+      +'<button class="btn xs" data-copy="http://127.0.0.1:'+s.port+'/v1">Copy base URL</button>'
+      +(mLanUrl?'<span class="tag ok">LAN · '+esc(mLanUrl)+'</span><button class="btn xs" data-copy="'+esc(mLanUrl)+'">Copy LAN URL</button>':'');
+  }else{
+    $('#mayadetail').innerHTML='<span class="hint">Maya is stopped. Choose a config below to start serving.</span>';
+  }
+
+  if(list){
+    if(!MSEL||!list.some(c=>c.path===MSEL))MSEL=(s.running&&s.config_path)||'';
+    if(!MSEL&&list.length)MSEL=(list.find(c=>c.available)||list[0]).path;
+    if(!list.length){
+      $('#mayaconfigs').innerHTML='<div class="empty"><b>No Project Maya configs found</b>Expected JSON configs in <code>~/project-maya/</code> (e.g. <code>maya-hy4-flash-maya-xs.json</code>).</div>';
+    }else{
+      $('#mayaconfigs').innerHTML=list.map(c=>{
+        const isRun=s.running&&(s.config_path===c.path||s.config_id===c.id);
+        const tags=[
+          '<span class="tag">'+esc(c.engine.toUpperCase())+'</span>',
+          c.quant?'<span class="tag acc">'+esc(c.quant)+'</span>':'',
+          '<span class="tag mut">'+n0(c.ctx)+' ctx</span>',
+          '<span class="tag mut">:'+esc(c.port)+'</span>',
+          c.dir_size_h?'<span class="tag mut">'+esc(c.dir_size_h)+'</span>':'',
+          c.mtp?'<span class="tag ok">MTP</span>':'',
+          c.reasoning_effort?'<span class="tag mut">think:'+esc(c.reasoning_effort)+'</span>':'',
+          c.key_set?'<span class="tag mut mono" title="API key set (server-side)">key '+esc(c.key_masked)+'</span>':'',
+          c.concurrency_note?'<span class="tag warn">'+esc(c.concurrency_note)+'</span>':'',
+          isRun?'<span class="tag ok">running</span>':'',
+          !c.available?'<span class="tag err">binary missing</span>':'',
+        ].filter(Boolean).join(' ');
+        return '<label class="frow" style="align-items:flex-start;padding:10px 11px">'
+          +'<input type="radio" name="mcfg" value="'+esc(c.path)+'"'+(c.path===MSEL?' checked':'')+'>'
+          +'<span style="flex:1;min-width:0"><b>'+esc(c.model_name)+'</b> <span class="hint mono">'+esc(c.filename)+'</span>'
+          +'<div class="kvs" style="margin-top:4px">'+tags+'</div></span></label>';
+      }).join('');
+      $$('#mayaconfigs input[name=mcfg]').forEach(r=>r.addEventListener('change',()=>{MSEL=r.value;drawMaya(MAYA||s,MLIST)}));
+    }
+  }
+  const selObj=(MLIST||[]).find(c=>c.path===MSEL);
+  const selRunning=!!(s.running&&selObj&&(s.config_path===selObj.path||s.config_id===selObj.id));
+  $('#mayastart').disabled=!MSEL||!!s.running;
+  $('#mayaswitch').disabled=!MSEL||!s.running||selRunning;
+  $('#mayastop').disabled=!s.running;
+  $('#mayakeybtn').disabled=!s.key_set&&!(selObj&&selObj.key_set);
+}
+async function loadMaya(){
+  try{
+    const [cfgs,st]=await Promise.all([api('/api/maya/configs'),api('/api/maya/status')]);
+    MLIST=(cfgs&&cfgs.configs)||[];
+    MAYA=st;
+    drawMaya(st,MLIST);
+    drawHeader();drawChatTarget();
+  }catch(e){}
+}
+async function refreshMayaLog(){
+  try{
+    const d=await api('/api/maya/log');
+    if(d.path)$('#mayalogpath').textContent=d.path;
+    paintInto($('#mayalog'),d.log||'');
+  }catch(e){}
+}
+$('#mayadetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Base URL')});
+$('#mayalogref').addEventListener('click',refreshMayaLog);
+$('#mayastart').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  $('#mayastart').disabled=true;
+  try{
+    await post('/api/maya/start',{config:MSEL,switch:false});
+    toast('Maya starting — cold start takes 30–60 s','ok');
+  }catch(e){toast('Start failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayaswitch').addEventListener('click',async()=>{
+  if(!MSEL)return;
+  if(!await confirmDlg('Switch Maya config','Stop the running Maya server and start the selected config?','Switch',true))return;
+  $('#mayaswitch').disabled=true;
+  try{
+    await post('/api/maya/switch',{config:MSEL,switch:true});
+    toast('Switching Maya config — cold start takes 30–60 s','ok');
+  }catch(e){toast('Switch failed: '+e.message,'err',12000)}
+  loadMaya();refreshMayaLog();
+});
+$('#mayastop').addEventListener('click',async()=>{
+  if(!await confirmDlg('Stop Maya','Stop the running Project Maya server and release VRAM?','Stop',true))return;
+  $('#mayastop').disabled=true;
+  try{
+    const r=await post('/api/maya/stop');
+    toast(r.stopped?'Maya stopped & VRAM released':'Stop requested — check log',r.stopped?'ok':'warn');
+  }catch(e){toast('Stop failed: '+e.message,'err')}
+  loadMaya();refreshMayaLog();
+});
+$('#mayakeybtn').addEventListener('click',async()=>{
+  try{
+    const q=MSEL?('&config='+encodeURIComponent(MSEL)):'';
+    const d=await api('/api/maya/key?reveal=1'+q);
+    if(!d.key_set||!d.key)return toast('No API key configured','warn');
+    await copy(d.key,'Maya API key');
+  }catch(e){toast('Failed: '+e.message,'err')}
+});
+
 /* ============================== HF pull (resumable) ============================== */
 let HFREPO='',DLPREV={},DLTIMER=null;
 async function hfSearch(){
@@ -6486,9 +9511,11 @@ function totsize(){
 $('#hffiles').addEventListener('change',totsize);
 $('#hfnone').addEventListener('click',()=>{$$('#hffiles input').forEach(i=>i.checked=false);totsize()});
 $('#hfpull').addEventListener('click',async()=>{
-  const sel=$$('#hffiles input:checked').map(i=>i.value);
+  const checked=$$('#hffiles input:checked');
+  const sel=checked.map(i=>i.value);
+  const sizes={};checked.forEach(i=>{sizes[i.value]=Number(i.dataset.size)||0;});
   if(!sel.length)return toast('Select at least one file','warn');
-  try{await post('/api/hf/pull',{repo:HFREPO,files:sel});
+  try{await post('/api/hf/pull',{repo:HFREPO,files:sel,sizes});
     toast('Queued '+sel.length+' file'+(sel.length>1?'s':''),'ok');ensureDl(true);pollDownloads()}
   catch(e){toast('Pull failed: '+e.message,'err',10000)}
 });
@@ -6496,10 +9523,17 @@ function ensureDl(on){
   if(on&&!DLTIMER)DLTIMER=setInterval(pollDownloads,1200);
   if(!on&&DLTIMER){clearInterval(DLTIMER);DLTIMER=null}
 }
+let DL_DONE_IDS=new Set();
 async function pollDownloads(){
   let ds;try{ds=await api('/api/downloads')}catch(e){return}
+  const activeCount=ds.filter(d=>d.status==='downloading'||d.status==='queued').length;
+  const nb=$('#nb-dl');
+  if(nb){nb.textContent=String(activeCount);nb.classList.toggle('hide',activeCount===0);}
+  let newlyDone=false;
+  ds.forEach(d=>{if(d.status==='done'&&!DL_DONE_IDS.has(d.id)){DL_DONE_IDS.add(d.id);newlyDone=true;}});
+  if(newlyDone){loadModels();toast('Download finished · model library updated','ok',3200);}
   if(!ds.length){$('#downloads').innerHTML='<span class="hint">No downloads queued.</span>';$('#dlinfo').textContent='';ensureDl(false);return}
-  const live=ds.some(d=>d.status==='downloading'||d.status==='queued');
+  const live=activeCount>0;
   $('#dlinfo').textContent=ds.length+' job'+(ds.length>1?'s':'')+(live?' · active':'');
   $('#downloads').innerHTML=ds.map(d=>{
     const pct=d.total?Math.round(100*d.done/d.total):0;
@@ -6560,6 +9594,7 @@ function drawSetup(){
   if(J.log&&J.log.length){box.classList.remove('hide');paintInto(box,J.log.join('\n'))}
   const running=J.state==='running';
   $$('#t-settings button[id^="setup-"][id$="-btn"]').forEach(b=>b.disabled=running);
+  if(!A.source_exists)$('#setup-avalon-btn').disabled=true;
   if(running&&!SETUPTIMER)SETUPTIMER=setInterval(()=>{loadSetup();if(tab!=='settings'){clearInterval(SETUPTIMER);SETUPTIMER=null}},1500);
   if(!running&&SETUPTIMER){clearInterval(SETUPTIMER);SETUPTIMER=null}
   if(J.state==='done'&&!SETUP._told){SETUP._told=true;toast('Engine setup finished','ok');loadSettings();loadModels();pollStatus(true)}
@@ -6603,6 +9638,11 @@ async function loadSettings(){
     $('#set-strataalias').value=s.strata_alias||'';
     $('#set-stratakey').value='';
     $('#set-stratakey-status').textContent=s.strata_api_key_set?'overridden ('+s.strata_api_key_masked+')':'not set (Strata owns its key)';
+    if($('#set-agenturl')){$('#set-agenturl').value=s.agent_llm_url||'';}
+    if($('#set-agentmodel')){$('#set-agentmodel').value=s.agent_llm_model||'';}
+    if($('#set-agentkey')){$('#set-agentkey').value='';}
+    if($('#set-agentkey-status')){$('#set-agentkey-status').textContent=s.agent_llm_key_set?'saved ('+s.agent_llm_key_masked+')':'not set';}
+    if($('#set-agentfallback')){$('#set-agentfallback').checked=s.agent_llm_fallback_local!==false;}
     const c=s.caps||{};
     $('#set-caps-badge').textContent=c.exists?'binary verified':'binary missing';
     $('#set-caps-badge').className='tag '+(c.exists?'ok':'err');
@@ -6610,6 +9650,7 @@ async function loadSettings(){
     $('#set-bin-flags').innerHTML=['fa_value','ncmoe','metrics','fit','ctk','mlock','no_mmap','parallel','draft','draft_max','ot','tensor_split','tbatch','keep','jinja']
       .map(k=>'<span class="tag '+(c[k]?'ok':'mut')+'">'+k+(c[k]?' ✓':' –')+'</span>').join('');
     $('#set-disks').innerHTML=(s.disks||[]).map(d=>d.exists?d.path+': '+d.free_gb+' GB free':d.path+': missing').join(' · ');
+    loadPanelProc();
   }catch(e){toast('Failed to load settings: '+e.message,'err')}
 }
 $('#set-modelhost').addEventListener('change',e=>{
@@ -6635,12 +9676,53 @@ $('#set-save').addEventListener('click',async()=>{
       hf_token:$('#set-hftok').value.trim(),
       strata_bin:$('#set-stratabin').value.trim(),
       strata_alias:$('#set-strataalias').value.trim(),
-      strata_api_key:$('#set-stratakey').value.trim()
+      strata_api_key:$('#set-stratakey').value.trim(),
+      agent_llm_url:$('#set-agenturl')?$('#set-agenturl').value.trim():undefined,
+      agent_llm_model:$('#set-agentmodel')?$('#set-agentmodel').value.trim():undefined,
+      agent_llm_key:$('#set-agentkey')?$('#set-agentkey').value.trim():undefined,
+      agent_llm_fallback_local:$('#set-agentfallback')?$('#set-agentfallback').checked:undefined
     });
     toast('Settings saved','ok');
-    await Promise.all([loadSettings(),loadModels(),loadModelHost(),loadAvalonAccess(),loadAvalon(),pollStatus(true)]);
+    await Promise.all([loadSettings(),loadModels(),loadModelHost(),loadAvalonAccess(),loadAvalon(),pollStatus(true),loadAgentProvider(),loadAgentStatus()]);
   }catch(e){toast('Save failed: '+e.message,'err')}
   btn.disabled=false;
+});
+
+/* ============================== panel process ============================== */
+const panelPing=()=>api('/api/panel/ping');
+async function loadPanelProc(){
+  try{
+    const p=await panelPing();
+    $('#panel-proc-chip').textContent='pid '+p.pid;
+    $('#panel-proc-chip').className='tag ok';
+    $('#panel-proc-detail').textContent='up '+fmtUp(p.uptime_s)+' · port '+p.port+(p.restartable?'':' · restart unavailable');
+    $('#panelrestart').disabled=!p.restartable;
+  }catch(e){
+    $('#panel-proc-chip').textContent='unreachable';
+    $('#panel-proc-chip').className='tag err';
+  }
+}
+async function waitForPanelRestart(before){
+  // execv keeps the PID, so watch started_at instead; every poll during the swap fails.
+  for(let i=0;i<120;i++){
+    await new Promise(r=>setTimeout(r,500));
+    try{
+      const p=await panelPing();
+      if(p.ok&&p.started_at!==before){location.reload();return}
+    }catch(e){}
+  }
+  toast('Panel never answered after restart. Check the service log.','err',15000);
+}
+$('#panelrestart').addEventListener('click',async()=>{
+  if(!await confirmDlg('Restart panel','Re-exec the panel process now? Running models are not stopped, and this tab reconnects automatically.','Restart',true))return;
+  const btn=$('#panelrestart');
+  let before=null;
+  try{before=(await panelPing()).started_at}catch(e){}
+  btn.disabled=true;btn.textContent='Restarting…';
+  try{await post('/api/panel/restart',{delay_ms:600})}
+  catch(e){btn.disabled=false;btn.textContent='Restart panel';return toast('Restart failed: '+e.message,'err')}
+  toast('Panel restarting…','warn',4000);
+  waitForPanelRestart(before);
 });
 
 /* ============================== command palette (Ctrl/Cmd+K) ============================== */
@@ -6652,11 +9734,26 @@ function buildPaletteItems(){
   if(ACTIVE&&ACTIVE.running){
     items.push({label:'Stop active llama-server ('+ACTIVE.alias+')',sub:':'+ACTIVE.port,run:()=>$('#srvstop').click()});
   }
+  if(AV&&AV.running){
+    items.push({label:'Stop Avalon ('+(AV.profile||'running')+')',sub:':'+(AV.port||8086),run:()=>$('#avalonstop').click()});
+  }else if(ALIST&&ALIST.some(p=>p.available)){
+    items.push({label:'Start Avalon ('+(ASEL||'flagship')+')',sub:'Avalon',run:()=>{setTab('avalon');$('#avalonstart').click()}});
+  }
+  (AVSNAPS||[]).forEach(s=>{
+    items.push({label:'Launch Avalon snapshot: '+s.name,sub:s.profile||'snapshot',run:async()=>{
+      try{await post('/api/avalon/snapshots/launch',{id:s.id});toast('Avalon starting: '+s.name,'ok');setTab('avalon');loadAvalon();}
+      catch(e){toast('Launch failed: '+e.message,'err',10000)}
+    }});
+  });
   if(STRATA&&STRATA.running){
     items.push({label:'Stop Strata ('+(STRATA.model||'model')+')',sub:':'+(STRATA.port||''),run:()=>$('#stratastopbtn').click()});
   }
+  if(MAYA&&MAYA.running){
+    items.push({label:'Stop Maya ('+(MAYA.alias||MAYA.model_name||'maya')+')',sub:':'+(MAYA.port||''),run:()=>$('#mayastop').click()});
+  }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
+  items.push({label:'Restart the panel process',sub:'Panel',run:()=>{setTab('settings');loadPanelProc();$('#panelrestart').click()}});
   items.push({
     label:MODEL_HOST_STATE.lan?'Switch model servers to 127.0.0.1 (local only)':'Host model servers on 0.0.0.0 (LAN)',
     sub:'currently '+(MODEL_HOST_STATE.host||'127.0.0.1'),
@@ -6691,6 +9788,8 @@ function renderPalette(){
     +'<span class="pi-main">'+esc(it.label)+'</span><span class="pi-sub">'+esc(it.sub)+'</span></button>'
   ).join(''):'<div class="empty">No matching commands or models</div>';
   $('#pal-list')._matched=matched;
+  const selEl=$('#pal-list .pal-item.sel');
+  if(selEl)selEl.scrollIntoView({block:'nearest'});
 }
 function openPalette(){
   PAL_ITEMS=buildPaletteItems();PAL_IDX=0;
@@ -6713,20 +9812,767 @@ $('#pal-list').addEventListener('click',e=>{
   if(m){$('#cmdpal').close();m.run();}
 });
 
+/* ============================== optimization agent & sidebar ============================== */
+let AG_LAST_RESULT=null,AG_PROV_PRESETS={},AG_MAYA_CFGS=[];
+async function syncAgentModelOptions(){
+  const sel=$('#ag-model');if(!sel)return;
+  const eng=$('#ag-engine').value;
+  if(eng==='llama'){
+    sel.innerHTML='<option value="">(auto-select active / pinned)</option>'
+      +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+' ('+esc(m.quant)+(m.moe?' · MoE':'')+')</option>').join('');
+  }else if(eng==='avalon'){
+    sel.innerHTML='<option value="flagship">flagship</option><option value="prefast">prefast</option><option value="compact">compact</option>';
+  }else if(eng==='maya'){
+    try{const d=await api('/api/maya/configs');AG_MAYA_CFGS=d.configs||[];}catch(e){}
+    sel.innerHTML='<option value="">(auto-select best Maya config)</option>'
+      +AG_MAYA_CFGS.map(c=>'<option value="'+esc(c.id)+'">'+esc(c.model_name)+' ('+esc(c.engine)+(c.quant?' · '+esc(c.quant):'')+(c.mtp?' · MTP':'')+')</option>').join('');
+  }else{
+    sel.innerHTML='<option value="">(Strata default / active)</option>'
+      +MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
+  }
+}
+$('#ag-engine')?.addEventListener('change',syncAgentModelOptions);
+
+/* Agent LLM Provider (Hermes-style presets + Custom + Always-On Model Polling) */
+async function loadAgentProvider(){
+  try{
+    const d=await api('/api/agent/provider');
+    AG_PROV_PRESETS=d.presets||{};
+    const sel=$('#ag-prov-select');
+    if(sel&&!sel.options.length){
+      sel.innerHTML=Object.entries(AG_PROV_PRESETS).map(([k,v])=>'<option value="'+esc(k)+'">'+esc(v.label)+'</option>').join('');
+    }
+    if(sel)sel.value=d.provider||'custom';
+    if($('#ag-prov-url'))$('#ag-prov-url').value=d.url||(AG_PROV_PRESETS[d.provider]?.url||'');
+    if($('#ag-prov-model'))$('#ag-prov-model').value=d.model||'';
+    if($('#ag-prov-headers'))$('#ag-prov-headers').value=d.headers||'';
+    if($('#ag-prov-key'))$('#ag-prov-key').value='';
+    if($('#ag-prov-key-status'))$('#ag-prov-key-status').textContent=d.key_set?'saved ('+d.key_masked+')':'not set';
+    if($('#ag-prov-fallback'))$('#ag-prov-fallback').checked=d.fallback_local!==false;
+    pollAgentProviderModels(true);
+  }catch(e){}
+}
+async function pollAgentProviderModels(silent){
+  const chip=$('#ag-prov-models-chip'),msg=$('#ag-prov-msg');
+  if(chip)chip.textContent='polling models…';
+  try{
+    const prov=$('#ag-prov-select')?.value||'custom';
+    const url=($('#ag-prov-url')?.value||'').trim();
+    const api_key=($('#ag-prov-key')?.value||'').trim();
+    const r=await post('/api/agent/provider/models',{provider:prov,url,api_key});
+    const list=r.models||[];
+    if(chip){chip.textContent='models: '+list.length;chip.className='tag '+(list.length?'ok':'mut');}
+    const dl=$('#ag-prov-models-dl'),pk=$('#ag-prov-model-pick');
+    if(dl)dl.innerHTML=list.map(m=>'<option value="'+esc(m)+'"></option>').join('');
+    if(pk){
+      const cur=$('#ag-prov-model')?.value||'';
+      pk.innerHTML='<option value="">— '+(list.length?list.length+' polled models':'no models polled')+' —</option>'
+        +list.map(m=>'<option value="'+esc(m)+'"'+(m===cur?' selected':'')+'>'+esc(m)+'</option>').join('');
+    }
+    if(msg)msg.textContent=r.error?('Model poll note: '+r.error):(list.length?'Polled '+list.length+' model(s) from '+r.url:'');
+  }catch(e){
+    if(chip){chip.textContent='models: err';chip.className='tag warn';}
+    if(!silent)toast('Model poll failed: '+e.message,'warn');
+  }
+}
+$('#ag-prov-select')?.addEventListener('change',()=>{
+  const p=AG_PROV_PRESETS[$('#ag-prov-select').value];
+  if(p&&typeof p.url==='string')$('#ag-prov-url').value=p.url;
+  pollAgentProviderModels(true);
+});
+$('#ag-prov-url')?.addEventListener('blur',()=>pollAgentProviderModels(true));
+$('#ag-prov-key')?.addEventListener('blur',()=>pollAgentProviderModels(true));
+$('#ag-prov-model-pick')?.addEventListener('change',()=>{
+  const v=$('#ag-prov-model-pick').value;if(v)$('#ag-prov-model').value=v;
+});
+$('#ag-prov-poll')?.addEventListener('click',()=>pollAgentProviderModels(false));
+$('#ag-prov-save')?.addEventListener('click',async()=>{
+  const btn=$('#ag-prov-save');btn.disabled=true;
+  try{
+    const prov=$('#ag-prov-select').value;
+    const url=$('#ag-prov-url').value.trim();
+    const model=$('#ag-prov-model').value.trim();
+    const fallback=$('#ag-prov-fallback').checked;
+    const res=await post('/api/agent/provider',{
+      provider:prov,
+      url:url,
+      model:model,
+      api_key:$('#ag-prov-key').value.trim(),
+      headers:$('#ag-prov-headers').value.trim(),
+      fallback_local:fallback
+    });
+    if($('#set-agenturl'))$('#set-agenturl').value=res.url||'';
+    if($('#set-agentmodel'))$('#set-agentmodel').value=res.model||'';
+    if($('#set-agentfallback'))$('#set-agentfallback').checked=res.fallback_local!==false;
+    if(res.status)renderAgentLlmChip(res.status);
+    if(prov!=='local_fallback'&&!model){
+      toast('Saved, but Model ID is empty — pick or enter a model to enable LLM mode','warn',8000);
+    }else{
+      toast('Agent LLM provider saved','ok');
+    }
+    await Promise.all([loadAgentProvider(),loadAgentStatus()]);
+  }catch(e){toast('Save provider failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-prov-test')?.addEventListener('click',async()=>{
+  const btn=$('#ag-prov-test');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/provider/test',{});
+    if(r.ok){toast('Provider OK ('+r.latency_ms+'ms): '+r.reply,'ok');if($('#ag-prov-msg'))$('#ag-prov-msg').textContent='Connected ('+r.latency_ms+' ms): '+r.reply;}
+    else{toast('Provider test failed: '+(r.error||'check config'),'err');if($('#ag-prov-msg'))$('#ag-prov-msg').textContent=r.error||'Test failed';}
+  }catch(e){toast('Test failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+
+function buildAgentPayload(){
+  const eng=$('#ag-engine').value;
+  const constraints={};
+  const mc=Number($('#ag-minctx').value)||0;if(mc>0)constraints.min_ctx=mc;
+  const hr=Number($('#ag-headroom').value)||0;if(hr>0)constraints.vram_headroom_mb=hr;
+  return {
+    engine:eng,
+    goal:$('#ag-goal').value,
+    model:eng==='avalon'?'':$('#ag-model').value,
+    profile:eng==='avalon'?($('#ag-model').value||'flagship'):'flagship',
+    constraints,
+    user_prompt:$('#ag-prompt').value.trim(),
+    max_trials:Number($('#ag-trials').value)||5
+  };
+}
+
+function renderAgentResult(title,data){
+  AG_LAST_RESULT=data;
+  $('#ag-result-card').classList.remove('hide');
+  $('#ag-result-title').textContent=title;
+  const moe=data.moe;
+  $('#ag-result-moe').innerHTML=moe
+    ?('<span class="tag '+(moe.feasible?'ok':'err')+'">'+(moe.is_moe?'MoE · '+esc(moe.strategy):esc(moe.strategy))+'</span>'
+      +(moe.gpu_hot_path_mb?'<span class="tag mut">GPU hot: '+moe.gpu_hot_path_mb+' MB</span>':'')
+      +(moe.cpu_cold_experts_mb?'<span class="tag mut">CPU experts: '+moe.cpu_cold_experts_mb+' MB</span>':'')
+      +(data.fit?'<span class="tag '+(data.fit.status==='fit'?'ok':data.fit.status==='tight'?'warn':'err')+'">'+esc(data.fit.badge)+' ('+data.fit.pct+'%)</span>':''))
+    :'';
+  const notes=data.notes||data.remediation_steps||[];
+  const extra=data.llm_analysis||data.llm_diagnosis||'';
+  $('#ag-result-notes').innerHTML=(notes.map(n=>'<div>• '+esc(n)+'</div>').join(''))
+    +(extra?'<div style="margin-top:8px;padding:8px;border-left:2px solid var(--acc);background:var(--bg-2)">'+esc(extra)+'</div>':'');
+  const cfg=data.config||data.fix_config;
+  $('#ag-result-cfg').textContent=cfg?JSON.stringify(cfg,null,2):(data.cause||'No config changes proposed.');
+  $('#ag-apply-btn').classList.toggle('hide',!cfg);
+  $('#ag-save-preset-btn').classList.toggle('hide',!cfg);
+}
+
+function renderAgentLlmChip(lm){
+  lm=lm||{};
+  const ltxt=lm.mode==='external'?'LLM: '+lm.model:(lm.mode==='local_fallback'?'LLM: local fallback':'deterministic');
+  if($('#ag-llm-chip')){$('#ag-llm-chip').textContent=ltxt;$('#ag-llm-chip').className='tag '+(lm.available?'ok':'mut');}
+  if($('#ag-sb-llm')){$('#ag-sb-llm').textContent=ltxt;$('#ag-sb-llm').className='tag '+(lm.available?'ok':'mut');}
+}
+
+async function loadAgentStatus(){
+  try{
+    const d=await api('/api/agent/status');
+    renderAgentLlmChip(d.llm);
+    renderTuneStatus(d.tune);
+  }catch(e){}
+}
+
+function renderTuneStatus(t){
+  const running=!!(t&&t.running);
+  if($('#ag-tune-chip')){$('#ag-tune-chip').textContent=running?'tuning…':(t&&t.session?t.session.state:'idle');$('#ag-tune-chip').className='tag '+(running?'acc':'mut');}
+  if(!t||!t.session){$('#ag-tune-card')?.classList.add('hide');return;}
+  const s=t.session;
+  $('#ag-tune-card').classList.remove('hide');
+  $('#ag-tune-state').textContent=s.state+' · '+s.completed_trials+'/'+s.max_trials+' trials';
+  $('#ag-tune-trials').innerHTML=(s.trials||[]).map(tr=>
+    '<div class="kvs" style="margin-bottom:4px">'
+    +'<span class="tag '+(tr.ok?'ok':'err')+'">#'+tr.index+' '+esc(tr.label)+'</span>'
+    +(tr.ok?'<span class="tag acc">'+tr.metrics.tok_s+' tok/s</span><span class="tag mut">TTFT '+tr.metrics.ttft_ms+'ms</span><span class="tag mut">VRAM '+tr.metrics.vram_mb+' MB</span><span class="tag mut">score '+tr.score+'</span>'
+      :'<span class="hint">'+esc(tr.error||'failed')+'</span>')
+    +'</div>'
+  ).join('')||'<span class="hint">Starting first trial…</span>';
+  $('#ag-tune-log').textContent=(s.log||[]).join('\n');
+}
+
+async function loadAgentCheckpoints(){
+  try{
+    const d=await api('/api/agent/checkpoints');
+    const cps=d.checkpoints||[];
+    $('#ag-checkpoints').innerHTML=cps.length?cps.map(c=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(c.label)+'</div><div class="hint">'+esc(c.id)+' · '+esc(c.engine)+' · '+new Date(c.ts*1000).toLocaleString()+'</div></div>'
+      +'<div style="display:flex;gap:4px">'
+      +'<button class="btn xs" data-cp-restore="'+esc(c.id)+'">Restore</button>'
+      +'<button class="btn xs danger" data-cp-del="'+esc(c.id)+'">×</button>'
+      +'</div></div>'
+    ).join(''):'<span class="hint">No checkpoints yet. One is auto-created before any Apply or Auto-Tune.</span>';
+  }catch(e){}
+}
+
+async function loadAgentPresets(){
+  try{
+    const d=await api('/api/agent/presets');
+    const ps=d.presets||[];
+    $('#ag-presets').innerHTML=ps.length?ps.map(p=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:6px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(p.name)+' <span class="tag mut">'+esc(p.engine)+'</span></div>'
+      +'<div class="hint">'+esc(p.notes||p.goal)+'</div></div>'
+      +'<div style="display:flex;gap:4px">'
+      +'<button class="btn xs primary" data-pre-apply="'+esc(p.id)+'">Apply</button>'
+      +(p.builtin?'':'<button class="btn xs danger" data-pre-del="'+esc(p.id)+'">×</button>')
+      +'</div></div>'
+    ).join(''):'<span class="hint">No presets.</span>';
+    $('#ag-presets')._items=ps;
+  }catch(e){}
+}
+
+async function loadAgentMemory(){
+  try{
+    const m=await api('/api/agent/memory');
+    const cal=m.vram_calibration||{};
+    const best=m.best||[];
+    $('#ag-memory').innerHTML=
+      '<div class="kvs" style="margin-bottom:8px">'
+      +'<span class="tag mut">Trials: '+m.trial_count+'</span>'
+      +'<span class="tag ok">Winners: '+m.best_count+'</span>'
+      +'<span class="tag mut">Failure signatures: '+m.failure_count+'</span>'
+      +'<span class="tag acc">VRAM calibration samples: '+(cal.total_samples||0)+'</span>'
+      +'</div>'
+      +(best.length?best.slice(0,8).map(b=>
+        '<div class="hint" style="padding:3px 0">• <b>'+esc(b.engine)+'</b> / '+esc(b.model_key)+' ('+esc(b.goal)+'): '
+        +((b.metrics&&b.metrics.tok_s)?b.metrics.tok_s+' tok/s, '+b.metrics.vram_mb+' MB VRAM':'recorded')+'</div>'
+      ).join(''):'<span class="hint">Run Active Auto-Tune to record empirically verified winners & calibrate VRAM estimates.</span>');
+  }catch(e){}
+}
+
+async function loadAgentAll(){
+  syncAgentModelOptions();
+  const sm=$('#ag-spec-model');
+  if(sm)sm.innerHTML='<option value="">(auto-select active / pinned)</option>'+MODELS.map(m=>'<option value="'+esc(m.path)+'">'+esc(m.name)+'</option>').join('');
+  await Promise.all([loadAgentStatus(),loadAgentProvider(),loadAgentCheckpoints(),loadAgentPresets(),loadAgentMemory(),loadThermalGuard()]);
+}
+
+/* Phase 2 UI: Thermal Guard */
+async function loadThermalGuard(){
+  try{
+    const d=await api('/api/agent/thermal');
+    const c=d.config||{};
+    if($('#tg-warn'))$('#tg-warn').value=c.warn_temp_c||80;
+    if($('#tg-throttle'))$('#tg-throttle').value=c.throttle_temp_c||88;
+    if($('#tg-kill'))$('#tg-kill').value=c.kill_temp_c||95;
+    if($('#tg-cool'))$('#tg-cool').value=c.cool_temp_c||70;
+    if($('#tg-pwrpct'))$('#tg-pwrpct').value=c.power_throttle_pct||15;
+    if($('#tg-vrampct'))$('#tg-vrampct').value=c.vram_pressure_pct||92;
+    if($('#tg-enabled'))$('#tg-enabled').checked=!!c.enabled;
+    if($('#tg-autoact'))$('#tg-autoact').checked=!!c.auto_act;
+    const ch=$('#tg-state-chip');
+    if(ch){
+      ch.textContent=d.state+(d.hw_override_active?' · hw override':'');
+      ch.className='tag '+(d.level===0?'ok':d.level===1?'warn':'err');
+    }
+    const hc=d.hw_caps||{};
+    if($('#tg-hw-hint')&&hc.setup_hint){
+      $('#tg-hw-hint').textContent='Hardware: '+hc.vendor+' (fan writable: '+hc.fan_writable+', power writable: '+hc.power_writable+'). '+hc.setup_hint;
+    }
+    const evs=d.events||[];
+    if($('#tg-events')){
+      $('#tg-events').innerHTML=evs.length?evs.slice(0,6).map(e=>'<div>• ['+new Date(e.ts*1000).toLocaleTimeString()+'] <b>'+esc(e.action)+'</b>: '+esc(e.detail)+'</div>').join(''):'No thermal events recorded.';
+    }
+  }catch(e){}
+}
+$('#tg-save')?.addEventListener('click',async()=>{
+  try{
+    await post('/api/agent/thermal/config',{
+      enabled:$('#tg-enabled').checked,auto_act:$('#tg-autoact').checked,
+      warn_temp_c:Number($('#tg-warn').value),throttle_temp_c:Number($('#tg-throttle').value),
+      kill_temp_c:Number($('#tg-kill').value),cool_temp_c:Number($('#tg-cool').value),
+      power_throttle_pct:Number($('#tg-pwrpct').value),vram_pressure_pct:Number($('#tg-vrampct').value)
+    });
+    toast('Thermal guard policy saved','ok');loadThermalGuard();
+  }catch(e){toast('Save failed: '+e.message,'err')}
+});
+$('#tg-eval-now')?.addEventListener('click',async()=>{
+  try{const r=await post('/api/agent/thermal/evaluate',{});toast('Thermal eval: '+r.state+' ('+(r.eff_temp_c||0)+'°C)','ok');loadThermalGuard();}
+  catch(e){toast('Eval failed: '+e.message,'err')}
+});
+$$('[data-tg-act]').forEach(b=>b.addEventListener('click',async()=>{
+  try{const r=await post('/api/agent/thermal/action',{action:b.dataset.tgAct});toast(r.ok?(r.detail||'Action executed'):(r.error||'Action failed'),r.ok?'ok':'warn');loadThermalGuard();}
+  catch(e){toast('Action failed: '+e.message,'err')}
+}));
+
+/* Phase 2 UI: Workload Router */
+async function runWorkloadRoute(apply){
+  const out=$('#ag-route-out');
+  try{
+    const r=await post('/api/agent/route',{task:$('#ag-route-task').value,apply,sync_agents:$('#ag-route-sync').checked});
+    const s=r.selected;
+    out.innerHTML='<div><b>Selected:</b> '+esc(s.engine)+' · <code>'+esc(s.model_key)+'</code> (score '+s.score+')</div>'
+      +'<div class="hint">'+(s.reasons||[]).map(esc).join(' · ')+'</div>'
+      +(r.applied?'<div class="tag ok" style="margin-top:6px">Launched (checkpoint '+esc(r.applied.checkpoint_id)+')</div>':'')
+      +(r.synced_agents?'<div class="tag acc" style="margin-top:6px">Synced coding agents</div>':'');
+    if(apply){loadAgentCheckpoints();pollStatus(true);}
+  }catch(e){toast('Route failed: '+e.message,'err')}
+}
+$('#ag-route-preview')?.addEventListener('click',()=>runWorkloadRoute(false));
+$('#ag-route-apply')?.addEventListener('click',()=>runWorkloadRoute(true));
+
+/* Phase 2 UI: Speculative Decoding Tuner */
+$('#ag-spec-run')?.addEventListener('click',async()=>{
+  const btn=$('#ag-spec-run');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/speculate',{model:$('#ag-spec-model').value,apply_best:true});
+    $('#ag-spec-out').innerHTML='<div><b>'+esc(r.verdict)+'</b></div>'
+      +(r.trials||[]).map(t=>'<div class="hint">• '+esc(t.label)+': '+(t.ok?t.tok_s+' tok/s ('+(t.speedup_pct>=0?'+':'')+t.speedup_pct+'%)':esc(t.error))+'</div>').join('');
+    loadAgentCheckpoints();loadAgentMemory();
+  }catch(e){toast('Speculation tuner failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+
+/* Phase 2 UI: HF Recommender */
+$('#ag-hf-go')?.addEventListener('click',async()=>{
+  const q=($('#ag-hf-q').value||'').trim();if(!q)return;
+  const btn=$('#ag-hf-go');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/hf/recommend',{query:q,goal:$('#ag-hf-goal').value});
+    const recs=r.recommendations||[];
+    $('#ag-hf-out').innerHTML=recs.length?recs.map((x,i)=>
+      '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--bd)">'
+      +'<div><div style="font-weight:600;font-size:12.5px">'+esc(x.repo)+' · <span class="tag acc">'+esc(x.quant)+'</span> <span class="tag '+(x.is_moe?'warn':'ok')+'">'+esc(x.fit_label)+'</span></div>'
+      +'<div class="hint">'+x.size_gb+' GB · GPU ~'+x.gpu_est_mb+' MB'+(x.ram_est_mb?' · RAM experts ~'+x.ram_est_mb+' MB':'')+(x.mmproj?' · +mmproj':'')+(x.draft?' · +draft':'')+'</div></div>'
+      +'<button class="btn xs primary" data-hf-rec-pull="'+i+'">Queue Pull</button></div>'
+    ).join(''):'<span class="hint">No fitting GGUF quants found for that query.</span>';
+    $('#ag-hf-out')._recs=recs;
+  }catch(e){toast('HF recommend failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-hf-out')?.addEventListener('click',async e=>{
+  const b=e.target.closest('[data-hf-rec-pull]');if(!b)return;
+  const rec=($('#ag-hf-out')._recs||[])[Number(b.dataset.hfRecPull)];if(!rec)return;
+  try{await post('/api/hf/pull',{repo:rec.repo,files:rec.pull_files});toast('Queued '+rec.pull_files.length+' file(s) from '+rec.repo,'ok');pollDownloads();}
+  catch(err){toast('Pull failed: '+err.message,'err')}
+});
+
+$('#ag-advise')?.addEventListener('click',async()=>{
+  const btn=$('#ag-advise');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/advise',buildAgentPayload());
+    renderAgentResult('Dry-Run Recommendation ('+d.engine+' · '+d.goal+')',d);
+  }catch(e){toast('Advise failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-tune-start')?.addEventListener('click',async()=>{
+  const btn=$('#ag-tune-start');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/tune/start',buildAgentPayload());
+    renderTuneStatus(d);loadAgentCheckpoints();toast('Auto-tune started (safety checkpoint created)','ok');
+  }catch(e){toast('Auto-tune failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-tune-stop')?.addEventListener('click',async()=>{
+  await post('/api/agent/tune/stop',{rollback:false});toast('Stopping auto-tune…','ok');loadAgentStatus();
+});
+$('#ag-tune-rollback')?.addEventListener('click',async()=>{
+  await post('/api/agent/tune/stop',{rollback:true});toast('Stopped and rolled back to checkpoint','ok');loadAgentStatus();
+});
+$('#ag-diagnose')?.addEventListener('click',async()=>{
+  const btn=$('#ag-diagnose');btn.disabled=true;
+  try{
+    const d=await post('/api/agent/diagnose',{engine:$('#ag-engine').value});
+    renderAgentResult('Failure Diagnosis ('+d.engine+'): '+d.title,d);
+  }catch(e){toast('Diagnose failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-cp-now')?.addEventListener('click',async()=>{
+  try{
+    const cp=await post('/api/agent/checkpoints',{engine:$('#ag-engine').value,label:'Manual checkpoint ('+$('#ag-engine').value+')'});
+    toast('Created checkpoint '+cp.id,'ok');loadAgentCheckpoints();
+  }catch(e){toast('Checkpoint failed: '+e.message,'err')}
+});
+$('#ag-apply-btn')?.addEventListener('click',async()=>{
+  if(!AG_LAST_RESULT)return;
+  const cfg=AG_LAST_RESULT.config||AG_LAST_RESULT.fix_config;if(!cfg)return;
+  const btn=$('#ag-apply-btn');btn.disabled=true;
+  try{
+    const r=await post('/api/agent/apply',{engine:AG_LAST_RESULT.engine,config:cfg,launch:true,goal:AG_LAST_RESULT.goal||'balanced'});
+    toast('Applied & launched (checkpoint '+r.checkpoint_id+')','ok');
+    loadAgentCheckpoints();pollStatus(true);
+  }catch(e){toast('Apply failed: '+e.message,'err')}
+  btn.disabled=false;
+});
+$('#ag-save-preset-btn')?.addEventListener('click',async()=>{
+  if(!AG_LAST_RESULT)return;
+  const cfg=AG_LAST_RESULT.config||AG_LAST_RESULT.fix_config;if(!cfg)return;
+  const nm=prompt('Preset name:',(AG_LAST_RESULT.engine||'llama')+' · '+(AG_LAST_RESULT.goal||'custom'));
+  if(!nm)return;
+  try{
+    await post('/api/agent/presets',{name:nm,engine:AG_LAST_RESULT.engine,goal:AG_LAST_RESULT.goal||'balanced',config:cfg,notes:(AG_LAST_RESULT.notes||[])[0]||''});
+    toast('Preset saved','ok');loadAgentPresets();
+  }catch(e){toast('Save preset failed: '+e.message,'err')}
+});
+$('#ag-cp-refresh')?.addEventListener('click',loadAgentCheckpoints);
+$('#ag-pre-refresh')?.addEventListener('click',loadAgentPresets);
+$('#ag-mem-refresh')?.addEventListener('click',loadAgentMemory);
+$('#ag-mem-clear')?.addEventListener('click',async()=>{
+  if(!confirm('Clear persistent agent experience memory?'))return;
+  await fetch('/api/agent/memory',{method:'DELETE'});toast('Agent memory cleared','ok');loadAgentMemory();
+});
+$('#ag-checkpoints')?.addEventListener('click',async e=>{
+  const r=e.target.closest('[data-cp-restore]');
+  if(r){
+    try{await post('/api/agent/checkpoints/'+r.dataset.cpRestore+'/restore',{relaunch:true});toast('Checkpoint restored','ok');pollStatus(true);}
+    catch(err){toast('Restore failed: '+err.message,'err')}
+    return;
+  }
+  const d=e.target.closest('[data-cp-del]');
+  if(d){await fetch('/api/agent/checkpoints/'+d.dataset.cpDel,{method:'DELETE'});loadAgentCheckpoints();}
+});
+$('#ag-presets')?.addEventListener('click',async e=>{
+  const a=e.target.closest('[data-pre-apply]');
+  if(a){
+    const p=($('#ag-presets')._items||[]).find(x=>x.id===a.dataset.preApply);
+    if(!p)return;
+    try{const r=await post('/api/agent/apply',{engine:p.engine,config:p.config,launch:true,goal:p.goal||'balanced'});toast('Applied preset '+p.name+' (checkpoint '+r.checkpoint_id+')','ok');loadAgentCheckpoints();pollStatus(true);}
+    catch(err){toast('Apply preset failed: '+err.message,'err')}
+    return;
+  }
+  const d=e.target.closest('[data-pre-del]');
+  if(d){await fetch('/api/agent/presets/'+d.dataset.preDel,{method:'DELETE'});loadAgentPresets();}
+});
+
+/* Quick triggers on llama.cpp / Strata / Avalon tabs */
+document.addEventListener('click',e=>{
+  const q=e.target.closest('[data-agent-quick]');if(!q)return;
+  const [eng,act]=q.dataset.agentQuick.split(':');
+  setTab('agent');
+  if($('#ag-engine')){$('#ag-engine').value=eng;syncAgentModelOptions();}
+  if(act==='diagnose')$('#ag-diagnose')?.click();
+  else $('#ag-advise')?.click();
+});
+
+/* Collapsible Agent Chat Sidebar + Comprehensive Clickable Action Menu */
+let AG_ACTIONS=[];
+let AG_ACTIVE_TPL=null;
+
+function currentAgentEngine(){
+  return (tab==='strata'||tab==='avalon'||tab==='maya')?tab:($('#ag-engine')?.value||'llama');
+}
+function toggleAgentMenu(force){
+  const p=$('#ag-menu-panel'),btn=$('#ag-menu-toggle');if(!p||!btn)return;
+  const open=typeof force==='boolean'?force:p.hidden;
+  p.hidden=!open;
+  btn.setAttribute('aria-expanded',String(open));
+  if(open){loadAgentActions();$('#ag-menu-filter')?.focus();}
+}
+function syncMenuExpandBtn(){
+  const acc=$('#ag-menu-acc'),btn=$('#ag-menu-expand-all');if(!acc||!btn)return;
+  const items=[...acc.querySelectorAll(':scope > details')];
+  const allOpen=items.length>0&&items.every(d=>d.open);
+  btn.setAttribute('aria-expanded',String(allOpen));
+}
+function renderAgentActionMenu(filterText=''){
+  const acc=$('#ag-menu-acc');if(!acc)return;
+  const q=(filterText||'').trim().toLowerCase();
+  const byCat=new Map();
+  AG_ACTIONS.forEach(a=>{
+    const hay=(a.label+' '+a.description+' '+a.category+' '+a.id).toLowerCase();
+    if(q&&!hay.includes(q))return;
+    if(!byCat.has(a.category))byCat.set(a.category,[]);
+    byCat.get(a.category).push(a);
+  });
+  acc.innerHTML='';
+  if(!byCat.size){
+    const empty=document.createElement('div');empty.className='hint';empty.style.padding='8px';
+    empty.textContent='No matching actions.';acc.appendChild(empty);syncMenuExpandBtn();return;
+  }
+  let idx=0;
+  for(const [cat,items] of byCat.entries()){
+    const det=document.createElement('details');
+    if(q||idx===0)det.open=true;
+    const sum=document.createElement('summary');
+    sum.textContent=cat+' ('+items.length+')';
+    det.appendChild(sum);
+    const grid=document.createElement('div');grid.className='ag-menu-grid';
+    items.forEach(a=>{
+      const b=document.createElement('button');b.type='button';b.className='ag-act-item';
+      b.dataset.agMenuAct=a.id;
+      const top=document.createElement('span');top.className='ag-act-item-top';
+      const lbl=document.createElement('span');lbl.textContent=a.label;
+      const badge=document.createElement('span');badge.className='tag '+(a.instant?'ok':'acc');
+      badge.textContent=a.instant?'1-click':'template';
+      top.appendChild(lbl);top.appendChild(badge);
+      const desc=document.createElement('span');desc.className='ag-act-item-desc';desc.textContent=a.description||'';
+      b.appendChild(top);b.appendChild(desc);
+      grid.appendChild(b);
+    });
+    det.appendChild(grid);
+    acc.appendChild(det);
+    idx++;
+  }
+  syncMenuExpandBtn();
+}
+async function loadAgentActions(force=false){
+  if(AG_ACTIONS.length&&!force){renderAgentActionMenu($('#ag-menu-filter')?.value||'');return;}
+  try{
+    const d=await api('/api/agent/actions');
+    AG_ACTIONS=d.actions||[];
+    renderAgentActionMenu($('#ag-menu-filter')?.value||'');
+  }catch(e){toast('Failed to load agent actions: '+e.message,'err')}
+}
+function closeAgentTemplateForm(){
+  AG_ACTIVE_TPL=null;
+  const f=$('#ag-tpl-form');if(f)f.hidden=true;
+}
+function formatTemplatePrompt(tpl,vals){
+  let s=tpl.prompt_template||tpl.label;
+  Object.entries(vals).forEach(([k,v])=>{s=s.replaceAll('{'+k+'}',String(v));});
+  return s;
+}
+function readTemplateFormValues(){
+  const vals={};
+  if(!AG_ACTIVE_TPL)return vals;
+  (AG_ACTIVE_TPL.fields||[]).forEach(f=>{
+    const el=$('#ag-tf-'+f.name);if(!el)return;
+    if(f.type==='checkbox')vals[f.name]=!!el.checked;
+    else if(f.type==='number')vals[f.name]=Number(el.value||f.default||0);
+    else vals[f.name]=(el.value||'').trim();
+  });
+  return vals;
+}
+function openAgentTemplate(actionId){
+  const tpl=AG_ACTIONS.find(a=>a.id===actionId);
+  if(!tpl){
+    loadAgentActions().then(()=>{const t=AG_ACTIONS.find(a=>a.id===actionId);if(t)openAgentTemplate(actionId);});
+    return;
+  }
+  if(tpl.instant||!(tpl.fields&&tpl.fields.length)){
+    toggleAgentMenu(false);
+    closeAgentTemplateForm();
+    runAgentActionTemplate(tpl,{});
+    return;
+  }
+  AG_ACTIVE_TPL=tpl;
+  toggleAgentMenu(false);
+  const form=$('#ag-tpl-form'),fieldsBox=$('#ag-tpl-fields');if(!form||!fieldsBox)return;
+  $('#ag-tpl-title').textContent=tpl.label;
+  $('#ag-tpl-desc').textContent=tpl.description||'';
+  fieldsBox.innerHTML='';
+  const curEng=currentAgentEngine();
+  (tpl.fields||[]).forEach(f=>{
+    const wrap=document.createElement('label');
+    wrap.className='ag-tpl-field'+(f.type==='checkbox'?' chk':'');
+    const id='ag-tf-'+f.name;
+    let inp;
+    if(f.type==='checkbox'){
+      inp=document.createElement('input');inp.type='checkbox';inp.id=id;inp.checked=!!f.default;
+      const sp=document.createElement('span');sp.textContent=f.label;
+      wrap.appendChild(inp);wrap.appendChild(sp);
+    }else if(f.type==='select'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('select');inp.id=id;
+      const defVal=(f.name==='engine')?curEng:(f.default||'');
+      (f.options||[]).forEach(opt=>{
+        const o=document.createElement('option');o.value=opt;o.textContent=opt;
+        if(opt===defVal)o.selected=true;
+        inp.appendChild(o);
+      });
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else if(f.type==='model_select'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('select');inp.id=id;
+      const autoOpt=document.createElement('option');autoOpt.value='';autoOpt.textContent='(auto / active model)';
+      inp.appendChild(autoOpt);
+      (typeof MODELS!=='undefined'&&Array.isArray(MODELS)?MODELS:[]).forEach(m=>{
+        const o=document.createElement('option');o.value=m.path||m.name;o.textContent=m.name+(m.quant?' ('+m.quant+')':'');
+        inp.appendChild(o);
+      });
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else if(f.type==='number'){
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('input');inp.type='number';inp.id=id;inp.value=f.default!=null?f.default:'';
+      if(f.min!=null)inp.min=f.min;if(f.max!=null)inp.max=f.max;
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }else{
+      const sp=document.createElement('span');sp.textContent=f.label;
+      inp=document.createElement('input');inp.type='text';inp.id=id;inp.placeholder=f.placeholder||'';
+      if(f.default)inp.value=f.default;
+      if(f.required)inp.required=true;
+      wrap.appendChild(sp);wrap.appendChild(inp);
+    }
+    fieldsBox.appendChild(wrap);
+  });
+  form.hidden=false;
+  const firstInp=fieldsBox.querySelector('input[type="text"],input[type="number"],select');
+  firstInp?.focus();
+}
+async function runAgentActionTemplate(tpl,params){
+  const displayMsg=formatTemplatePrompt(tpl,params);
+  appendAgentBubble('user',displayMsg);
+  try{
+    const eng=params.engine||currentAgentEngine();
+    const r=await post('/api/agent/chat',{message:displayMsg,engine:eng,model:params.model||'',action_id:tpl.id,params});
+    if(r.llm)renderAgentLlmChip(r.llm);
+    appendAgentBubble('bot',r.reply,r.actions||[]);
+  }catch(e){appendAgentBubble('bot','Error: '+e.message);}
+}
+
+function toggleAgentDrawer(force){
+  const dr=$('#agentdrawer');if(!dr)return;
+  dr.classList.toggle('open',typeof force==='boolean'?force:!dr.classList.contains('open'));
+  if(dr.classList.contains('open')){$('#ag-sb-in')?.focus();loadAgentStatus();loadAgentActions();}
+}
+$('#agentdrawerbtn')?.addEventListener('click',()=>toggleAgentDrawer());
+$('#ag-open-sidebar')?.addEventListener('click',()=>toggleAgentDrawer(true));
+$('#ag-sb-close')?.addEventListener('click',()=>toggleAgentDrawer(false));
+$('#ag-menu-toggle')?.addEventListener('click',()=>toggleAgentMenu());
+$('#ag-sb-clear')?.addEventListener('click',async()=>{
+  const box=$('#ag-sb-msgs');if(!box)return;
+  try{await fetch('/api/agent/chat',{method:'DELETE'});}catch(e){}
+  box.innerHTML='<div class="agent-msg bot">Chat cleared. Pick any workflow from <b>Actions Menu</b> or type below.</div>';
+});
+$('#ag-menu-filter')?.addEventListener('input',e=>renderAgentActionMenu(e.target.value));
+$('#ag-menu-expand-all')?.addEventListener('click',e=>{
+  const btn=e.currentTarget,acc=$('#ag-menu-acc');if(!acc)return;
+  const expand=btn.getAttribute('aria-expanded')!=='true';
+  acc.querySelectorAll(':scope > details').forEach(d=>{d.open=expand;});
+  btn.setAttribute('aria-expanded',String(expand));
+});
+$('#ag-menu-acc')?.addEventListener('toggle',e=>{
+  if(e.target.matches('.ag-menu-acc > details'))syncMenuExpandBtn();
+},{capture:true});
+$('#ag-menu-acc')?.addEventListener('click',e=>{
+  const b=e.target.closest('[data-ag-menu-act]');if(!b)return;
+  openAgentTemplate(b.dataset.agMenuAct);
+});
+$('#ag-tpl-cancel')?.addEventListener('click',closeAgentTemplateForm);
+$('#ag-tpl-insert')?.addEventListener('click',()=>{
+  if(!AG_ACTIVE_TPL)return;
+  const vals=readTemplateFormValues();
+  $('#ag-sb-in').value=formatTemplatePrompt(AG_ACTIVE_TPL,vals);
+  closeAgentTemplateForm();
+  $('#ag-sb-in').focus();
+});
+$('#ag-tpl-form')?.addEventListener('submit',async e=>{
+  e.preventDefault();
+  if(!AG_ACTIVE_TPL)return;
+  const tpl=AG_ACTIVE_TPL;
+  const vals=readTemplateFormValues();
+  closeAgentTemplateForm();
+  await runAgentActionTemplate(tpl,vals);
+});
+
+function appendAgentBubble(role,text,actions){
+  const box=$('#ag-sb-msgs');if(!box)return;
+  const div=document.createElement('div');
+  div.className='agent-msg '+(role==='user'?'usr':'bot');
+  div.textContent=text;
+  if(actions&&actions.length){
+    const acts=document.createElement('div');acts.className='agent-acts';
+    actions.forEach((a,idx)=>{
+      const b=document.createElement('button');b.type='button';
+      b.className='btn xs'+(idx===0?' primary':'');
+      b.textContent=a.label;
+      b.addEventListener('click',async()=>{
+        b.disabled=true;
+        try{
+          if(a.type==='apply'){
+            const r=await post('/api/agent/apply',{engine:a.engine,config:a.config,launch:true,goal:a.goal||'balanced'});
+            toast('Applied (checkpoint '+r.checkpoint_id+')','ok');pollStatus(true);
+          }else if(a.type==='start_tune'){
+            await post('/api/agent/tune/start',{engine:a.engine,goal:a.goal||'fastest',model:a.model||''});
+            setTab('agent');loadAgentStatus();toast('Auto-tune started','ok');
+          }else if(a.type==='stop_tune'){
+            await post('/api/agent/tune/stop',{rollback:!!a.rollback});
+            loadAgentStatus();toast(a.rollback?'Stopped & rolled back':'Auto-tune stopped','ok');
+          }else if(a.type==='restore_checkpoint'){
+            await post('/api/agent/checkpoints/'+a.checkpoint_id+'/restore',{relaunch:true});
+            toast('Restored '+a.checkpoint_id,'ok');pollStatus(true);
+          }else if(a.type==='create_checkpoint'){
+            const cp=await post('/api/agent/checkpoints',{engine:a.engine||currentAgentEngine(),label:'Chat checkpoint'});
+            toast('Created checkpoint '+cp.id,'ok');loadAgentCheckpoints();
+          }else if(a.type==='hf_pull'){
+            await post('/api/hf/pull',{repo:a.repo,files:a.files||[],sizes:a.sizes||{}});
+            toast('Queued '+(a.files||[]).length+' file(s) from '+a.repo,'ok');pollDownloads();
+          }else if(a.type==='stop_engine'){
+            const ep=a.engine==='avalon'?'/api/avalon/stop':(a.engine==='strata'?'/api/strata/stop':(a.engine==='maya'?'/api/maya/stop':'/api/server/stop'));
+            await post(ep,{});toast('Stopped '+a.engine,'ok');pollStatus(true);
+          }else if(a.type==='killswitch'){
+            const r=await post('/api/agent/thermal/action',{action:'killswitch'});
+            toast(r.detail||'Stopped all engines','ok');pollStatus(true);
+          }else if(a.type==='downshift'){
+            const r=await post('/api/agent/thermal/action',{action:'downshift'});
+            toast(r.detail||'Downshifted active engine','ok');pollStatus(true);
+          }else if(a.type==='thermal_evaluate'){
+            const r=await post('/api/agent/thermal/evaluate',{});
+            toast('Thermal: '+r.state+' ('+(r.eff_temp_c||0)+'°C)','ok');
+          }else if(a.type==='benchmark'){
+            const r=await post('/api/benchmarks/run',{prompt_key:a.prompt_key||'short',max_tokens:a.max_tokens||128});
+            toast('Benchmark: '+(r.gen_tps||r.tok_s||0)+' tok/s','ok');
+          }else if(a.type==='sync_agents'){
+            const agd=await api('/api/agents');
+            const ids=(agd.agents||[]).map(x=>x.id);
+            await post('/api/agents/sync',{agents:ids,source:a.source||'auto'});
+            toast('Synced '+ids.length+' coding agents','ok');
+          }else if(a.type==='heal'){
+            const r=await post('/api/agent/heal',{engine:a.engine||currentAgentEngine()});
+            toast(r.healed?'Engine healed & relaunched':(r.detail||'No fix applied'),r.healed?'ok':'warn');pollStatus(true);
+          }else if(a.type==='open_tab'){
+            setTab(a.tab||'agent');
+          }else if(a.type==='open_template'){
+            openAgentTemplate(a.action_id);
+          }else if(a.type==='send_chat'){
+            await sendAgentChat(a.message||'');
+          }
+        }catch(err){toast('Action failed: '+err.message,'err')}
+        b.disabled=false;
+      });
+      acts.appendChild(b);
+    });
+    div.appendChild(acts);
+  }
+  box.appendChild(div);
+  box.scrollTop=box.scrollHeight;
+}
+async function sendAgentChat(text){
+  const msg=(text||$('#ag-sb-in').value||'').trim();if(!msg)return;
+  $('#ag-sb-in').value='';
+  closeAgentTemplateForm();
+  appendAgentBubble('user',msg);
+  try{
+    const eng=currentAgentEngine();
+    const r=await post('/api/agent/chat',{message:msg,engine:eng});
+    if(r.llm)renderAgentLlmChip(r.llm);
+    appendAgentBubble('bot',r.reply,r.actions||[]);
+  }catch(e){appendAgentBubble('bot','Error: '+e.message);}
+}
+$('#ag-sb-form')?.addEventListener('submit',e=>{e.preventDefault();sendAgentChat();});
+$('#ag-sb-in')?.addEventListener('keydown',e=>{
+  if(e.key==='Enter'){
+    e.preventDefault();
+    if(e.isComposing||e.keyCode===229)return;
+    $('#ag-sb-form')?.requestSubmit();
+  }
+});
+$$('[data-ag-tpl]').forEach(b=>b.addEventListener('click',()=>openAgentTemplate(b.dataset.agTpl)));
+
 /* ============================== polling & keys ============================== */
 function tick(){
   if(document.hidden)return;
   pollStatus();
   pollTelemetry();
-  if(tab==='strata')loadStrata();
+  if(tab==='strata'){loadStrata();pollStrataTelemetry();}
   if(tab==='avalon')loadAvalon();
+  if(tab==='agent')loadAgentStatus();
+  if(tab==='maya')loadMaya();
 }
 setInterval(tick,2500);
+setInterval(()=>{if(!document.hidden)refreshVitals()},5000);
 setInterval(()=>{if(!document.hidden&&tab==='vitals')refreshVitals()},2000);
 setInterval(()=>{if(!document.hidden&&tab==='server')refreshLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='strata')refreshStrataLog()},1500);
 setInterval(()=>{if(!document.hidden&&tab==='avalon')refreshAvalonLog()},1500);
-async function refreshAvalonLog(){try{const d=await api('/api/avalon/log');paintInto($('#avalonlog'),d.log)}catch(e){}}
+setInterval(()=>{if(!document.hidden&&tab==='maya')refreshMayaLog()},1500);
+async function refreshAvalonLog(){
+  try{const d=await api('/api/avalon/log');AVLOGTEXT=d.log||'';paintFilteredLog($('#avalonlog'),AVLOGTEXT,'#avlogfilter','#avlogauto','#avlogn')}catch(e){}
+}
 document.addEventListener('visibilitychange',()=>{if(!document.hidden){pollStatus();pollTelemetry();refreshVitals()}});
 document.addEventListener('keydown',e=>{
   if((e.metaKey||e.ctrlKey)&&e.key.toLowerCase()==='k'){
@@ -6736,10 +10582,11 @@ document.addEventListener('keydown',e=>{
   }
   if(e.metaKey||e.ctrlKey||e.altKey)return;
   if($$('dialog[open]').length)return;
-  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.TagName==='SELECT'||t.isContentEditable);
+  const t=e.target,typing=t&&(t.tagName==='INPUT'||t.tagName==='TEXTAREA'||t.tagName==='SELECT'||t.isContentEditable);
+  if(e.key==='Escape'&&document.body.classList.contains('nav-open')){closeNav();return;}
   if(e.key==='/'&&!typing){
     e.preventDefault();
-    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
+    if(tab==='hf')$('#hfq').focus();else if(tab==='server')$('#logfilter').focus();else if(tab==='strata')$('#stlogfilter').focus();else if(tab==='avalon')$('#avlogfilter').focus();else if(tab==='chat')$('#csearch').focus();else{setTab('models');$('#msearch').focus()}
     return;
   }
   if(!typing&&TABS[Number(e.key)-1])setTab(TABS[Number(e.key)-1]);
@@ -6751,7 +10598,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadModelHost();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadModelHost();loadAvalon();loadAvalonAccess();loadMaya();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();loadAgentStatus();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""
