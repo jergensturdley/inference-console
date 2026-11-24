@@ -28,6 +28,7 @@ DEFAULT_CONFIG = {
     "ctx": 8192,
     "port_base": 8830,
     "bind_host": "0.0.0.0",      # the admin API can launch arbitrary binaries — use 127.0.0.1 for local-only
+    "model_server_host": "127.0.0.1",  # 127.0.0.1 (local) or 0.0.0.0 (LAN) for model servers
     "avalon_lan": False,
     "avalon_api_key": "",
     "idle_unload_min": 0,        # 0 = never auto-unload the panel's llama-server
@@ -75,6 +76,23 @@ def load_config():
 _migrate_legacy_paths()
 CFG = load_config()
 APP_DIR.mkdir(parents=True, exist_ok=True)
+
+def _normalize_model_host(val) -> str:
+    if isinstance(val, bool):
+        return "0.0.0.0" if val else "127.0.0.1"
+    s = str(val or "").strip().lower()
+    if s in ("0.0.0.0", "lan", "all", "*", "true", "1", "yes", "on"):
+        return "0.0.0.0"
+    if s in ("127.0.0.1", "localhost", "local", "false", "0", "no", "off", ""):
+        return "127.0.0.1"
+    raise HTTPException(400, f"invalid model_server_host: {val!r} (expected '0.0.0.0' or '127.0.0.1')")
+
+def model_server_host() -> str:
+    return "0.0.0.0" if str(CFG.get("model_server_host") or "").strip() == "0.0.0.0" else "127.0.0.1"
+
+def _host_from_cmd(cmd: str) -> str:
+    m = re.search(r"--host(?:=|\s+)(\S+)", cmd or "")
+    return m.group(1) if m else "127.0.0.1"
 
 def _pid_alive(pid) -> bool:
     """True if the process exists (portable: no /proc needed)."""
@@ -709,15 +727,17 @@ class ServerManager:
             if not argv or os.path.basename(argv[0]) != "llama-server":
                 continue
             model = port = mmproj = ngl = dev = None
+            host = "127.0.0.1"
             ot = False
             i = 1
             while i < len(argv):
                 a = argv[i]
-                if a in ("-m", "--mmproj", "-ngl", "--device") and i + 1 < len(argv):
+                if a in ("-m", "--mmproj", "-ngl", "--device", "--host") and i + 1 < len(argv):
                     v = argv[i + 1]; i += 1
                     if a == "-m": model = v
                     elif a == "--mmproj": mmproj = v
                     elif a == "--device": dev = v
+                    elif a == "--host": host = v
                     else: ngl = v
                 elif a == "--port" and i + 1 < len(argv):
                     try: port = int(argv[i + 1])
@@ -747,7 +767,7 @@ class ServerManager:
             except Exception:
                 pass
             out.append({"pid": int(pdir.name), "port": port, "model": model,
-                        "alias": Path(model).stem, "preset": preset,
+                        "alias": Path(model).stem, "preset": preset, "host": host,
                         "started_at": started_at})
         return out
 
@@ -878,6 +898,8 @@ class ServerManager:
                 return {
                     "running": True, "pid": pid, "alias": i.get("alias"), "model": i.get("model"),
                     "port": i.get("port"), "preset": i.get("preset"), "ctx": i.get("ctx"),
+                    "host": i.get("host") or _host_from_cmd(i.get("cmd", "")),
+                    "configured_host": model_server_host(),
                     "cmd": i.get("cmd", ""),
                     "uptime": int(time.time() - i.get("started_at", time.time())),
                     "idle_sec": idle_sec,
@@ -896,7 +918,8 @@ class ServerManager:
                 self.proc = None
                 self.info = {"pid": cand["pid"], "port": cand["port"],
                              "alias": cand["alias"], "model": cand["model"],
-                             "preset": cand["preset"], "started_at": cand["started_at"],
+                             "preset": cand["preset"], "host": cand.get("host", "127.0.0.1"),
+                             "started_at": cand["started_at"],
                              "adopted": True}
                 self.last_active = time.time()
                 self._save_state()
@@ -905,11 +928,13 @@ class ServerManager:
                 i = self.info
                 break
         if not i:
-            return {"running": False}
+            return {"running": False, "configured_host": model_server_host()}
         idle_sec = int(max(0, time.time() - self.last_active))
         return {
             "running": True, "pid": i.get("pid"), "alias": i.get("alias"), "model": i.get("model"),
             "port": i.get("port"), "preset": i.get("preset"), "ctx": i.get("ctx"),
+            "host": i.get("host") or _host_from_cmd(i.get("cmd", "")),
+            "configured_host": model_server_host(),
             "cmd": i.get("cmd", ""),
             "uptime": int(time.time() - i.get("started_at", time.time())),
             "idle_sec": idle_sec,
@@ -927,7 +952,7 @@ class ServerManager:
                    draft: str = "", draft_max: int = 16, draft_min: int = 0,
                    ot: str = "", tensor_split: str = "", tbatch: int | None = None,
                    keep: int | None = None, jinja: str = "on",
-                   port: int | None = None):
+                   port: int | None = None, host: str | None = None):
         mp = Path(model)
         meta = next((m for m in scan_models()["models"] if m["path"] == model), None)
         igpu = preset.startswith("igpu")
@@ -962,8 +987,9 @@ class ServerManager:
 
         binary = CFG.get("server_binary", BIN)
         caps = bin_caps(binary)
+        eff_host = _normalize_model_host(host) if host is not None else model_server_host()
 
-        args = [binary, "-m", model, "--host", "127.0.0.1",
+        args = [binary, "-m", model, "--host", eff_host,
                 "-c", str(eff_ctx), "--alias", mp.stem,
                 "-ngl", str(eff_ngl), "-t", str(eff_t)]
         if jinja in ("on", "auto") and caps.get("jinja"):
@@ -1084,11 +1110,43 @@ class ServerManager:
         self.last_active = time.time()
         self.last_tok_s = 0.0
         self.last_prompt_s = 0.0
+        eff_host = _host_from_cmd(cmd_str)
+        launch_opts = {
+            "preset": preset, "extra_args": extra_args, "ctx": eff_ctx, "ngl": ngl,
+            "threads": threads, "fa": fa, "ctk": ctk, "ctv": ctv, "parallel": parallel,
+            "batch": batch, "ubatch": ubatch, "ncmoe": ncmoe, "mlock": mlock,
+            "no_mmap": no_mmap, "draft": draft, "draft_max": draft_max,
+            "draft_min": draft_min, "ot": ot, "tensor_split": tensor_split,
+            "tbatch": tbatch, "keep": keep, "jinja": jinja,
+        }
         self.info = {"pid": self.proc.pid, "port": port, "alias": mp.stem, "model": model,
-                     "preset": resolved_preset, "ctx": eff_ctx, "cmd": _redact_cmd(cmd_str),
+                     "preset": resolved_preset, "ctx": eff_ctx, "host": eff_host,
+                     "cmd": _redact_cmd(cmd_str), "launch_opts": launch_opts,
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
+
+    def restart(self):
+        st = self.status()
+        if not st.get("running") or not st.get("model"):
+            return {"restarted": False, "reason": "not running"}
+        model = st["model"]
+        if not Path(model).exists():
+            return {"restarted": False, "reason": f"model not found: {model}"}
+        opts = dict(self.info.get("launch_opts") or {})
+        if not opts:
+            profs = _read_json(LAUNCH_PROFILES_PATH, {})
+            saved = profs.get(model) or {}
+            opts = {k: saved[k] for k in (
+                "preset", "extra_args", "ctx", "ngl", "threads", "fa", "ctk", "ctv",
+                "parallel", "batch", "ubatch", "ncmoe", "mlock", "no_mmap", "draft",
+                "draft_max", "draft_min", "ot", "tensor_split", "tbatch", "keep", "jinja",
+            ) if k in saved}
+            if "preset" not in opts and st.get("preset") and st["preset"] != "external":
+                opts["preset"] = st["preset"]
+        self.stop()
+        new_st = self.start(model, save_profile=False, **opts)
+        return {"restarted": True, "status": new_st}
 
     @staticmethod
     def _port_busy(port):
@@ -1326,6 +1384,7 @@ class AvalonManager:
         return {
             "running": True, "state": state,
             "pid": st.get("pid"), "profile": st.get("profile"), "port": AVALON_PORT,
+            "host": st.get("host") or _host_from_cmd(st.get("cmd", "")),
             "uptime": int(time.time() - st.get("started_at", time.time())),
             "model": detail.get("model"), "max_context": detail.get("max_context"),
             "cmd": st.get("cmd", ""),
@@ -1418,6 +1477,7 @@ class AvalonManager:
             text=True, errors="replace", start_new_session=True)
         threading.Thread(target=self._pump_logs, daemon=True).start()
         self.info = {"profile": profile, "pid": self.proc.pid, "cmd": _redact_cmd(cmd_str),
+                     "host": _host_from_cmd(cmd_str),
                      "started_at": time.time(), "adopted": False}
         self._save_state()
         return self.status()
@@ -2709,7 +2769,13 @@ def _save_config_secure():
     except Exception:
         pass
 
-def _lan_ip():
+_lan_ip_cache = {"ts": 0.0, "ip": "127.0.0.1"}
+
+def _lan_ip(refresh: bool = False):
+    now = time.time()
+    if not refresh and (now - _lan_ip_cache["ts"]) < 30.0:
+        return _lan_ip_cache["ip"]
+    ip_out = "127.0.0.1"
     try:
         out = subprocess.check_output(["ip", "-4", "-o", "addr", "show", "scope", "global"],
                                       text=True, timeout=3)
@@ -2724,9 +2790,108 @@ def _lan_ip():
                 break
             if best is None and ip.startswith(("10.", "172.")):
                 best = ip
-        return best or "127.0.0.1"
+        if best:
+            ip_out = best
     except Exception:
-        return "127.0.0.1"
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.connect(("10.255.255.255", 1))
+                cand = s.getsockname()[0]
+                if cand and not cand.startswith("127."):
+                    ip_out = cand
+        except Exception:
+            pass
+    _lan_ip_cache["ts"] = now
+    _lan_ip_cache["ip"] = ip_out
+    return ip_out
+
+def _model_host_state():
+    host = model_server_host()
+    lan = host == "0.0.0.0"
+    ip = _lan_ip()
+    m = MGR.status()
+    a = SMGR.status()
+    s = strata_status()
+    llama_running = bool(m.get("running") and m.get("port") != AVALON_PORT)
+    llama_host = m.get("host", "127.0.0.1") if llama_running else host
+    avalon_running = bool(a.get("running"))
+    want_av_host = "0.0.0.0" if CFG.get("avalon_lan") else "127.0.0.1"
+    avalon_host = a.get("host", "127.0.0.1") if avalon_running else want_av_host
+    strata_running = bool(s.get("running"))
+    needs_restart = []
+    if llama_running and llama_host != host:
+        needs_restart.append("llama.cpp")
+    if avalon_running and avalon_host != want_av_host:
+        needs_restart.append("avalon")
+    return {
+        "host": host,
+        "lan": lan,
+        "ip": ip,
+        "avalon_lan": bool(CFG.get("avalon_lan")),
+        "running": {
+            "llama": {"running": llama_running, "host": llama_host,
+                      "port": m.get("port") if llama_running else None,
+                      "mismatch": llama_running and llama_host != host},
+            "avalon": {"running": avalon_running, "host": avalon_host,
+                       "port": AVALON_PORT if avalon_running else None,
+                       "mismatch": avalon_running and avalon_host != want_av_host},
+            "strata": {"running": strata_running, "port": s.get("port") if strata_running else None},
+        },
+        "needs_restart": needs_restart,
+    }
+
+class ModelServerHostBody(BaseModel):
+    host: str | None = None
+    lan: bool | None = None
+    restart: bool = False
+
+@app.get("/api/server/host")
+def api_server_host_get():
+    return _model_host_state()
+
+@app.post("/api/server/host")
+def api_server_host_set(b: ModelServerHostBody):
+    if b.host is not None:
+        host = _normalize_model_host(b.host)
+    elif b.lan is not None:
+        host = "0.0.0.0" if b.lan else "127.0.0.1"
+    else:
+        host = model_server_host()
+    CFG["model_server_host"] = host
+    CFG["avalon_lan"] = (host == "0.0.0.0")
+    _save_config_secure()
+
+    restarted = []
+    restart_errors = {}
+    if b.restart:
+        m = MGR.status()
+        if m.get("running") and m.get("port") != AVALON_PORT and m.get("host", "127.0.0.1") != host:
+            try:
+                res = MGR.restart()
+                if res.get("restarted"):
+                    restarted.append("llama.cpp")
+                else:
+                    restart_errors["llama.cpp"] = res.get("reason", "could not restart")
+            except HTTPException as e:
+                restart_errors["llama.cpp"] = str(e.detail)
+            except Exception as e:
+                restart_errors["llama.cpp"] = str(e)
+        a = SMGR.status()
+        want_av_host = "0.0.0.0" if CFG.get("avalon_lan") else "127.0.0.1"
+        if a.get("running") and a.get("profile") and a.get("host", "127.0.0.1") != want_av_host:
+            try:
+                SMGR.stop()
+                SMGR.start(a["profile"])
+                restarted.append("avalon")
+            except HTTPException as e:
+                restart_errors["avalon"] = str(e.detail)
+            except Exception as e:
+                restart_errors["avalon"] = str(e)
+
+    state = _model_host_state()
+    state["restarted"] = restarted
+    state["restart_errors"] = restart_errors
+    return state
 
 def _apply_avalon_access():
     st = SMGR.status()
@@ -2900,8 +3065,9 @@ def strata_build_args(b: "StrataLaunchBody", plan: bool) -> list[str]:
         args += ["--tune", b.tune]
     if b.retune:
         args += ["--retune"]
-    if b.access:
-        args += ["--access", b.access]
+    eff_access = b.access or ("lan" if model_server_host() == "0.0.0.0" else None)
+    if eff_access:
+        args += ["--access", eff_access]
     if b.port:
         args += ["--port", str(b.port)]
     if b.no_api_key:
@@ -3446,6 +3612,7 @@ class SettingsBody(BaseModel):
     server_binary: str | None = None
     ctx: int | None = None
     port_base: int | None = None
+    model_server_host: str | None = None
     idle_unload_min: int | None = None
     vram_reserve_mb: int | None = None
     hf_token: str | None = None
@@ -3483,6 +3650,9 @@ def api_settings_get():
         "caps": caps,
         "ctx": int(CFG.get("ctx", 8192) or 8192),
         "port_base": int(CFG.get("port_base", 8830) or 8830),
+        "model_server_host": model_server_host(),
+        "model_server_lan": model_server_host() == "0.0.0.0",
+        "lan_ip": _lan_ip(),
         "idle_unload_min": int(CFG.get("idle_unload_min", 0) or 0),
         "vram_reserve_mb": int(CFG.get("vram_reserve_mb", 512) or 512),
         "hf_token_set": bool(tok) or env_tok,
@@ -3512,6 +3682,10 @@ def api_settings_set(b: SettingsBody):
         CFG["ctx"] = max(512, min(1048576, int(b.ctx)))
     if b.port_base is not None:
         CFG["port_base"] = max(1024, min(65000, int(b.port_base)))
+    if b.model_server_host is not None:
+        host = _normalize_model_host(b.model_server_host)
+        CFG["model_server_host"] = host
+        CFG["avalon_lan"] = (host == "0.0.0.0")
     if b.idle_unload_min is not None:
         CFG["idle_unload_min"] = max(0, min(1440, int(b.idle_unload_min)))
     if b.vram_reserve_mb is not None:
@@ -3938,6 +4112,28 @@ input[type=range]{accent-color:var(--acc);width:100%;cursor:pointer}
 .switch input:checked+.track{background:color-mix(in srgb,var(--acc) 26%,transparent);border-color:var(--acc)}
 .switch input:checked+.track::after{transform:translateX(16px);background:var(--acc)}
 .switch input:focus-visible+.track{outline:2px solid var(--acc);outline-offset:2px}
+input[type="checkbox"][switch]{accent-color:var(--ok);margin:0;width:auto;height:auto;cursor:pointer;vertical-align:middle}
+input[type="checkbox"][switch]:focus:not(:focus-visible){outline:none}
+input[type="checkbox"][switch]:focus-visible{outline:3px solid var(--acc);outline-offset:3px}
+html.no-native-switch input[type="checkbox"][switch]{
+  appearance:none;-webkit-appearance:none;
+  width:34px;height:18px;border-radius:99px;background:var(--bg-2);border:1px solid var(--bd-2);
+  position:relative;flex-shrink:0;transition:background .16s,border-color .16s}
+html.no-native-switch input[type="checkbox"][switch]::after{
+  content:"";position:absolute;top:2px;left:2px;width:12px;height:12px;border-radius:99px;
+  background:var(--mut);transition:transform .16s,background .16s}
+html.no-native-switch input[type="checkbox"][switch]:checked{
+  background:color-mix(in srgb,var(--ok) 26%,transparent);border-color:var(--ok)}
+html.no-native-switch input[type="checkbox"][switch]:checked::after{
+  transform:translateX(16px);background:var(--ok)}
+html.no-native-switch input[type="checkbox"][switch]:disabled{opacity:.5;cursor:not-allowed}
+.host-toggle{display:inline-flex;align-items:center;gap:7px;padding:4px 10px;border-radius:999px;
+  border:1px solid var(--bd-2);background:var(--panel);color:var(--mut);font-size:11.5px;font-weight:600;
+  cursor:pointer;white-space:nowrap;user-select:none;flex-shrink:0;font-family:var(--mono);
+  transition:border-color .14s,background .14s,color .14s}
+.host-toggle:hover{border-color:var(--mut);color:var(--fg)}
+.host-toggle.on{color:var(--ok);border-color:color-mix(in srgb,var(--ok) 40%,transparent);
+  background:color-mix(in srgb,var(--ok) 11%,transparent)}
 
 /* ---------- tags / stats / meters ---------- */
 .tag{display:inline-flex;align-items:center;gap:4px;padding:2px 7px;border-radius:999px;border:1px solid var(--bd-2);
@@ -4123,6 +4319,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
     <span class="tag mut hide" id="hdrkv" title="KV cache fill"></span>
     <span class="tag mut hide" id="hdridle" title="Idle auto-unload timer"></span>
   </div>
+  <label class="host-toggle" id="hdrhostwrap" title="Bind model servers to 0.0.0.0 (LAN) instead of 127.0.0.1">
+    <input type="checkbox" switch id="hdrhost">
+    <span id="hdrhostlbl">0.0.0.0</span>
+  </label>
   <button class="cmdbtn" id="cmdbtn" title="Command palette (Ctrl+K or Cmd+K)" aria-label="Open command palette">
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.5-3.5"/></svg>
     <kbd>⌘K</kbd>
@@ -4193,7 +4393,11 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn danger" id="srvstop">Stop server</button>
       <button class="btn" id="srvtune">Tune active model…</button>
       <button class="btn" id="agentsbtn">Register in coding agents…</button>
-      <span class="hint">Binds 127.0.0.1 · reachable on LAN through this panel</span>
+      <label class="host-toggle" id="srvhostwrap" title="Bind model servers to 0.0.0.0 (all interfaces / LAN)">
+        <input type="checkbox" switch id="srvhost">
+        <span>Host on 0.0.0.0</span>
+      </label>
+      <span class="hint" id="srvhostnote">Binds 127.0.0.1 (local only)</span>
     </div>
   </div>
 
@@ -4274,6 +4478,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <button class="btn" id="stratadoctor">Run doctor</button>
       <button class="btn" id="strataupdate">Check update</button>
       <button class="btn" id="strataagentsbtn" title="Point omp, opencode, codex, aider, zed, pi, claude-code, hermes, kimi… at the running Strata server">Register in coding agents…</button>
+      <label class="host-toggle" id="stratahostwrap" title="Default Strata launches to --access lan (0.0.0.0)">
+        <input type="checkbox" switch id="stratahost">
+        <span>Host on 0.0.0.0</span>
+      </label>
       <span class="tag hide" id="stratakeychip" title="API key of the running launch (strata launch --show-key)"></span>
     </div>
   </div>
@@ -4292,7 +4500,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <div class="field"><label>MTP draft layer (--mtp)</label><select id="st-mtp"><option value="">auto (on)</option><option>on</option><option>off</option></select></div>
       <div class="field"><label>Drafting mode</label><select id="st-drafting"><option value="">auto</option><option>mtp</option><option>dflash2</option><option>off</option></select></div>
       <div class="field"><label>Tuning</label><select id="st-tune"><option value="">skip (CLI default)</option><option>quick</option><option>thorough</option></select></div>
-      <div class="field"><label>Access</label><select id="st-access"><option value="">local (127.0.0.1)</option><option>local</option><option>lan</option><option>cloudflare</option><option>tailscale</option></select></div>
+      <div class="field"><label>Access</label><select id="st-access"><option value="" id="st-access-def">default (127.0.0.1 / local)</option><option>local</option><option>lan</option><option>cloudflare</option><option>tailscale</option></select></div>
       <div class="field"><label>Port</label><input id="st-port" type="number" min="1024" max="65535" placeholder="8080"></div>
       <div class="field"><label>GPU cards (--gpu)</label><input id="st-gpu" type="text" placeholder="e.g. 0,1 — default: all"></div>
       <div class="field"><label>Save as preset</label><input id="st-savepreset" type="text" placeholder="preset name (optional)"></div>
@@ -4423,7 +4631,7 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 
   <div class="card">
     <div class="hd"><h2>Network access</h2>
-      <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN</span></label></div>
+      <label class="switch"><input type="checkbox" id="avalonlan"><span class="track"></span><span class="hint">Expose to LAN (0.0.0.0)</span></label></div>
     <div id="avalonaccess" class="kvs"></div>
   </div>
   <div class="card"><div class="hd"><h2>Avalon log</h2></div><pre class="log" id="avalonlog" style="max-height:280px"></pre></div>
@@ -4558,6 +4766,16 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
       <div class="field">
         <label>Default Server Port</label>
         <input id="set-port" type="number" min="1024" max="65535">
+      </div>
+      <div class="field" style="grid-column:1 / -1">
+        <label>Model server bind host (llama.cpp, Avalon, Strata)</label>
+        <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;padding-top:2px">
+          <label class="host-toggle" id="sethostwrap">
+            <input type="checkbox" switch id="set-modelhost">
+            <span>Host model servers on 0.0.0.0</span>
+          </label>
+          <span class="hint" id="set-modelhost-hint">Binds 127.0.0.1 (local only)</span>
+        </div>
       </div>
       <div class="field">
         <label>Auto-unload when idle (minutes, 0 = disabled)</label>
@@ -4804,6 +5022,10 @@ kbd{font-family:var(--mono);font-size:10.5px;border:1px solid var(--bd-2);border
 /* ============================== helpers ============================== */
 const $=(s,r=document)=>r.querySelector(s);
 const $$=(s,r=document)=>Array.from(r.querySelectorAll(s));
+if(!('switch' in HTMLInputElement.prototype)){
+  document.documentElement.classList.add('no-native-switch');
+  $$('input[type="checkbox"][switch]').forEach(el=>el.setAttribute('role','switch'));
+}
 const esc=v=>String(v==null?'':v).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]);
 const n0=v=>Number(v||0).toLocaleString();
 const gib=b=>(Number(b||0)/1073741824).toFixed(2)+' GB';
@@ -5228,6 +5450,115 @@ $('#srvtune').addEventListener('click',()=>{
   else toast('No models in library','warn');
 });
 
+/* ============================== model server host (0.0.0.0 toggle) ============================== */
+let MODEL_HOST_STATE={host:'127.0.0.1',lan:false,ip:'127.0.0.1',needs_restart:[],running:{}};
+function drawModelHost(){
+  const on=!!MODEL_HOST_STATE.lan;
+  const host=MODEL_HOST_STATE.host||'127.0.0.1';
+  const ip=MODEL_HOST_STATE.ip||'127.0.0.1';
+  const tip=on
+    ?('Model servers bind 0.0.0.0 (LAN: '+ip+') — click to switch back to 127.0.0.1')
+    :'Model servers bind 127.0.0.1 (local only) — click to host on 0.0.0.0';
+  for(const [id,wrap] of [['#hdrhost','#hdrhostwrap'],['#srvhost','#srvhostwrap'],['#stratahost','#stratahostwrap']]){
+    const inp=$(id),w=$(wrap);
+    if(inp)inp.checked=on;
+    if(w){w.classList.toggle('on',on);w.title=tip;}
+  }
+  const setInp=$('#set-modelhost'),setWrap=$('#sethostwrap'),setHint=$('#set-modelhost-hint');
+  if(setInp){setInp.checked=on;}
+  if(setWrap){setWrap.classList.toggle('on',on);}
+  if(setHint){
+    setHint.textContent=on
+      ?('Binds 0.0.0.0 · reachable on LAN at '+ip)
+      :'Binds 127.0.0.1 (local only)';
+  }
+  const stDef=$('#st-access-def');
+  if(stDef)stDef.textContent=on?'default (0.0.0.0 / lan)':'default (127.0.0.1 / local)';
+  const note=$('#srvhostnote');
+  if(note){
+    const runningHost=ACTIVE&&ACTIVE.host?ACTIVE.host:null;
+    const mismatch=!!(ACTIVE&&ACTIVE.port!==((AV&&AV.port)||8086)&&runningHost&&runningHost!==host);
+    if(mismatch){
+      note.innerHTML='<span class="tag warn">running on '+esc(runningHost)+' · restart to bind '+esc(host)+'</span> '
+        +'<button type="button" class="btn xs primary" id="srvhostrestart">Restart now</button>';
+    }else if(on){
+      const port=(ACTIVE&&ACTIVE.port)||'port';
+      note.textContent=ip&&ip!=='127.0.0.1'
+        ?('Binds 0.0.0.0 · LAN http://'+ip+':'+port+'/v1')
+        :'Binds 0.0.0.0 (all interfaces)';
+    }else{
+      note.textContent='Binds 127.0.0.1 (local only)';
+    }
+  }
+  if(typeof stPreview==='function'&&$('#st-cmd'))stPreview();
+}
+async function loadModelHost(){
+  try{
+    MODEL_HOST_STATE=await api('/api/server/host');
+    drawModelHost();
+  }catch(e){}
+}
+async function restartMismatchedServers(){
+  const btn=$('#srvhostrestart');
+  if(btn){btn.disabled=true;btn.textContent='Restarting…';}
+  try{
+    const r=await post('/api/server/host',{host:MODEL_HOST_STATE.host,restart:true});
+    MODEL_HOST_STATE=r;
+    const errs=r.restart_errors||{};
+    const errKeys=Object.keys(errs);
+    if(r.restarted&&r.restarted.length){
+      toast('Restarted '+r.restarted.join(' & ')+' on '+r.host,'ok',4500);
+    }
+    if(errKeys.length){
+      toast('Restart error ('+errKeys.map(k=>k+': '+errs[k]).join('; ')+')','err',9000);
+    }
+    drawModelHost();
+    await Promise.all([pollStatus(true),loadAvalonAccess(),loadAvalon()]);
+  }catch(e){
+    toast('Restart failed: '+e.message,'err',8000);
+    if(btn){btn.disabled=false;btn.textContent='Restart now';}
+  }
+}
+async function toggleModelHost(on){
+  const inputs=['#hdrhost','#srvhost','#stratahost'].map(id=>$(id)).filter(Boolean);
+  inputs.forEach(i=>i.disabled=true);
+  try{
+    const r=await post('/api/server/host',{lan:!!on,restart:false});
+    MODEL_HOST_STATE=r;
+    drawModelHost();
+    await Promise.all([loadAvalonAccess(),loadAvalon(),pollStatus(true)]);
+    if($('#launchdlg')&&$('#launchdlg').open)updateLaunchPreview();
+    const need=r.needs_restart||[];
+    if(need.length){
+      const ok=await confirmDlg(
+        'Apply bind host to running server?',
+        'Saved: model servers will bind <b>'+esc(r.host)+'</b>'
+          +(r.lan&&r.ip&&r.ip!=='127.0.0.1'?' (LAN: <code>'+esc(r.ip)+'</code>)':'')
+          +'.<br><br>Restart running <b>'+esc(need.join(' & '))+'</b> now to apply immediately? (Cancel to apply on next launch.)',
+        'Restart now',false);
+      if(ok){await restartMismatchedServers();}
+      else{toast('Saved ('+r.host+') — restart running server to apply','warn',5000);}
+    }else if(r.running&&r.running.strata&&r.running.strata.running){
+      toast('Model servers set to '+r.host+' — relaunch Strata to apply','ok',5000);
+    }else{
+      toast(r.lan
+        ?('Model servers set to 0.0.0.0'+(r.ip&&r.ip!=='127.0.0.1'?' (LAN: '+r.ip+')':''))
+        :'Model servers set to 127.0.0.1 (local only)','ok',3500);
+    }
+  }catch(e){
+    toast('Failed to update host: '+e.message,'err',8000);
+    drawModelHost();
+  }
+  inputs.forEach(i=>i.disabled=false);
+}
+for(const id of ['#hdrhost','#srvhost','#stratahost']){
+  const el=$(id);
+  if(el)el.addEventListener('change',e=>toggleModelHost(e.target.checked));
+}
+$('#srvhostnote').addEventListener('click',e=>{
+  if(e.target.closest('#srvhostrestart'))restartMismatchedServers();
+});
+
 /* ============================== server status, telemetry & bench ============================== */
 let lastRunModel=null,wasLoading=false,TELE=null;
 function chatTarget(){
@@ -5283,12 +5614,20 @@ function pollStatus(force){
     const chip=$('#srvchip');
     chip.textContent=st.running?(st.ready?'running · ready':'running · loading'):'stopped';
     chip.className='tag '+(st.running?(st.ready?'ok':'warn'):'mut');
+    if(st.configured_host&&st.configured_host!==MODEL_HOST_STATE.host){
+      MODEL_HOST_STATE.host=st.configured_host;
+      MODEL_HOST_STATE.lan=st.configured_host==='0.0.0.0';
+    }
     if(st.running){
+      const bindHost=st.host||'127.0.0.1';
+      const lanUrl=(bindHost==='0.0.0.0'&&MODEL_HOST_STATE.ip&&MODEL_HOST_STATE.ip!=='127.0.0.1')
+        ?('http://'+MODEL_HOST_STATE.ip+':'+st.port+'/v1'):'';
       $('#srvdetail').innerHTML=[
-        ['alias',st.alias],['pid',st.pid],['port',':'+st.port],['preset',st.preset],
+        ['alias',st.alias],['pid',st.pid],['host',bindHost],['port',':'+st.port],['preset',st.preset],
         ['uptime',fmtUp(st.uptime)],st.adopted?['source','adopted']:null]
-        .filter(Boolean).map(kv=>'<span class="tag">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
-        +'<button class="btn xs" data-copy="http://127.0.0.1:'+st.port+'/v1">Copy base URL</button>';
+        .filter(Boolean).map(kv=>'<span class="tag'+(kv[0]==='host'&&kv[1]==='0.0.0.0'?' ok':'')+'">'+esc(kv[0])+' <b>'+esc(kv[1])+'</b></span>').join('')
+        +'<button class="btn xs" data-copy="http://127.0.0.1:'+st.port+'/v1">Copy base URL</button>'
+        +(lanUrl?'<span class="tag ok">LAN · '+esc(lanUrl)+'</span><button class="btn xs" data-copy="'+esc(lanUrl)+'">Copy LAN URL</button>':'');
       if(st.cmd){$('#srvcmdwrap').classList.remove('hide');$('#srvcmd').textContent=st.cmd;}
       else $('#srvcmdwrap').classList.add('hide');
       $('#srvstop').disabled=false;$('#agentsbtn').disabled=false;
@@ -5297,6 +5636,7 @@ function pollStatus(force){
       $('#srvcmdwrap').classList.add('hide');
       $('#srvstop').disabled=true;$('#agentsbtn').disabled=true;
     }
+    drawModelHost();
     const now=ACTIVE?ACTIVE.model:null;
     if(force||now!==lastRunModel){lastRunModel=now;renderModels()}
     drawHeader();drawChatTarget();
@@ -5786,6 +6126,7 @@ function stForm(){
 }
 function stPreview(){
   const f=stForm();let c='strata launch';
+  if(!f.access&&MODEL_HOST_STATE.lan)f.access='lan';
   const map={preset:'--preset',family:'--family',model:'--model',model_path:'--model-path',
              context:'--context',kv:'--kv',vision:'--vision',mtp:'--mtp',drafting:'--drafting',
              gpu:'--gpu',tune:'--tune',access:'--access',save_preset:'--save-preset'};
@@ -6075,28 +6416,34 @@ async function loadAvalonAccess(){
     const a=await api('/api/avalon/access');
     $('#avalonlan').checked=!!a.lan;
     const port=a.port||8086;
+    const lanUrl='http://'+a.ip+':'+port+'/v1';
+    const hasKey=!!a.api_key;
     $('#avalonaccess').innerHTML=a.lan
-      ?'<span class="tag ok">LAN · http://'+esc(a.ip)+':'+port+'/v1</span>'
-        +'<button class="btn sm" data-copy="'+esc(a.api_key)+'">Copy key</button>'
-        +'<span class="tag mut mono" title="API key">'+esc(a.api_key.slice(0,6))+'…'+esc(a.api_key.slice(-4))+'</span>'
-        +'<button class="btn sm" id="regen">New key</button>'
-        +'<span class="hint">send as <code>Authorization: Bearer &lt;key&gt;</code></span>'
+      ?'<span class="tag ok">LAN (0.0.0.0) · '+esc(lanUrl)+'</span>'
+        +'<button class="btn sm" data-copy="'+esc(lanUrl)+'" data-copylabel="LAN URL">Copy LAN URL</button>'
+        +(hasKey
+          ?'<button class="btn sm" data-copy="'+esc(a.api_key)+'" data-copylabel="API key">Copy key</button>'
+            +'<span class="tag mut mono" title="API key">'+esc(a.api_key.slice(0,6))+'…'+esc(a.api_key.slice(-4))+'</span>'
+            +'<button class="btn sm" id="regen">New key</button>'
+            +'<span class="hint">send as <code>Authorization: Bearer &lt;key&gt;</code></span>'
+          :'<button class="btn sm" id="regen">Add API key</button>'
+            +'<span class="hint">no API key required · click to protect LAN access with a bearer token</span>')
       :'<span class="tag mut">local only · http://127.0.0.1:'+port+'/v1</span>'
-        +'<span class="hint">toggle above to expose it on the LAN with an API key</span>';
+        +'<span class="hint">toggle above (or the header 0.0.0.0 switch) to expose on the LAN</span>';
     const rg=$('#regen');
     if(rg)rg.addEventListener('click',async()=>{
-      if(!await confirmDlg('Rotate API key','Every LAN client must be updated with the new key.','Rotate',true))return;
-      try{await post('/api/avalon/access/regenerate');loadAvalonAccess();toast('New key issued','ok')}
+      if(hasKey&&!await confirmDlg('Rotate API key','Every LAN client must be updated with the new key.','Rotate',true))return;
+      try{await post('/api/avalon/access/regenerate');loadAvalonAccess();toast(hasKey?'New key issued':'API key generated','ok')}
       catch(e){toast('Failed: '+e.message,'err')}});
   }catch(e){}
 }
-$('#avalonaccess').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'API key')});
+$('#avalonaccess').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,b.dataset.copylabel||'API key')});
 $('#avalonlan').addEventListener('change',async e=>{
   const on=e.target.checked;e.target.disabled=true;
   try{await post('/api/avalon/access',{lan:on});
-    toast(on?'Exposed on the LAN with an API key':'Back to local-only','ok')}
+    toast(on?'Avalon exposed on 0.0.0.0 (LAN) with an API key':'Avalon back to local-only (127.0.0.1)','ok')}
   catch(err){toast('Failed: '+err.message,'err');e.target.checked=!on}
-  e.target.disabled=false;loadAvalonAccess();loadAvalon();
+  e.target.disabled=false;loadAvalonAccess();loadAvalon();loadModelHost();
 });
 
 /* ============================== HF pull (resumable) ============================== */
@@ -6241,6 +6588,12 @@ async function loadSettings(){
     $('#set-bin').value=s.server_binary||'';
     $('#set-ctx').value=s.ctx||16384;
     $('#set-port').value=s.port_base||8081;
+    const mLan=!!s.model_server_lan;
+    $('#set-modelhost').checked=mLan;
+    $('#sethostwrap').classList.toggle('on',mLan);
+    $('#set-modelhost-hint').textContent=mLan
+      ?('Binds 0.0.0.0 · reachable on LAN at '+(s.lan_ip||'127.0.0.1'))
+      :'Binds 127.0.0.1 (local only)';
     $('#set-idle').value=s.idle_unload_min||0;
     $('#set-reserve').value=s.vram_reserve_mb!=null?s.vram_reserve_mb:512;
     $('#set-hftok').value='';
@@ -6259,6 +6612,13 @@ async function loadSettings(){
     $('#set-disks').innerHTML=(s.disks||[]).map(d=>d.exists?d.path+': '+d.free_gb+' GB free':d.path+': missing').join(' · ');
   }catch(e){toast('Failed to load settings: '+e.message,'err')}
 }
+$('#set-modelhost').addEventListener('change',e=>{
+  const on=e.target.checked;
+  $('#sethostwrap').classList.toggle('on',on);
+  $('#set-modelhost-hint').textContent=on
+    ?('Will bind 0.0.0.0 (LAN: '+(MODEL_HOST_STATE.ip||'127.0.0.1')+') — click Save settings to apply')
+    :'Will bind 127.0.0.1 (local only) — click Save settings to apply';
+});
 $('#set-reload').addEventListener('click',loadSettings);
 $('#set-save').addEventListener('click',async()=>{
   const btn=$('#set-save');btn.disabled=true;
@@ -6269,6 +6629,7 @@ $('#set-save').addEventListener('click',async()=>{
       server_binary:$('#set-bin').value.trim(),
       ctx:Number($('#set-ctx').value)||16384,
       port_base:Number($('#set-port').value)||8081,
+      model_server_host:$('#set-modelhost').checked?'0.0.0.0':'127.0.0.1',
       idle_unload_min:Number($('#set-idle').value)||0,
       vram_reserve_mb:Number($('#set-reserve').value)||0,
       hf_token:$('#set-hftok').value.trim(),
@@ -6277,7 +6638,7 @@ $('#set-save').addEventListener('click',async()=>{
       strata_api_key:$('#set-stratakey').value.trim()
     });
     toast('Settings saved','ok');
-    await loadSettings();await loadModels();
+    await Promise.all([loadSettings(),loadModels(),loadModelHost(),loadAvalonAccess(),loadAvalon(),pollStatus(true)]);
   }catch(e){toast('Save failed: '+e.message,'err')}
   btn.disabled=false;
 });
@@ -6296,6 +6657,11 @@ function buildPaletteItems(){
   }
   items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
+  items.push({
+    label:MODEL_HOST_STATE.lan?'Switch model servers to 127.0.0.1 (local only)':'Host model servers on 0.0.0.0 (LAN)',
+    sub:'currently '+(MODEL_HOST_STATE.host||'127.0.0.1'),
+    run:()=>toggleModelHost(!MODEL_HOST_STATE.lan)
+  });
   items.push({label:'Toggle light / dark theme',sub:'Appearance',run:()=>$('#theme').click()});
   items.push({label:'Rescan model directories',sub:'Models',run:()=>$('#rescan').click()});
   MODELS.forEach(m=>{
@@ -6385,7 +6751,7 @@ loadModels().then(()=>{pollStatus(true);pollTelemetry();}).catch(e=>toast('Panel
 loadChatList();
 (async()=>{const s=localStorage.getItem('ic.cid');
   if(!s||!(await openChat(s,true))){localStorage.removeItem('ic.cid');emptyThread()}})();
-refreshVitals();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
+refreshVitals();loadModelHost();loadAvalon();loadAvalonAccess();pollDownloads();loadBenchmarks();drawChatTarget();loadStrata();loadStrataPresets();loadSetup();
 $('#footnote').textContent='live telemetry active · polling pauses when tab is hidden';
 </script>
 </body></html>"""

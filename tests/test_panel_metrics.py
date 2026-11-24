@@ -1430,6 +1430,142 @@ def test_inline_js_parses():
             os.unlink(path)
 
 
+# ------------------------------------------------ model server 0.0.0.0 host toggle
+def test_model_server_host_toggle_across_engines():
+    mp = MODELS_DIR / "host-toggle-test.gguf"
+    gguf(mp, arch="llama")
+    ov_host = panel.CFG.get("model_server_host")
+    ov_av_lan = panel.CFG.get("avalon_lan")
+    ov_caps = panel.bin_caps
+    ov_av_tgt = panel._avalon_target
+    ov_strata = panel.strata_status
+    ov_mgr_st = panel.MGR.status
+    ov_smgr_st = panel.SMGR.status
+    panel.bin_caps = lambda b: {"exists": True, "metrics": True, "jinja": True}
+    panel._avalon_target = lambda: {"model": mp, "mmproj": None, "draft": None, "base": "test"}
+    panel.strata_status = lambda refresh=False: {"installed": False, "running": False}
+    panel.MGR.status = lambda: {"running": False, "configured_host": panel.model_server_host()}
+    panel.SMGR.status = lambda: {"running": False}
+    try:
+        # Default is 127.0.0.1
+        st0 = panel.api_server_host_set(panel.ModelServerHostBody(lan=False))
+        assert st0["host"] == "127.0.0.1" and st0["lan"] is False
+        args, _, _ = panel.MGR.build_args(str(mp), preset="dense-gpu", ctx=4096)
+        assert args[args.index("--host") + 1] == "127.0.0.1"
+        av_args = panel.SMGR.build_args("flagship")
+        assert "--host" not in av_args
+        st_args = panel.strata_build_args(panel.StrataLaunchBody(), plan=False)
+        assert "--access" not in st_args
+
+        # Toggle ON -> 0.0.0.0 across llama.cpp, Avalon, and Strata
+        st1 = panel.api_server_host_set(panel.ModelServerHostBody(lan=True))
+        assert st1["host"] == "0.0.0.0" and st1["lan"] is True
+        assert st1["avalon_lan"] is True
+        saved = json.loads(panel.CONFIG_PATH.read_text())
+        assert saved["model_server_host"] == "0.0.0.0"
+        assert saved["avalon_lan"] is True
+
+        args, _, _ = panel.MGR.build_args(str(mp), preset="dense-gpu", ctx=4096)
+        assert args[args.index("--host") + 1] == "0.0.0.0"
+        av_args = panel.SMGR.build_args("flagship")
+        assert "--host" in av_args and av_args[av_args.index("--host") + 1] == "0.0.0.0"
+        st_args = panel.strata_build_args(panel.StrataLaunchBody(), plan=False)
+        assert "--access" in st_args and st_args[st_args.index("--access") + 1] == "lan"
+        # Explicit Strata access still overrides the global 0.0.0.0 default
+        st_local = panel.strata_build_args(panel.StrataLaunchBody(access="local"), plan=False)
+        assert st_local[st_local.index("--access") + 1] == "local"
+
+        # Invalid host raises HTTPException 400
+        try:
+            panel.api_server_host_set(panel.ModelServerHostBody(host="999.999.999.999"))
+            assert False, "expected HTTPException for invalid host"
+        except panel.HTTPException as e:
+            assert e.status_code == 400
+    finally:
+        panel.CFG["model_server_host"] = ov_host
+        panel.CFG["avalon_lan"] = ov_av_lan
+        panel._save_config_secure()
+        panel.bin_caps = ov_caps
+        panel._avalon_target = ov_av_tgt
+        panel.strata_status = ov_strata
+        panel.MGR.status = ov_mgr_st
+        panel.SMGR.status = ov_smgr_st
+
+
+def test_model_server_host_restart_mismatch():
+    ov_host = panel.CFG.get("model_server_host")
+    ov_av_lan = panel.CFG.get("avalon_lan")
+    ov_strata = panel.strata_status
+    ov_mgr_st = panel.MGR.status
+    ov_mgr_restart = panel.MGR.restart
+    ov_smgr_st = panel.SMGR.status
+    cur = {"host": "127.0.0.1", "restarts": 0}
+
+    def fake_mgr_status():
+        return {"running": True, "port": 8830, "model": "/tmp/m.gguf",
+                "host": cur["host"], "configured_host": panel.model_server_host()}
+
+    def fake_mgr_restart():
+        cur["restarts"] += 1
+        cur["host"] = panel.model_server_host()
+        return {"restarted": True, "status": fake_mgr_status()}
+
+    panel.strata_status = lambda refresh=False: {"installed": False, "running": False}
+    panel.MGR.status = fake_mgr_status
+    panel.MGR.restart = fake_mgr_restart
+    panel.SMGR.status = lambda: {"running": False}
+    try:
+        panel.CFG["model_server_host"] = "127.0.0.1"
+        panel.CFG["avalon_lan"] = False
+        # Toggle without restart reports mismatch
+        r1 = panel.api_server_host_set(panel.ModelServerHostBody(host="0.0.0.0", restart=False))
+        assert r1["host"] == "0.0.0.0"
+        assert r1["needs_restart"] == ["llama.cpp"]
+        assert r1["running"]["llama"]["mismatch"] is True
+        assert cur["restarts"] == 0
+
+        # Calling with restart=True restarts llama.cpp and clears mismatch
+        r2 = panel.api_server_host_set(panel.ModelServerHostBody(restart=True))
+        assert cur["restarts"] == 1
+        assert r2["restarted"] == ["llama.cpp"]
+        assert r2["needs_restart"] == []
+        assert r2["running"]["llama"]["host"] == "0.0.0.0"
+        assert r2["running"]["llama"]["mismatch"] is False
+    finally:
+        panel.CFG["model_server_host"] = ov_host
+        panel.CFG["avalon_lan"] = ov_av_lan
+        panel._save_config_secure()
+        panel.strata_status = ov_strata
+        panel.MGR.status = ov_mgr_st
+        panel.MGR.restart = ov_mgr_restart
+        panel.SMGR.status = ov_smgr_st
+
+
+def test_settings_model_server_host_sync():
+    ov_host = panel.CFG.get("model_server_host")
+    ov_av_lan = panel.CFG.get("avalon_lan")
+    try:
+        s1 = panel.api_settings_set(panel.SettingsBody(model_server_host="0.0.0.0"))
+        assert s1["model_server_host"] == "0.0.0.0"
+        assert s1["model_server_lan"] is True
+        assert panel.CFG["avalon_lan"] is True
+        s2 = panel.api_settings_set(panel.SettingsBody(model_server_host="127.0.0.1"))
+        assert s2["model_server_host"] == "127.0.0.1"
+        assert s2["model_server_lan"] is False
+        assert panel.CFG["avalon_lan"] is False
+    finally:
+        panel.CFG["model_server_host"] = ov_host
+        panel.CFG["avalon_lan"] = ov_av_lan
+        panel._save_config_secure()
+
+
+def test_ui_contains_accessible_host_switches():
+    for elem in ('id="hdrhost"', 'id="srvhost"', 'id="stratahost"', 'id="set-modelhost"'):
+        assert f'type="checkbox" switch {elem}' in panel.HTML, f"missing switch {elem}"
+    assert "'switch' in HTMLInputElement.prototype" in panel.HTML
+    assert "/api/server/host" in panel.HTML
+
+
 if __name__ == "__main__":
     fns = [(n, f) for n, f in sorted(globals().items())
            if n.startswith("test_") and isinstance(f, types.FunctionType)]
