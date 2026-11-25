@@ -6728,7 +6728,8 @@ kbd {
     </div>
     <div id="stratadetail" class="kvs"></div>
     <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;align-items:center">
-      <button class="btn primary" id="st-toggleform">Launch setup…</button>
+      <button class="btn primary hide" id="st-start" title="Launch the last-used preset with the settings it saved">Start</button>
+      <button class="btn" id="st-toggleform">Launch options…</button>
       <button class="btn danger" id="stratastopbtn" disabled>Stop</button>
       <button class="btn" id="stratadoctor">Run doctor</button>
       <button class="btn" id="strataupdate">Check update</button>
@@ -6780,7 +6781,7 @@ kbd {
     </div>
     <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:12px;flex-wrap:wrap">
       <button class="btn" id="st-plan">Preview plan (read-only)</button>
-      <button class="btn primary" id="st-launch">Download &amp; Launch</button>
+      <button class="btn primary" id="st-launch">Launch</button>
     </div>
     <div class="cmdbox hide" id="st-out" style="margin-top:12px;white-space:pre-wrap;max-height:340px;overflow:auto"></div>
   </div>
@@ -8378,7 +8379,7 @@ function pollStatus(force){
       else $('#srvcmdwrap').classList.add('hide');
       $('#srvstop').disabled=false;$('#agentsbtn').disabled=false;
     }else{
-      $('#srvdetail').innerHTML='<span class="hint">No llama-server running. Pick a model in the Models tab or press ⌘K to launch one.</span>';
+      $('#srvdetail').innerHTML='<button class="btn primary" data-goto="models">Pick a model to launch…</button> <span class="hint">or press ⌘K anywhere</span>';
       $('#srvcmdwrap').classList.add('hide');
       $('#srvstop').disabled=true;$('#agentsbtn').disabled=true;
     }
@@ -8388,7 +8389,8 @@ function pollStatus(force){
     drawHeader();drawChatTarget();
   }).catch(()=>{});
 }
-$('#srvdetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)copy(b.dataset.copy,'Base URL')});
+$('#srvdetail').addEventListener('click',e=>{const b=e.target.closest('[data-copy]');if(b)return copy(b.dataset.copy,'Base URL');
+  const g=e.target.closest('[data-goto]');if(g)setTab(g.dataset.goto)});
 $('#srvcopycmd').addEventListener('click',()=>copy($('#srvcmd').textContent,'Launch command'));
 $('#srvstop').addEventListener('click',async()=>{
   if(!await confirmDlg('Stop server','Stop the loaded model? Running requests will be interrupted.','Stop',true))return;
@@ -8947,7 +8949,14 @@ function drawStrata(s){
     +(s.raw?'<details style="margin-top:6px"><summary class="hint">raw strata launch --status output</summary><pre class="log" style="max-height:200px">'+esc(s.raw)+'</pre></details>':'')
     :'<span class="hint">'+esc(s.note||'')+'</span>';
   $('#stratastopbtn').disabled=!(s.running);
+  const p=stLastPreset(),sb=$('#st-start');
+  sb.classList.toggle('hide',!(s.installed&&!s.running&&p));
+  if(p)sb.textContent='Start '+p.name;
 }
+function stLastPreset(){
+  return STPRESETS.length?[...STPRESETS].sort((a,b)=>String(b.last_used||'').localeCompare(String(a.last_used||'')))[0]:null;
+}
+
 async function pollStrataTelemetry(){
   const card=$('#stratametricscard');
   if(!(STRATA&&STRATA.running)){card.classList.add('hide');return;}
@@ -9002,7 +9011,7 @@ function ctxWord(n){n=Number(n);if(!n||n<=0)return '';
   if(n%1024===0)return (n/1024)+'k';
   return String(n)}
 function stApplyPreset(p){
-  // Fill the form from a preset's own saved fields so "Launch setup…" reflects the setup
+  // Fill the form from a preset's own saved fields so "Launch options…" reflects the setup
   // that exists, instead of starting blank and letting strata pick a model to download.
   if(!p||!p.name)return;
   const setV=(id,v)=>{if(v!==undefined&&v!==null&&v!=='')$(id).value=String(v)};
@@ -9028,8 +9037,8 @@ const stApplyPresetByName=n=>stApplyPreset(STPRESETS.find(p=>p.name===n));
 $('#st-preset').addEventListener('change',()=>stApplyPresetByName($('#st-preset').value));
 $('#st-toggleform').addEventListener('click',()=>{
   $('#strataformcard').classList.toggle('hide');
-  if(!$('#strataformcard').classList.contains('hide')&&!$('#st-preset').value&&STPRESETS.length)
-    stApplyPreset([...STPRESETS].sort((a,b)=>String(b.last_used||'').localeCompare(String(a.last_used||'')))[0]);
+  if(!$('#strataformcard').classList.contains('hide')&&!$('#st-preset').value)
+    stApplyPreset(stLastPreset());
   else stPreview();
 });
 $('#st-copycmd').addEventListener('click',()=>copy($('#st-cmd').textContent,'Strata command'));
@@ -9047,8 +9056,8 @@ async function loadStrataPresets(){
       +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset" aria-label="Delete preset">'+xSvg+'</button></span>').join('')
       :'<span class="hint">'+(d.error?'strata --list-presets failed: '+esc(d.error):'No saved presets yet. Name one in the launch form to save this exact configuration.')+'</span>';
     const sel=$('#st-preset'),cur=sel.value;
-    sel.innerHTML='<option value="">(none)</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     sel.value=cur;
+    if(STRATA)drawStrata(STRATA);
   }catch(e){}
 }
 $('#st-refreshpresets').addEventListener('click',loadStrataPresets);
@@ -9070,30 +9079,35 @@ $('#st-plan').addEventListener('click',async()=>{
   }catch(e){stOut('Plan failed: '+e.message)}
   b.disabled=false;b.textContent='Preview plan (read-only)';
 });
-$('#st-launch').addEventListener('click',async()=>{
-  const btn=$('#st-launch');
+async function stLaunchConfirm(form,btn){
+  const old=btn.textContent;
   // Read-only plan first, so the confirm states what strata will actually do with the
   // files on this machine instead of warning about a download that is not coming.
   btn.disabled=true;btn.textContent='Checking plan…';
   let msg='Strata may download model files (tens of GB) and load a server into memory. Continue?';
   try{
-    const r=await post('/api/strata/launch',Object.assign(stForm(),{plan:true}));
+    const r=await post('/api/strata/launch',Object.assign({},form,{plan:true}));
     const m=r.json&&r.json.plan&&r.json.plan.model;
     if(m)msg=(m.own_files
       ?'Model files are already local'+(m.model_gb?' ('+m.model_gb+' GB'+(m.folder?' in '+esc(m.folder):'')+')':'')+'. '
-      :esc(m.title||'The model')+' is not on this machine — Strata will download '+(m.model_gb!=null?m.model_gb+' GB':'it')+'. ')
+      :esc(m.title||'The model')+' is not on this machine, so Strata will download '+(m.model_gb!=null?m.model_gb+' GB':'it')+'. ')
       +'Load the server into memory?';
   }catch(e){}
-  btn.disabled=false;btn.textContent='Download & Launch';
-  if(!await confirmDlg('Launch Strata',msg,'Download & Launch',true))return;
+  btn.disabled=false;btn.textContent=old;
+  if(!await confirmDlg('Launch Strata',msg,'Launch',true))return;
   btn.disabled=true;btn.textContent='Launching…';
   try{
-    const r=await post('/api/strata/launch',stForm());
+    const r=await post('/api/strata/launch',form);
     toast('Strata launch accepted — loading…','ok',4000);
     if(r.state){STRATA=r.state;drawStrata(STRATA)}
     pollStatus(true);loadStrataPresets();
   }catch(e){toast('Strata launch failed: '+e.message,'err',15000)}
-  btn.disabled=false;btn.textContent='Download & Launch';
+  btn.disabled=false;btn.textContent=old;
+}
+$('#st-launch').addEventListener('click',()=>stLaunchConfirm(stForm(),$('#st-launch')));
+$('#st-start').addEventListener('click',()=>{
+  const p=stLastPreset();
+  if(p)stLaunchConfirm({preset:p.name},$('#st-start'));
 });
 $('#stratastopbtn').addEventListener('click',async()=>{
   if(!await confirmDlg('Stop Strata','Unload the Strata model?','Stop',true))return;
@@ -9807,7 +9821,7 @@ function buildPaletteItems(){
   if(MAYA&&MAYA.running){
     items.push({label:'Stop Maya ('+(MAYA.alias||MAYA.model_name||'maya')+')',sub:':'+(MAYA.port||''),run:()=>$('#mayastop').click()});
   }
-  items.push({label:'Strata launch setup…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
+  items.push({label:'Strata launch options…',sub:'Strata',run:()=>{setTab('strata');if($('#strataformcard').classList.contains('hide'))$('#st-toggleform').click()}});
   items.push({label:'Engine setup (llama.cpp / Strata / Avalon)',sub:'Settings',run:()=>{setTab('settings');loadSetup()}});
   items.push({label:'Restart the panel process',sub:'Panel',run:()=>{setTab('settings');loadPanelProc();$('#panelrestart').click()}});
   items.push({
