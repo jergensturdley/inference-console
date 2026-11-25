@@ -13,7 +13,9 @@ venv/bin/pip install -r requirements.txt
 ./venv/bin/python panel.py            # then open http://127.0.0.1:8817
 ```
 
-Login is your system (sudo) password. For always-on operation, install the
+Login is your system (sudo) password. When a session expires, the page sends
+you back to the sign-in screen instead of quietly freezing on stale data. For
+always-on operation, install the
 systemd user unit in `deploy/` and `systemctl --user enable --now inference-console.service`
 (manages the panel at `:8817`, one llama.cpp child on ports 8830-8839, and the
 `avalon-flashnext.service` eGPU server).
@@ -25,18 +27,26 @@ systemd user unit in `deploy/` and `systemctl --user enable --now inference-cons
 ## Engines
 
 Each engine gets its own tab with status, launch controls, presets, and logs.
-Whichever one is serving becomes the chat backend and the coding-agent
-registry target automatically. Engines are GPU-exclusive: starting one is
-refused while another holds VRAM, so there is never a silent OOM.
+Every stopped tab has a one-click way to start: Strata starts its last-used
+preset, Avalon and Maya start the selected profile or config, and the
+llama.cpp tab links into the model library. Whichever engine is serving
+becomes the chat backend and the coding-agent registry target automatically.
+Engines are GPU-exclusive: starting one is refused while another holds VRAM,
+so there is never a silent OOM.
 
 - **llama.cpp**: launches and supervises a `llama-server` child. Presets for
   dense GPU, MoE CPU/GPU split, vision, and iGPU (Vulkan `--device` resolved
   via `--list-devices`, with a fit guard against free VRAM).
-- **Strata**: wraps the `strata launch` CLI. Launch form (preset, family,
-  quant, context, KV format, parallel, vision, MTP, drafting, GPU, access
-  mode), read-only plan preview before any download, preset save/delete,
-  `doctor --live`, `update --check`, masked API key. Empty fields keep
-  Strata's own defaults.
+- **Strata**: wraps the `strata launch` CLI. A Start button launches the
+  last-used preset with the settings it saved, in one click. The launch form
+  (preset, family, quant, context, KV format, parallel, vision, MTP,
+  drafting, GPU, access mode) pre-fills from that preset; empty fields keep
+  Strata's own defaults. The read-only plan runs before any launch, and the
+  confirm says whether the model files are already local or a download is
+  coming, so nothing implies a download that is not. Preset save/delete,
+  `doctor --live`, `update --check`, masked API key. A failed
+  `--list-presets` run shows its error in the presets card instead of
+  pretending no presets exist.
 - **Avalon**: profiles (`flagship`, `prefast`, `compact`) with fit-aware
   launches (`-fit on` places dense + KV on the GPU, MoE experts in system
   memory; no hardcoded full offload), per-profile config optimizer with
