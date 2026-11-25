@@ -1302,6 +1302,41 @@ def test_strata_status_without_cli_is_not_installed():
     finally:
         panel.strata_bin = ov
 
+def test_strata_presets_failure_is_not_fake_presets_or_silence():
+    """A failed --list-presets run must read as a failure: no preset names fabricated from
+    its output, and an error the tab can show instead of "no saved presets yet"."""
+    ov_bin, ov_run = panel.CFG.get("strata_bin"), panel._strata_run
+    stub = Path(HOME_TMP) / "strata-stub"
+    try:
+        stub.write_text("#!/bin/sh\nexit 0\n")
+        stub.chmod(0o755)
+        panel.CFG["strata_bin"] = str(stub)
+        # Failed run whose stdout holds an error message (or a partial payload from a
+        # timeout): the old text fallback turned each line into a preset name.
+        panel._strata_run = lambda args, timeout=20: {
+            "ok": False, "json": None, "stdout": "error: data dir is corrupt\n",
+            "stderr": "", "error": "strata exited 1"}
+        out = panel.api_strata_presets()
+        assert out["presets"] == []
+        assert "data dir" not in json.dumps(out)
+        assert out["error"]
+        # A successful text run still lists one preset per line.
+        panel._strata_run = lambda args, timeout=20: {
+            "ok": True, "json": None, "stdout": "sc117\nworkhorse\n",
+            "stderr": "", "error": None}
+        out = panel.api_strata_presets()
+        assert [p["name"] for p in out["presets"]] == ["sc117", "workhorse"]
+        assert "error" not in out
+        # JSON shapes pass through unchanged.
+        panel._strata_run = lambda args, timeout=20: {
+            "ok": True, "json": {"presets": [{"name": "sc117", "model": "IQ2_XS"}]},
+            "stdout": "", "stderr": "", "error": None}
+        out = panel.api_strata_presets()
+        assert out["presets"][0]["model"] == "IQ2_XS"
+    finally:
+        panel.CFG["strata_bin"] = ov_bin
+        panel._strata_run = ov_run
+        stub.unlink(missing_ok=True)
 
 def test_strata_key_endpoint_masks_by_default():
     ov_bin, ov_run = panel.CFG.get("strata_bin"), panel._strata_run
