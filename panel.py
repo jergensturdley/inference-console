@@ -8918,7 +8918,7 @@ $('#ag-apply').addEventListener('click',async()=>{
 });
 
 /* ============================== strata ============================== */
-let STLOGTEXT='';
+let STLOGTEXT='',STPRESETS=[];
 async function loadStrata(){
   try{
     const s=await api('/api/strata/status');STRATA=s;drawStrata(s);drawHeader();drawChatTarget();
@@ -8989,14 +8989,49 @@ function stPreview(){
   $('#st-cmd').textContent=c;
 }
 $$('#strataformcard input,#strataformcard select').forEach(el=>el.addEventListener('input',stPreview));
-$('#st-toggleform').addEventListener('click',()=>{$('#strataformcard').classList.toggle('hide');stPreview()});
+function ctxWord(n){n=Number(n);if(!n||n<=0)return '';
+  if(n%(1024*1024)===0)return (n/(1024*1024))+'m';
+  if(n%1024===0)return (n/1024)+'k';
+  return String(n)}
+function stApplyPreset(p){
+  // Fill the form from a preset's own saved fields so "Launch setup…" reflects the setup
+  // that exists, instead of starting blank and letting strata pick a model to download.
+  if(!p||!p.name)return;
+  const setV=(id,v)=>{if(v!==undefined&&v!==null&&v!=='')$(id).value=String(v)};
+  const setSel=(id,v)=>{const el=$(id);if(v===undefined||v===null||v==='')return;
+    if([...el.options].some(o=>o.value===String(v)))el.value=String(v)};
+  $('#st-preset').value=p.name;
+  setSel('#st-family',p.family);
+  setV('#st-model',p.model);
+  setV('#st-modelpath',p.model_path);
+  setSel('#st-context',ctxWord(p.context));
+  setSel('#st-kv',p.kv);
+  setSel('#st-parallel',p.parallel);
+  setSel('#st-vision',p.vision);
+  setSel('#st-mtp',p.mtp);
+  setSel('#st-drafting',p.drafting);
+  setV('#st-gpu',typeof p.gpus==='string'||typeof p.gpus==='number'?p.gpus:(p.gpus&&p.gpus.join?p.gpus.join(','):''));
+  setSel('#st-tune',p.tune);
+  setSel('#st-access',p.access);
+  setV('#st-port',p.port);
+  stPreview();
+}
+const stApplyPresetByName=n=>stApplyPreset(STPRESETS.find(p=>p.name===n));
+$('#st-preset').addEventListener('change',()=>stApplyPresetByName($('#st-preset').value));
+$('#st-toggleform').addEventListener('click',()=>{
+  $('#strataformcard').classList.toggle('hide');
+  if(!$('#strataformcard').classList.contains('hide')&&!$('#st-preset').value&&STPRESETS.length)
+    stApplyPreset([...STPRESETS].sort((a,b)=>String(b.last_used||'').localeCompare(String(a.last_used||'')))[0]);
+  else stPreview();
+});
 $('#st-copycmd').addEventListener('click',()=>copy($('#st-cmd').textContent,'Strata command'));
 $('#stratacopyinst').addEventListener('click',()=>copy($('#stratainstcmd').textContent,'Install command'));
 async function loadStrataPresets(){
   if(!$('#st-presets'))return;
   try{
     const d=await api('/api/strata/presets');
-    const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?{name:p.name,context:p.context,model:p.model}:null)).filter(Boolean);
+    const ps=(d.presets||[]).map(p=>typeof p==='string'?{name:p}:(p&&p.name?p:null)).filter(Boolean);
+    STPRESETS=ps;
     const xSvg='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:11px;height:11px"><path d="M18 6L6 18M6 6l12 12"/></svg>';
     $('#st-presets').innerHTML=ps.length?ps.map(p=>'<span class="tag">'+esc(p.name)
       +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
@@ -9011,7 +9046,7 @@ async function loadStrataPresets(){
 $('#st-refreshpresets').addEventListener('click',loadStrataPresets);
 $('#st-presets').addEventListener('click',async e=>{
   const b=e.target.closest('[data-stp]');if(!b)return;
-  if(b.dataset.act==='use'){$('#st-preset').value=b.dataset.stp;stPreview();toast('Preset '+b.dataset.stp+' selected','ok')}
+  if(b.dataset.act==='use'){stApplyPresetByName(b.dataset.stp);toast('Preset '+b.dataset.stp+' loaded','ok')}
   else{
     if(!await confirmDlg('Delete preset','Delete Strata preset <b>'+esc(b.dataset.stp)+'</b>?','Delete',true))return;
     try{await post('/api/strata/presets/delete',{name:b.dataset.stp});loadStrataPresets();toast('Preset deleted','ok')}
@@ -9029,7 +9064,20 @@ $('#st-plan').addEventListener('click',async()=>{
 });
 $('#st-launch').addEventListener('click',async()=>{
   const btn=$('#st-launch');
-  if(!await confirmDlg('Launch Strata','Strata may download model files (tens of GB) and load a server into memory. Continue?','Download & Launch',true))return;
+  // Read-only plan first, so the confirm states what strata will actually do with the
+  // files on this machine instead of warning about a download that is not coming.
+  btn.disabled=true;btn.textContent='Checking plan…';
+  let msg='Strata may download model files (tens of GB) and load a server into memory. Continue?';
+  try{
+    const r=await post('/api/strata/launch',Object.assign(stForm(),{plan:true}));
+    const m=r.json&&r.json.plan&&r.json.plan.model;
+    if(m)msg=(m.own_files
+      ?'Model files are already local'+(m.model_gb?' ('+m.model_gb+' GB'+(m.folder?' in '+esc(m.folder):'')+')':'')+'. '
+      :esc(m.title||'The model')+' is not on this machine — Strata will download '+(m.model_gb!=null?m.model_gb+' GB':'it')+'. ')
+      +'Load the server into memory?';
+  }catch(e){}
+  btn.disabled=false;btn.textContent='Download & Launch';
+  if(!await confirmDlg('Launch Strata',msg,'Download & Launch',true))return;
   btn.disabled=true;btn.textContent='Launching…';
   try{
     const r=await post('/api/strata/launch',stForm());
