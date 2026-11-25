@@ -4035,16 +4035,22 @@ def _strata_status_now() -> dict:
         out["running"] = True
     return out
 
-def strata_presets() -> list:
+def strata_presets() -> dict:
+    """Presets from `strata launch --list-presets`. A failed run must read as a failure, not
+    as "no presets": its stdout (an error message, or a partial payload left by a timeout)
+    must never be mistaken for preset names."""
     r = _strata_run(["launch", "--list-presets", "--output", "json"], timeout=15)
     j = r["json"]
     if isinstance(j, list):
-        return [p if isinstance(p, dict) else {"name": str(p)} for p in j]
+        return {"presets": [p if isinstance(p, dict) else {"name": str(p)} for p in j]}
     if isinstance(j, dict) and isinstance(j.get("presets"), list):
-        return [p if isinstance(p, dict) else {"name": str(p)} for p in j["presets"]]
+        return {"presets": [p if isinstance(p, dict) else {"name": str(p)} for p in j["presets"]]}
+    if not r["ok"]:
+        return {"presets": [], "error": _redact_cmd(r["error"] or r["stderr"] or
+                                                    "strata launch --list-presets failed")}
     # Text output: keep one name per non-empty line rather than guessing at columns.
     lines = [ln.strip() for ln in (r["stdout"] or "").splitlines() if ln.strip()]
-    return [{"name": ln} for ln in lines]
+    return {"presets": [{"name": ln} for ln in lines]}
 
 @app.get("/api/strata/status")
 def api_strata_status():
@@ -4052,7 +4058,8 @@ def api_strata_status():
 
 @app.get("/api/strata/presets")
 def api_strata_presets():
-    return {"presets": strata_presets()}
+    return strata_presets()
+
 
 class StrataPresetDeleteBody(BaseModel):
     name: str
@@ -4068,7 +4075,7 @@ def api_strata_preset_delete(b: StrataPresetDeleteBody):
     if not r["ok"]:
         raise HTTPException(502, _redact_cmd(r["error"] or r["stderr"] or r["stdout"] or "delete-preset failed"))
     strata_log(f"deleted preset {name}")
-    return {"deleted": name, "presets": strata_presets()}
+    return {"deleted": name, **strata_presets()}
 
 @app.get("/api/strata/key")
 def api_strata_key(reveal: bool = False):
@@ -7739,6 +7746,7 @@ const fmtUp=s=>{s=s|0;const h=(s/3600)|0,m=((s%3600)/60)|0;return h?h+'h '+m+'m'
 
 async function api(url,opt){
   const r=await fetch(url,opt);
+  if(r.status===401&&location.pathname!=='/login')location.href='/login';
   if(!r.ok){let d=await r.text();try{const j=JSON.parse(d);d=(j&&j.detail)||d}catch(e){}
     throw new Error(String(d).slice(0,400))}
   return r.json();
@@ -9037,7 +9045,7 @@ async function loadStrataPresets(){
       +(p.context?' · '+esc(p.context):'')+(p.model?' · '+esc(p.model):'')
       +' <button class="btn xs" data-stp="'+esc(p.name)+'" data-act="use">Use</button>'
       +' <button class="btn xs danger" data-stp="'+esc(p.name)+'" data-act="del" title="Delete preset" aria-label="Delete preset">'+xSvg+'</button></span>').join('')
-      :'<span class="hint">No saved presets yet. Name one in the launch form to save this exact configuration.</span>';
+      :'<span class="hint">'+(d.error?'strata --list-presets failed: '+esc(d.error):'No saved presets yet. Name one in the launch form to save this exact configuration.')+'</span>';
     const sel=$('#st-preset'),cur=sel.value;
     sel.innerHTML='<option value="">(none)</option>'+ps.map(p=>'<option value="'+esc(p.name)+'">'+esc(p.name)+'</option>').join('');
     sel.value=cur;
